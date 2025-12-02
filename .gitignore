@@ -1,0 +1,43 @@
+########################
+# Python ignores
+########################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.Python
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+
+########################
+# Virtual environment for MATCHA
+########################
+venv_matcha/
+env/
+venv/
+.venv/
+
+########################
+# Editor / OS files
+########################
+.vscode/
+.idea/
+*.swp
+*.swo
+*.DS_Store
+
+########################
+# MATCHA run artifacts
+########################
+*.log
+*.out
+*.err
+
+
