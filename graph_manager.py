@@ -50,6 +50,7 @@ class GraphProcessor(object):
         """ generate activation flags for each iteration """
         raise NotImplemented
 
+    # 重組出原本的graph，包含所有subgraph
     def getGraphFromSub(self, subGraphs):
         G = nx.Graph()
         for edge in subGraphs:
@@ -81,6 +82,7 @@ class GraphProcessor(object):
 
         return subgraphs
 
+    # 計算每個subgraph的Laplacian matrix，目的是用來計算mixing weight
     def graphToLaplacian(self):
         L_matrices = list()
         for i, subgraph in enumerate(self.subGraphs):
@@ -147,6 +149,7 @@ class GraphProcessor(object):
             node_degree[:] = node_degree[::-1]
         return subgraphs
 
+    # 將我們看的懂得連接列表，轉換成機器看的陣列矩陣
     def drawer(self):
         """
         input graph: list[list[tuples]]
@@ -154,6 +157,15 @@ class GraphProcessor(object):
                      graph: [edge1, edge2, ...]
                      edge: (node1, node2)
         output connect: matrix: [[]]
+        結構：這是一個二維陣列 [子圖ID][我的Rank]。
+        假設子圖 0 是 [(1, 5), ...]。
+        轉換後：
+        connect[0][1] 的值會變成 5 (Rank 1 在子圖 0 的鄰居是 5)。
+
+        connect[0][5] 的值會變成 1 (Rank 5 在子圖 0 的鄰居是 1)。
+
+        connect[0][2] 的值會變成 -1 (Rank 2 在子圖 0 沒鄰居)。
+        目的：這是為了訓練時的速度。當訓練迴圈跑到幾萬次時，Worker 不用再去遍歷搜尋列表，直接用 Array[0][MyRank] 就能 O(1) 瞬間知道鄰居是誰。
         """
         
         connect = []
@@ -186,18 +198,24 @@ class FixedProcessor(GraphProcessor):
         """ activation probabilities are same for subgraphs """
         return self.commBudget 
 
+    # 計算混合權重
     def getAlpha(self):
         """ there is an analytical expression of alpha in this case """
         L_base = np.zeros((self.size, self.size))
+        # 計算所有subgraph的Laplacian matrix的加總
         for subLMatrix in self.L_matrices:
             L_base += subLMatrix
+        # 計算L_base的特徵值
         w_b, _ = np.linalg.eig(L_base)
+        # 排序特徵值
         lambdaList = list(sorted(w_b))
+        # 計算alpha
         if len(w_b) > 1:
             alpha = 2 / (lambdaList[1] + lambdaList[-1])
 
         return alpha
 
+    # 任務清單，決定哪些subgraph要被激活
     def set_flags(self, iterations):
         """ warning: np.random.seed should be same across workers 
                      so that the activation flags are same

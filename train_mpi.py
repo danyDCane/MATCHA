@@ -229,9 +229,9 @@ if __name__ == "__main__":
         print('No experiment description, exit!')
         exit()
 
-    comm = MPI.COMM_WORLD
-    rank = comm.Get_rank()
-    size = comm.Get_size()
+    comm = MPI.COMM_WORLD  # comm 是 MPI 的 communicator，用於在 process 之間進行通信
+    rank = comm.Get_rank() # rank 是當前 process 的 id
+    size = comm.Get_size() # size 是總共有多少個 process
 
-    run(rank, size)
+    run(rank, size) # 開始訓練
 
