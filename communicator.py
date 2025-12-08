@@ -83,13 +83,13 @@ class decenCommunicator(Communicator):
 
 
     def prepare_comm_buffer(self):
-        # faltten tensors
+        # faltten tensors 壓扁成一條超級長的 1D 向量
         self.send_buffer = flatten_tensors(self.tensor_list).cpu()
         self.recv_buffer = torch.zeros_like(self.send_buffer)
 
 
     def averaging(self, active_flags):
-        
+        # 等待所有 worker 都準備好，確保都有壓扁參數了
         self.comm.barrier()
         tic = time.time()
 
@@ -99,15 +99,18 @@ class decenCommunicator(Communicator):
             if flag == 0:
                 continue
             else:
+                # 如果我在這個子圖有鄰居
                 if self.topology.neighbors_info[graph_id][self.rank] != -1:
                     degree += 1
+                    # 查表：我在這個子圖的鄰居是誰？
                     neighbor_rank = self.topology.neighbors_info[graph_id][self.rank]
-                    # Receive neighbor's model: x_j
+                    # 同時發送我的 (send_buffer) 給他，並接收他的存入 (recv_tmp)
                     self.recv_tmp = self.comm.sendrecv(self.send_buffer, source=neighbor_rank, dest = neighbor_rank)
-                    # Aggregate neighbors' models: alpha * sum_j x_j
+                    # 融合：把他的參數乘上權重，加到我的接收區
+                    # recv_buffer += alpha * neighbor_model
                     self.recv_buffer.add_(self.neighbor_weight, self.recv_tmp)
         
-        # compute self weight according to degree
+        # 檢查完子圖後，計算我的權重
         selfweight = 1 - degree * self.neighbor_weight
         # compute weighted average: (1-d*alpha)x_i + alpha * sum_j x_j
         self.recv_buffer.add_(selfweight, self.send_buffer)
