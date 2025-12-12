@@ -1,0 +1,2 @@
+Namespace(name='Vanilla_DecenSGD', description='Vanilla_DecenSGD_experiment', model='res', lr=0.05, momentum=0.9, epoch=200, bs=64, warmup=True, nesterov=False, matcha=False, budget=1.0, graphid=0, dataset='cifar10', datasetRoot='../AdaDSGD/data/', p=True, savePath='./exp_result_', compress=False, consensus_lr=0.1, randomSeed=1234)
+Vanilla_DecenSGD_experiment

@@ -21,11 +21,12 @@ import torchvision
 from torchvision import datasets, transforms
 import torch.backends.cudnn as cudnn
 import torchvision.models as models
+import wandb
 cudnn.benchmark = True
 
-import resnet
-import vggnet
-import wrn 
+# import resnet
+# import vggnet
+# import wrn 
 import util
 from graph_manager import FixedProcessor, MatchaProcessor
 from communicator import decenCommunicator, ChocoCommunicator, centralizedCommunicator
@@ -59,6 +60,27 @@ def run(rank, size):
     # set random seed
     torch.manual_seed(args.randomSeed+rank)
     np.random.seed(args.randomSeed)
+
+    # initialize wandb for each rank
+    wandb.init(
+        project="MATCHA",
+        name=f"{args.name}_rank{rank}",
+        config={
+            "rank": rank,
+            "size": size,
+            "model": args.model,
+            "lr": args.lr,
+            "epoch": args.epoch,
+            "batch_size": args.bs,
+            "budget": args.budget,
+            "graphid": args.graphid,
+            "dataset": args.dataset,
+            "matcha": args.matcha,
+            "randomSeed": args.randomSeed,
+            "description": args.description,
+        },
+        reinit=True
+    )
 
     # load data
     train_loader, test_loader = util.partition_dataset(rank, size, args)    
@@ -149,6 +171,18 @@ def run(rank, size):
 
         recorder.add_new(record_time,comp_time,comm_time,epoch_time,top1.avg,losses.avg,test_acc)
         print("rank: %d, epoch: %.3f, loss: %.3f, train_acc: %.3f, test_acc: %.3f epoch time: %.3f" % (rank, epoch, losses.avg, top1.avg, test_acc, epoch_time))
+        
+        # log to wandb for each rank
+        wandb.log({
+            "epoch": epoch,
+            "loss": losses.avg.item() if hasattr(losses.avg, 'item') else float(losses.avg),
+            "train_acc": top1.avg.item() if hasattr(top1.avg, 'item') else float(top1.avg),
+            "test_acc": test_acc.item() if hasattr(test_acc, 'item') else float(test_acc),
+            "comp_time": comp_time,
+            "comm_time": comm_time,
+            "epoch_time": epoch_time,
+        })
+        
         if rank == 0:
             print("comp_time: %.3f, comm_time: %.3f, comp_time_budget: %.3f, comm_time_budget: %.3f" % (comp_time, comm_time, comp_time/epoch_time, comm_time/epoch_time))
        
@@ -162,6 +196,7 @@ def run(rank, size):
         tic = time.time()
 
     recorder.save_to_file()
+    wandb.finish()
 
 
 def update_learning_rate(optimizer, epoch, itr=None, itr_per_epoch=None,
