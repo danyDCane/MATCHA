@@ -88,6 +88,7 @@ class GraphProcessor(object):
         for i, subgraph in enumerate(self.subGraphs):
             tmp_G = nx.Graph()
             tmp_G.add_edges_from(subgraph)
+            tmp_G.add_nodes_from(range(self.size))  # <--- 新增這一行
             L_matrices.append(nx.laplacian_matrix(tmp_G, list(range(self.size))).todense())
 
         return L_matrices
@@ -218,22 +219,16 @@ class FixedProcessor(GraphProcessor):
     # 任務清單，決定哪些subgraph要被激活
     def set_flags(self, iterations):
         """ warning: np.random.seed should be same across workers 
-                     so that the activation flags are same
+                    so that the activation flags are same
 
         """
-        iterProb = np.random.binomial(1, self.probabilities, iterations)
         flags = list()
-        idx = 0
-        for prob in iterProb:
-            if idx % 2 == 0:
-                flags.append([0,1])
-            else:
-                flags.append([1,0])
-            
-            idx += 1
-            # flags.append([prob for i in range(len(self.L_matrices))])
-
-        return flags
+        # 為每個子圖生成激活标志，使用相同的概率
+        for i in range(len(self.L_matrices)):
+            flags.append(np.random.binomial(1, self.probabilities, iterations))
+        
+        # 將每個子圖的激活标志轉換為列表
+        return [list(x) for x in zip(*flags)]
 
 class MatchaProcessor(GraphProcessor):
     """ Wrapper for MATCHA

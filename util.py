@@ -23,7 +23,7 @@ import torchvision.models as models
 
 from models import *
 
-import GraphPreprocess 
+# import GraphPreprocess 
 
 class Partition(object):
     """ Dataset-like object, but only access a subset of it. """
@@ -121,9 +121,14 @@ def partition_dataset(rank, size, args):
         ])
         trainset = torchvision.datasets.CIFAR10(root=args.datasetRoot, 
                                                 train=True, 
-                                                download=True, 
+                                                download=(rank == 0),  # 只有 rank 0 下载, 
                                                 transform=transform_train)
- 
+        # 等待下载完成
+        if rank == 0:
+            import time
+            time.sleep(2)  # 给下载一些时间
+        MPI.COMM_WORLD.Barrier()  # 所有进程等待 
+
         partition_sizes = [1.0 / size for _ in range(size)]
         partition = DataPartitioner(trainset, partition_sizes, isNonIID=False)
         partition = partition.use(rank)
@@ -380,17 +385,18 @@ class Recorder(object):
         self.args = args
         self.rank = rank
         self.saveFolderName = args.savePath + args.name + '_' + args.model
-        if rank == 0 and os.path.isdir(self.saveFolderName)==False and self.args.save:
-	        os.mkdir(self.saveFolderName)
-
-    def add_new(self,record_time,comp_time,comm_time,epoch_time,top1,losses,test_acc):
+        if rank == 0 and os.path.isdir(self.saveFolderName)==False and getattr(self.args, 'save', self.args.savePath is not None):
+            os.mkdir(self.saveFolderName)
+    
+    def add_new(self, record_time, comp_time, comm_time, epoch_time, top1, losses, test_acc):
         self.total_record_timing.append(record_time)
         self.record_timing.append(epoch_time)
         self.record_comp_timing.append(comp_time)
         self.record_comm_timing.append(comm_time)
-        self.record_trainacc.append(top1)
-        self.record_losses.append(losses)
-        self.record_accuracy.append(test_acc)
+        # 使用 float() 將 Tensor 轉為純數值，並移出 GPU
+        self.record_trainacc.append(float(top1))
+        self.record_losses.append(float(losses))
+        self.record_accuracy.append(float(test_acc))
 
     def save_to_file(self):
         np.savetxt(self.saveFolderName+'/dsgd-lr'+str(self.args.lr)+'-budget'+str(self.args.budget)+'-r'+str(self.rank)+'-recordtime.log', self.total_record_timing, delimiter=',')

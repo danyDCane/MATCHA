@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import torch.nn.init as init # 補上這行避免 conv_init 報錯
 from torch.autograd import Variable
 import sys
 

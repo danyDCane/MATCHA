@@ -32,6 +32,7 @@ venv/
 *.swp
 *.swo
 *.DS_Store
+wandb/
 
 ########################
 # MATCHA run artifacts
@@ -39,5 +40,6 @@ venv/
 *.log
 *.out
 *.err
+*.txt
 
 
