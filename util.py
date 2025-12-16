@@ -22,6 +22,7 @@ import torch.backends.cudnn as cudnn
 import torchvision.models as models
 
 from models import *
+from pacs_dataset import PACSDataset
 
 # import GraphPreprocess 
 
@@ -57,7 +58,7 @@ class DataPartitioner(object):
             indexes = indexes[part_len:]
 
         if isNonIID:
-            self.partitions = __getNonIIDdata__(self, data, sizes, seed)
+            self.partitions = self.__getNonIIDdata__(data, sizes, seed)
 
     def use(self, partition):
         return Partition(self.data, self.partitions[partition])
@@ -253,6 +254,98 @@ def partition_dataset(rank, size, args):
                                                 shuffle=False, 
                                                 num_workers=size)
  
+    elif args.dataset == 'pacs':
+        print('=' * 60)
+        print(f'[PACS Dataset] Initializing PACS dataset loading...')
+        print(f'[PACS Dataset] Rank: {rank}, Total nodes: {size}')
+        print('=' * 60)
+        
+        # Validate size == 3 for PACS
+        if size != 3:
+            raise ValueError(f'PACS dataset requires exactly 3 nodes, but {size} nodes were provided.')
+        
+        # PACS domains
+        all_domains = ['art_painting', 'cartoon', 'photo', 'sketch']
+        if not args.leave_out:
+            raise ValueError('--leave_out must be specified when using PACS dataset.')
+        if args.leave_out not in all_domains:
+            raise ValueError(f'Invalid leave_out domain: {args.leave_out}. Valid options: {all_domains}')
+        
+        print(f'[PACS Dataset] Leave-out domain: {args.leave_out}')
+        print(f'[PACS Dataset] All domains: {all_domains}')
+        
+        # Get available domains (exclude leave_out)
+        available_domains = [d for d in all_domains if d != args.leave_out]
+        print(f'[PACS Dataset] Available training domains: {available_domains}')
+        
+        # Assign domain to each rank
+        domain_for_rank = available_domains[rank]
+        print(f'[PACS Dataset] Rank {rank} assigned to domain: {domain_for_rank}')
+        print('-' * 60)
+        
+        # Transform for training (matching Dassl's PACS setting)
+        print(f'[PACS Dataset] Rank {rank}: Setting up training transforms...')
+        print(f'[PACS Dataset] Rank {rank}: Using Dassl-compatible transforms (random_flip, random_translation, normalize)')
+        # Equivalent to Dassl's Random2DTranslation:
+        # 50% chance: resize to 1.125x (252x252) then random crop to 224x224
+        # 50% chance: directly resize to 224x224
+        transform_train = transforms.Compose([
+            transforms.Resize((224, 224)),  # Base resize to 224x224
+            # RandomApply with p=0.5: 50% chance to apply enlargement + random crop
+            transforms.RandomApply([
+                transforms.Compose([
+                    transforms.Resize((252, 252)),  # 224 * 1.125 = 252 (enlarge)
+                    transforms.RandomCrop(224)      # Random crop back to 224x224
+                ])
+            ], p=0.5),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        # Load training data for this rank's domain
+        print(f'[PACS Dataset] Rank {rank}: Loading training data from domain "{domain_for_rank}"...')
+        print(f'[PACS Dataset] Rank {rank}: Dataset root: {args.datasetRoot}')
+        train_dataset = PACSDataset(root=args.datasetRoot, 
+                                   dataset_name=domain_for_rank, 
+                                   transform=transform_train)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, 
+            batch_size=args.bs, 
+            shuffle=True, 
+            pin_memory=True
+        )
+        
+        print(f'[PACS Dataset] Rank {rank}: Successfully created training DataLoader')
+        print(f'[PACS Dataset] Rank {rank}: Training samples: {len(train_dataset)}')
+        print(f'[PACS Dataset] Rank {rank}: Batch size: {args.bs}')
+        print(f'[PACS Dataset] Rank {rank}: Number of batches per epoch: {len(train_loader)}')
+        print('-' * 60)
+        
+        # Load test data from leave_out domain
+        print(f'[PACS Dataset] Rank {rank}: Loading test data from leave-out domain "{args.leave_out}"...')
+        transform_test = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        test_dataset = PACSDataset(root=args.datasetRoot, 
+                                  dataset_name=args.leave_out, 
+                                  transform=transform_test)
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset, 
+            batch_size=64, 
+            shuffle=False, 
+            pin_memory=True
+        )
+        
+        print(f'[PACS Dataset] Rank {rank}: Successfully created test DataLoader')
+        print(f'[PACS Dataset] Rank {rank}: Test samples: {len(test_dataset)}')
+        print(f'[PACS Dataset] Rank {rank}: Test batch size: 64')
+        print(f'[PACS Dataset] Rank {rank}: Number of test batches: {len(test_loader)}')
+        print('=' * 60)
+        print(f'[PACS Dataset] Rank {rank}: PACS dataset loading completed successfully!')
+        print('=' * 60)
 
     return train_loader, test_loader
 
@@ -262,7 +355,9 @@ def select_model(num_class, args):
     elif args.model == 'res':
         if args.dataset == 'cifar10':
             # model = large_resnet.ResNet18()
-            model = resnet.ResNet(50, num_class)
+            model = resnet.ResNet(18, num_class)
+        elif args.dataset == 'pacs':
+            model = resnet.ResNet(18, num_class)
         elif args.dataset == 'imagenet':
             model = models.resnet18()
     elif args.model == 'wrn':
@@ -273,6 +368,19 @@ def select_model(num_class, args):
     return model
 
 def select_graph(graphid):
+    # Special case: graphid == -1 for fully connected 3-node graph (used for PACS)
+    if graphid == -1:
+        # Fully connected graph for 3 nodes
+        # Decomposed into 3 matchings:
+        # - [(0,1)] (node 2 isolated)
+        # - [(0,2)] (node 1 isolated)
+        # - [(1,2)] (node 0 isolated)
+        return [
+            [(0, 1)],  # matching 1: edge between node 0 and 1
+            [(0, 2)],  # matching 2: edge between node 0 and 2
+            [(1, 2)]   # matching 3: edge between node 1 and 2
+        ]
+    
     # pre-defined base network topologies
     # you can add more by extending the list
     Graphs =[ 

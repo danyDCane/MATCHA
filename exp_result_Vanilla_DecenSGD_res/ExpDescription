@@ -1,2 +1,2 @@
-Namespace(name='Vanilla_DecenSGD', description='Vanilla_DecenSGD_experiment', model='res', lr=0.05, momentum=0.9, epoch=200, bs=64, warmup=True, nesterov=False, matcha=False, budget=1.0, graphid=0, dataset='cifar10', datasetRoot='../AdaDSGD/data/', p=True, savePath='./exp_result_', compress=False, consensus_lr=0.1, randomSeed=1234)
-Vanilla_DecenSGD_experiment
+Namespace(name='Vanilla_DecenSGD', description='Vanilla_DecenSGD_PACS_experiment', model='res', lr=0.001, momentum=0.9, epoch=200, bs=64, warmup=False, nesterov=False, matcha=False, budget=1.0, graphid=-1, dataset='pacs', datasetRoot='../datasets/', leave_out='art_painting', p=True, savePath='./exp_result_', compress=False, consensus_lr=0.1, randomSeed=1234, total_iter=None, wandb_project='MATCHA_pacs')
+Vanilla_DecenSGD_PACS_experiment
