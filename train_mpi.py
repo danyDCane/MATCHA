@@ -23,6 +23,11 @@ from torchvision import datasets, transforms
 import torch.backends.cudnn as cudnn
 import torchvision.models as models
 import wandb
+
+from style_stats import (
+    compute_multi_layer_style_stats,
+    flatten_style_stats,
+)
 cudnn.benchmark = True
 
 # import resnet
@@ -164,7 +169,42 @@ def run(rank, size):
         data, target = data.cuda(non_blocking = True), target.cuda(non_blocking = True)
         
         # forward pass
-        output = model(data)
+        # If enabled and using ResNet backbone, compute style statistics from
+        # the first three convolutional blocks in the SAME forward pass to
+        # avoid duplicated computation and extra memory.
+        if getattr(args, "use_style_stats", False) and args.model == "res":
+            output, feats = model(data, return_blocks=True)
+
+            # Compute STYLEDDG-style statistics (batch-level, per channel)
+            style_stats = compute_multi_layer_style_stats(
+                feats,
+                eta=getattr(args, "style_eta", 1e-5),
+            )
+
+            # Optional: flatten to a single style vector per batch/device.
+            # This is ready for later style sharing (StyleDDG) if needed.
+            style_vec = flatten_style_stats(
+                style_stats,
+                layer_order=["layer1", "layer2", "layer3"],
+            )
+            # NOTE: Currently we do not modify the loss using style_vec.
+            #       This keeps the training identical unless you plug
+            #       style-based regularization / sharing on top.
+            #       Here we only print a small summary occasionally for sanity check.
+            if rank == 0 and (k == 0 or (k + 1) % STEPS_PER_EPOCH == 0):
+                l1 = style_stats["layer1"]
+                print("\n[StyleStats] iter {}: ".format(k + 1))
+                print("  layer1 mu_bar       shape:", tuple(l1["mu_bar"].shape),
+                      " sample:", l1["mu_bar"][:5].detach().cpu().numpy())
+                print("  layer1 sigma_bar    shape:", tuple(l1["sigma_bar"].shape),
+                      " sample:", l1["sigma_bar"][:5].detach().cpu().numpy())
+                print("  layer1 Sigma_mu_sq  shape:", tuple(l1["Sigma_mu_sq"].shape),
+                      " sample:", l1["Sigma_mu_sq"][:5].detach().cpu().numpy())
+                print("  layer1 Sigma_sigma_sq shape:", tuple(l1["Sigma_sigma_sq"].shape),
+                      " sample:", l1["Sigma_sigma_sq"][:5].detach().cpu().numpy())
+                print("  style_vec length:", int(style_vec.numel()))
+        else:
+            output = model(data)
         loss = criterion(output, target)
 
         # record training loss and accuracy
@@ -298,6 +338,12 @@ if __name__ == "__main__":
     parser.add_argument('--randomSeed', type=int, help='random seed')
     parser.add_argument('--total_iter', type=int, help='total training iterations (if not set, uses epoch * max_steps_per_epoch)')
     parser.add_argument('--wandb_project', default='MATCHA', type=str, help='wandb project name')
+
+    # ===== Style statistics / StyleDDG-related options =====
+    parser.add_argument('--use_style_stats', action='store_true',
+                        help='compute style statistics from first three conv blocks in a single forward pass')
+    parser.add_argument('--style_eta', type=float, default=1e-5,
+                        help='numerical stability constant for style statistics')
 
     args = parser.parse_args()
 

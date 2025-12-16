@@ -5,6 +5,7 @@ mpirun -np 3 \
 python train_mpi.py \
 --wandb_project MATCHA_pacs \
 --dataset pacs \
+--use_style_stats \
 --datasetRoot ../datasets/ \
 --leave_out art_painting \
 --graphid -1 \
