@@ -15,6 +15,7 @@ import torch.utils.data.distributed
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.multiprocessing import Process
 from torch.autograd import Variable
 import torchvision
@@ -63,7 +64,7 @@ def run(rank, size):
 
     # initialize wandb for each rank
     wandb.init(
-        project="MATCHA",
+        project=args.wandb_project,
         name=f"{args.name}_rank{rank}",
         config={
             "rank": rank,
@@ -83,17 +84,43 @@ def run(rank, size):
     )
 
     # load data
-    train_loader, test_loader = util.partition_dataset(rank, size, args)    
-    num_batches = ceil(len(train_loader.dataset) / float(args.bs))
+    train_loader, test_loader = util.partition_dataset(rank, size, args)
+
+    # ====== Infinite iterator + shared STEPS_PER_EPOCH ======
+    # local number of batches on this rank
+    local_steps = len(train_loader)
+    # use MPI allreduce to get the maximum steps across all ranks
+    global comm
+    STEPS_PER_EPOCH = comm.allreduce(local_steps, op=MPI.MAX)
+
+    # total epochs as in original arguments
+    TOTAL_EPOCHS = args.epoch
+    # total iterations K (Algorithm 1)
+    if args.total_iter is not None:
+        K = args.total_iter
+    else:
+        K = STEPS_PER_EPOCH * TOTAL_EPOCHS
+
+    # build infinite iterator over local dataloader
+    def get_infinite_iterator(dataloader):
+        while True:
+            for batch in dataloader:
+                yield batch
+
+    train_iter = get_infinite_iterator(train_loader)
 
     # load base network topology
-    subGraphs = util.select_graph(args.graphid)
-    
-    # define graph activation scheme
-    if args.matcha:
-        GP = MatchaProcessor(subGraphs, args.budget, rank, size, args.epoch*num_batches, True)
+    # For PACS, use fully connected graph for 3 nodes (graphid = -1)
+    if args.dataset == 'pacs':
+        subGraphs = util.select_graph(-1)
     else:
-        GP = FixedProcessor(subGraphs, args.budget, rank, size, args.epoch*num_batches, True)
+        subGraphs = util.select_graph(args.graphid)
+    
+    # define graph activation scheme with K iterations
+    if args.matcha:
+        GP = MatchaProcessor(subGraphs, args.budget, rank, size, K, True)
+    else:
+        GP = FixedProcessor(subGraphs, args.budget, rank, size, K, True)
 
     # define communicator
     if args.compress:
@@ -102,7 +129,8 @@ def run(rank, size):
         communicator = decenCommunicator(rank, size, GP)
 
     # select neural network model
-    model = util.select_model(10, args)
+    num_classes = 7 if args.dataset == 'pacs' else 10
+    model = util.select_model(num_classes, args)
     model = model.cuda()
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = optim.SGD(model.parameters(), 
@@ -110,6 +138,9 @@ def run(rank, size):
                           momentum=args.momentum, 
                           weight_decay=5e-4,
                           nesterov=args.nesterov)
+    
+    # CosineAnnealingLR: T_max = K (total iterations), purely step-based
+    scheduler = CosineAnnealingLR(optimizer, T_max=K, eta_min=0.0)
     
     # guarantee all local models start from the same point
     # can be removed    
@@ -121,79 +152,86 @@ def run(rank, size):
     losses = util.AverageMeter()
     top1 = util.AverageMeter()
     tic = time.time()
-    itr = 0
-    
-    # start training
-    for epoch in range(args.epoch):
+
+    # ===== start training with fixed total steps K (Algorithm 1) =====
+    for k in range(K):
         model.train()
 
-        # Start training each epoch
-        for batch_idx, (data, target) in enumerate(train_loader):
-            start_time = time.time()
-            # data loading 
-            data, target = data.cuda(non_blocking = True), target.cuda(non_blocking = True)                
+        start_time = time.time()
+
+        # sample mini-batch (infinite iterator, cycles through local data)
+        data, target = next(train_iter)
+        data, target = data.cuda(non_blocking = True), target.cuda(non_blocking = True)
+        
+        # forward pass
+        output = model(data)
+        loss = criterion(output, target)
+
+        # record training loss and accuracy
+        record_start = time.time()
+        acc1 = util.comp_accuracy(output, target)
+        losses.update(loss.item(), data.size(0))
+        top1.update(acc1[0], data.size(0))
+        record_end = time.time()
+
+        # backward pass
+        loss.backward()
+
+        # gradient step
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # update cosine annealing scheduler (purely step-based)
+        scheduler.step()
+        end_time = time.time()
+
+        d_comp_time = (end_time - start_time - (record_end - record_start))
+        comp_time += d_comp_time
+
+        # communication happens here (all ranks use the same k)
+        d_comm_time = communicator.communicate(model)
+        comm_time += d_comm_time
+
+        print("iter: %d/%d, rank: %d, comp_time: %.3f, comm_time: %.3f, total time: %.3f "
+              % (k+1, K, rank, d_comp_time, d_comm_time, comp_time + comm_time), end='\r')
+
+        # measure and log after each pseudo-epoch
+        if (k + 1) % STEPS_PER_EPOCH == 0:
+            epoch = (k + 1) // STEPS_PER_EPOCH
+            toc = time.time()
+            record_time = toc - tic  # includes everything
+            epoch_time = comp_time + comm_time  # only important parts
+
+            # evaluate test accuracy
+            test_acc = util.test(model, test_loader)
+
+            recorder.add_new(record_time, comp_time, comm_time, epoch_time,
+                             top1.avg, losses.avg, test_acc)
+            print("rank: %d, epoch: %d, loss: %.3f, train_acc: %.3f, test_acc: %.3f epoch time: %.3f"
+                  % (rank, epoch, losses.avg, top1.avg, test_acc, epoch_time))
             
-            # forward pass
-            output = model(data)
-            loss = criterion(output, target)
+            # log to wandb for each rank
+            wandb.log({
+                "epoch": epoch,
+                "iter": k,
+                "loss": losses.avg.item() if hasattr(losses.avg, 'item') else float(losses.avg),
+                "train_acc": top1.avg.item() if hasattr(top1.avg, 'item') else float(top1.avg),
+                "test_acc": test_acc.item() if hasattr(test_acc, 'item') else float(test_acc),
+                "lr": optimizer.param_groups[0]['lr'],
+                "comp_time": comp_time,
+                "comm_time": comm_time,
+                "epoch_time": epoch_time,
+            })
+            
+            if rank == 0:
+                print("comp_time: %.3f, comm_time: %.3f, comp_time_budget: %.3f, comm_time_budget: %.3f"
+                      % (comp_time, comm_time, comp_time/epoch_time, comm_time/epoch_time))
 
-            # record training loss and accuracy
-            record_start = time.time()
-            acc1 = util.comp_accuracy(output, target)
-            losses.update(loss.item(), data.size(0))
-            top1.update(acc1[0], data.size(0))
-            record_end = time.time()
-
-            # backward pass
-            loss.backward()
-            update_learning_rate(optimizer, epoch, itr=batch_idx, itr_per_epoch=len(train_loader))
-
-            # gradient step
-            optimizer.step()
-            optimizer.zero_grad()
-            end_time = time.time()
-
-            d_comp_time = (end_time - start_time - (record_end - record_start))
-            comp_time += d_comp_time
-
-            # communication happens here
-            d_comm_time = communicator.communicate(model)
-            comm_time += d_comm_time
-
-            print("batch_idx: %d, rank: %d, comp_time: %.3f, comm_time: %.3f,epoch time: %.3f " % (batch_idx+1,rank,d_comp_time, d_comm_time, comp_time+ comm_time), end='\r')
-
-        toc = time.time()
-        record_time = toc - tic # time that includes anything
-        epoch_time = comp_time + comm_time # only include important parts
-
-        # evaluate test accuracy at the end of each epoch
-        test_acc = util.test(model, test_loader)
-
-        recorder.add_new(record_time,comp_time,comm_time,epoch_time,top1.avg,losses.avg,test_acc)
-        print("rank: %d, epoch: %.3f, loss: %.3f, train_acc: %.3f, test_acc: %.3f epoch time: %.3f" % (rank, epoch, losses.avg, top1.avg, test_acc, epoch_time))
-        
-        # log to wandb for each rank
-        wandb.log({
-            "epoch": epoch,
-            "loss": losses.avg.item() if hasattr(losses.avg, 'item') else float(losses.avg),
-            "train_acc": top1.avg.item() if hasattr(top1.avg, 'item') else float(top1.avg),
-            "test_acc": test_acc.item() if hasattr(test_acc, 'item') else float(test_acc),
-            "comp_time": comp_time,
-            "comm_time": comm_time,
-            "epoch_time": epoch_time,
-        })
-        
-        if rank == 0:
-            print("comp_time: %.3f, comm_time: %.3f, comp_time_budget: %.3f, comm_time_budget: %.3f" % (comp_time, comm_time, comp_time/epoch_time, comm_time/epoch_time))
-       
-        if epoch%10 == 0:
-            recorder.save_to_file()
-
-        # reset recorders
-        comp_time, comm_time = 0, 0
-        losses.reset()
-        top1.reset()
-        tic = time.time()
+            # reset recorders for next epoch
+            comp_time, comm_time = 0, 0
+            losses.reset()
+            top1.reset()
+            tic = time.time()
 
     recorder.save_to_file()
     wandb.finish()
@@ -251,12 +289,15 @@ if __name__ == "__main__":
     
     parser.add_argument('--dataset', default='cifar10', type=str, help='the dataset')
     parser.add_argument('--datasetRoot', type=str, help='the path of dataset')
+    parser.add_argument('--leave_out', type=str, default=None, help='leave out domain for PACS dataset (art_painting, cartoon, photo, sketch)')
     parser.add_argument('--p', '-p', action='store_true', help='partition the dataset or not')
     parser.add_argument('--savePath' ,type=str, help='save path')
     
     parser.add_argument('--compress', action='store_true', help='use chocoSGD or not')    
     parser.add_argument('--consensus_lr', default=0.1, type=float, help='consensus_lr')
     parser.add_argument('--randomSeed', type=int, help='random seed')
+    parser.add_argument('--total_iter', type=int, help='total training iterations (if not set, uses epoch * max_steps_per_epoch)')
+    parser.add_argument('--wandb_project', default='MATCHA', type=str, help='wandb project name')
 
     args = parser.parse_args()
 
@@ -267,6 +308,25 @@ if __name__ == "__main__":
     comm = MPI.COMM_WORLD  # comm 是 MPI 的 communicator，用於在 process 之間進行通信
     rank = comm.Get_rank() # rank 是當前 process 的 id
     size = comm.Get_size() # size 是總共有多少個 process
+
+    # Validate PACS requirements
+    if args.dataset == 'pacs':
+        if size != 3:
+            if rank == 0:
+                print(f'Error: PACS dataset requires exactly 3 nodes, but {size} nodes were provided.')
+                print('Please use: mpirun -np 3 python train_mpi.py ...')
+            exit(1)
+        if not args.leave_out:
+            if rank == 0:
+                print('Error: --leave_out must be specified when using PACS dataset.')
+                print('Valid options: art_painting, cartoon, photo, sketch')
+            exit(1)
+        valid_domains = ['art_painting', 'cartoon', 'photo', 'sketch']
+        if args.leave_out not in valid_domains:
+            if rank == 0:
+                print(f'Error: Invalid leave_out domain: {args.leave_out}')
+                print(f'Valid options: {valid_domains}')
+            exit(1)
 
     run(rank, size) # 開始訓練
 
