@@ -104,18 +104,45 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, return_blocks: bool = False):
+        """
+        Forward pass.
+
+        Args:
+            x: input tensor [B, 3, H, W]
+            return_blocks: if True, also return outputs of the first three
+                           convolutional blocks (layer1, layer2, layer3).
+
+        Returns:
+            If return_blocks is False (default):
+                logits: [B, num_classes]
+            If return_blocks is True:
+                logits: [B, num_classes]
+                features: dict with keys 'layer1', 'layer2', 'layer3',
+                          each of shape [B, C, H, W].
+        """
         out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
+
+        # First three convolutional blocks
+        out1 = self.layer1(out)
+        out2 = self.layer2(out1)
+        out3 = self.layer3(out2)
+
         # Use adaptive average pooling to support different input sizes
         # (e.g., 32x32 for CIFAR-10, 224x224 for PACS)
-        out = F.adaptive_avg_pool2d(out, 1)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
+        feat = F.adaptive_avg_pool2d(out3, 1)
+        feat = feat.view(feat.size(0), -1)
+        logits = self.linear(feat)
 
-        return out
+        if return_blocks:
+            features = {
+                "layer1": out1,
+                "layer2": out2,
+                "layer3": out3,
+            }
+            return logits, features
+
+        return logits
 
 if __name__ == '__main__':
     net=ResNet(50, 10)
