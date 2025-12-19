@@ -232,6 +232,10 @@ def run(rank, size):
         d_comm_time = communicator.communicate(model)
         comm_time += d_comm_time
 
+        # 每隔一定次數清理 GPU 緩存，避免記憶體累積（可選，避免頻繁清理影響性能）
+        if (k + 1) % 20 == 0:  # 每 20 個 iteration 清理一次
+            torch.cuda.empty_cache()
+
         print("iter: %d/%d, rank: %d, comp_time: %.3f, comm_time: %.3f, total time: %.3f "
               % (k+1, K, rank, d_comp_time, d_comm_time, comp_time + comm_time), end='\r')
 
@@ -242,8 +246,14 @@ def run(rank, size):
             record_time = toc - tic  # includes everything
             epoch_time = comp_time + comm_time  # only important parts
 
+            # 在測試前清理 GPU 緩存，釋放未使用的記憶體
+            torch.cuda.empty_cache()
+            
             # evaluate test accuracy
             test_acc = util.test(model, test_loader)
+            
+            # 測試後再次清理緩存，確保記憶體被釋放
+            torch.cuda.empty_cache()
 
             recorder.add_new(record_time, comp_time, comm_time, epoch_time,
                              top1.avg, losses.avg, test_acc)
