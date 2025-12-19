@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.nn.init as init # 補上這行避免 conv_init 報錯
 from torch.autograd import Variable
 import sys
+import numpy as np
 
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=True)
@@ -143,6 +144,82 @@ class ResNet(nn.Module):
             return logits, features
 
         return logits
+
+class StandardResNetWrapper(nn.Module):
+    """
+    Wrapper for torchvision ResNet to support return_blocks functionality.
+    This allows extracting intermediate features from layer1, layer2, layer3.
+    """
+    def __init__(self, depth, num_classes):
+        super(StandardResNetWrapper, self).__init__()
+        from torchvision.models import resnet18, resnet34, resnet50, resnet101, resnet152
+        
+        # 根據 depth 選擇對應的 ResNet
+        resnet_dict = {
+            18: resnet18,
+            34: resnet34,
+            50: resnet50,
+            101: resnet101,
+            152: resnet152
+        }
+        
+        if depth not in resnet_dict:
+            raise ValueError(f"ResNet depth {depth} not supported. Choose from {list(resnet_dict.keys())}")
+        
+        # 創建 ResNet 模型（pretrained=False）
+        self.backbone = resnet_dict[depth](pretrained=False)
+        
+        # 修改最後一層以匹配 num_classes
+        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
+    
+    def forward(self, x, return_blocks: bool = False):
+        """
+        Forward pass with optional intermediate feature extraction.
+        
+        Args:
+            x: input tensor [B, 3, H, W]
+            return_blocks: if True, also return outputs of layer1, layer2, layer3
+        
+        Returns:
+            If return_blocks is False:
+                logits: [B, num_classes]
+            If return_blocks is True:
+                logits: [B, num_classes]
+                features: dict with keys 'layer1', 'layer2', 'layer3'
+        """
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+        
+        # Extract intermediate features if needed
+        if return_blocks:
+            out1 = self.backbone.layer1(x)
+            out2 = self.backbone.layer2(out1)
+            out3 = self.backbone.layer3(out2)
+            out4 = self.backbone.layer4(out3)
+            
+            # Global average pooling
+            feat = self.backbone.avgpool(out4)
+            feat = feat.view(feat.size(0), -1)
+            logits = self.backbone.fc(feat)
+            
+            features = {
+                "layer1": out1,
+                "layer2": out2,
+                "layer3": out3,
+            }
+            return logits, features
+        else:
+            x = self.backbone.layer1(x)
+            x = self.backbone.layer2(x)
+            x = self.backbone.layer3(x)
+            x = self.backbone.layer4(x)
+            
+            x = self.backbone.avgpool(x)
+            x = x.view(x.size(0), -1)
+            logits = self.backbone.fc(x)
+            return logits
 
 if __name__ == '__main__':
     net=ResNet(50, 10)

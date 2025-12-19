@@ -225,7 +225,11 @@ class FixedProcessor(GraphProcessor):
         flags = list()
         # 為每個子圖生成激活标志，使用相同的概率
         for i in range(len(self.L_matrices)):
-            flags.append(np.random.binomial(1, self.probabilities, iterations))
+            if self.probabilities == 1.0:
+                # 如果概率為 1.0，直接設置為全 1，避免隨機性和提高效率
+                flags.append(np.ones(iterations, dtype=np.int32))
+            else:
+                flags.append(np.random.binomial(1, self.probabilities, iterations))
         
         # 將每個子圖的激活标志轉換為列表
         return [list(x) for x in zip(*flags)]
