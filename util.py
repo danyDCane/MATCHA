@@ -524,9 +524,12 @@ def test(model, test_loader):
     top1 = AverageMeter()
     # correct = 0
     # total = 0
-    for batch_idx, (inputs, targets) in enumerate(test_loader):
-        inputs, targets = inputs.cuda(non_blocking=True), targets.cuda(non_blocking=True)
-        outputs = model(inputs)
-        acc1 = comp_accuracy(outputs, targets)
-        top1.update(acc1[0], inputs.size(0))
+    with torch.no_grad():  # 確保不建立計算圖，節省顯存
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
+            inputs, targets = inputs.cuda(non_blocking=True), targets.cuda(non_blocking=True)
+            outputs = model(inputs)
+            acc1 = comp_accuracy(outputs, targets)
+            top1.update(acc1[0], inputs.size(0))
+            # 每個 batch 後清理臨時變量，避免記憶體累積
+            del inputs, targets, outputs
     return top1.avg

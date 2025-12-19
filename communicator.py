@@ -68,10 +68,12 @@ class centralizedCommunicator(Communicator):
 
     def reset_model(self):
         # Reset local models to be the averaged model
-        for f, t in zip(unflatten_tensors(
-                        self.recv_buffer.cuda(), self.tensor_list), 
-                        self.tensor_list):
+        unflattened = unflatten_tensors(
+            self.recv_buffer.cuda(), self.tensor_list)
+        for f, t in zip(unflattened, self.tensor_list):
             t.set_(f)
+        # 明確釋放臨時變量，避免記憶體累積
+        del unflattened
 
 class decenCommunicator(Communicator):
     """ decentralized averaging according to a topology sequence """
@@ -123,10 +125,12 @@ class decenCommunicator(Communicator):
 
     def reset_model(self):
         # Reset local models to be the averaged model
-        for f, t in zip(unflatten_tensors(
-                        self.recv_buffer.cuda(), self.tensor_list), 
-                        self.tensor_list):
+        unflattened = unflatten_tensors(
+            self.recv_buffer.cuda(), self.tensor_list)
+        for f, t in zip(unflattened, self.tensor_list):
             t.set_(f)
+        # 明確釋放臨時變量，避免記憶體累積
+        del unflattened
 
 
     def communicate(self, model):
@@ -230,10 +234,12 @@ class ChocoCommunicator(Communicator):
 
     def reset_model(self):
         # Reset local models to be the averaged model
-        for f, t in zip(unflatten_tensors(
-                        self.x.cuda(), self.tensor_list), 
-                        self.tensor_list):
+        unflattened = unflatten_tensors(
+            self.x.cuda(), self.tensor_list)
+        for f, t in zip(unflattened, self.tensor_list):
             t.set_(f)
+        # 明確釋放臨時變量，避免記憶體累積
+        del unflattened
 
     def communicate(self, model):
         # get activated topology at current iteration
