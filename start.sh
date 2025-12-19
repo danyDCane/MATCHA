@@ -3,8 +3,9 @@ mpirun -np 3 \
 -map-by slot \
 -mca pml ob1 -mca btl ^openib \
 python train_mpi.py \
---wandb_project MATCHA_pacs \
+--wandb_project MATCHA_pacs_standard \
 --dataset pacs \
+--use_style_stats \
 --datasetRoot ../datasets/ \
 --leave_out art_painting \
 --graphid -1 \
@@ -15,6 +16,7 @@ python train_mpi.py \
 --momentum 0.9 \
 -n Vanilla_DecenSGD \
 --model res \
+--resnet_type standard \
 -p \
 --description Vanilla_DecenSGD_PACS_experiment \
 --savePath ./exp_result_ \

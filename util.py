@@ -353,12 +353,24 @@ def select_model(num_class, args):
     if args.model == 'VGG':
         model = vggnet.VGG(16, num_class)
     elif args.model == 'res':
+        # 獲取 resnet_type 參數，默認為 'simplified'
+        resnet_type = getattr(args, 'resnet_type', 'simplified')
+        
         if args.dataset == 'cifar10':
-            # model = large_resnet.ResNet18()
-            model = resnet.ResNet(18, num_class)
+            if resnet_type == 'standard':
+                from models.resnet import StandardResNetWrapper
+                model = StandardResNetWrapper(18, num_class)
+            else:
+                # model = large_resnet.ResNet18()
+                model = resnet.ResNet(18, num_class)
         elif args.dataset == 'pacs':
-            model = resnet.ResNet(18, num_class)
+            if resnet_type == 'standard':
+                from models.resnet import StandardResNetWrapper
+                model = StandardResNetWrapper(18, num_class)
+            else:
+                model = resnet.ResNet(18, num_class)
         elif args.dataset == 'imagenet':
+            # ImageNet 默認使用標準 ResNet
             model = models.resnet18()
     elif args.model == 'wrn':
         model = wrn.Wide_ResNet(28,10,0,num_class)
