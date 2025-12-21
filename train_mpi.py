@@ -168,43 +168,110 @@ def run(rank, size):
         data, target = next(train_iter)
         data, target = data.cuda(non_blocking = True), target.cuda(non_blocking = True)
         
-        # forward pass
-        # If enabled and using ResNet backbone, compute style statistics from
-        # the first three convolutional blocks in the SAME forward pass to
-        # avoid duplicated computation and extra memory.
+        # ========== 第一阶段：计算风格统计量（不训练）==========
+        # If enabled, compute style statistics first without gradients
+        # This allows us to exchange style statistics before training
+        style_vec = None
+        if (getattr(args, "use_style_stats", False) or getattr(args, "use_style_shift", False)) and args.model == "res":
+            with torch.no_grad():  # 不计算梯度，节省内存
+                # 只提取特征到 layer3，不应用 style shift
+                feats = model.extract_features_to_layer3(data)
+                
+                # Compute STYLEDDG-style statistics (batch-level, per channel)
+                style_stats = compute_multi_layer_style_stats(
+                    feats,
+                    eta=getattr(args, "style_eta", 1e-5),
+                )
+                
+                # Extract channel information from style_stats for unflattening received neighbor stats
+                # Only set once (on first iteration or when not set)
+                if communicator.channels_per_layer is None:
+                    channels_per_layer = {}
+                    for layer_name in ["layer1", "layer2", "layer3"]:
+                        if layer_name in style_stats:
+                            # Get channel count from mu_bar shape
+                            channels_per_layer[layer_name] = style_stats[layer_name]["mu_bar"].shape[0]
+                    communicator.set_style_channels(channels_per_layer)
+                
+                # Flatten to a single style vector per batch/device for communication
+                style_vec = flatten_style_stats(
+                    style_stats,
+                    layer_order=["layer1", "layer2", "layer3"],
+                )
+                # Detach from computation graph and move to CPU for communication
+                style_vec = style_vec.detach().cpu()
+        
+        # ========== 通信交换风格统计量 ==========
+        # Exchange style statistics only (no model parameters) with neighbors
+        # If style_vec is provided, only exchange style statistics; if None, only exchange model parameters
+        d_comm_time = communicator.communicate(model, style_vec=style_vec)
+        comm_time += d_comm_time
+
+        # Verify style statistics exchange (print every epoch)
         if getattr(args, "use_style_stats", False) and args.model == "res":
-            output, feats = model(data, return_blocks=True)
-
-            # Compute STYLEDDG-style statistics (batch-level, per channel)
-            style_stats = compute_multi_layer_style_stats(
-                feats,
-                eta=getattr(args, "style_eta", 1e-5),
-            )
-
-            # Optional: flatten to a single style vector per batch/device.
-            # This is ready for later style sharing (StyleDDG) if needed.
-            style_vec = flatten_style_stats(
-                style_stats,
-                layer_order=["layer1", "layer2", "layer3"],
-            )
-            # NOTE: Currently we do not modify the loss using style_vec.
-            #       This keeps the training identical unless you plug
-            #       style-based regularization / sharing on top.
-            #       Here we only print a small summary occasionally for sanity check.
-            if rank == 0 and (k == 0 or (k + 1) % STEPS_PER_EPOCH == 0):
-                l1 = style_stats["layer1"]
-                print("\n[StyleStats] iter {}: ".format(k + 1))
-                print("  layer1 mu_bar       shape:", tuple(l1["mu_bar"].shape),
-                      " sample:", l1["mu_bar"][:5].detach().cpu().numpy())
-                print("  layer1 sigma_bar    shape:", tuple(l1["sigma_bar"].shape),
-                      " sample:", l1["sigma_bar"][:5].detach().cpu().numpy())
-                print("  layer1 Sigma_mu_sq  shape:", tuple(l1["Sigma_mu_sq"].shape),
-                      " sample:", l1["Sigma_mu_sq"][:5].detach().cpu().numpy())
-                print("  layer1 Sigma_sigma_sq shape:", tuple(l1["Sigma_sigma_sq"].shape),
-                      " sample:", l1["Sigma_sigma_sq"][:5].detach().cpu().numpy())
-                print("  style_vec length:", int(style_vec.numel()))
+            if k == 0 or (k + 1) % STEPS_PER_EPOCH == 0:
+                # Use MPI barrier to synchronize output
+                comm.barrier()
+                # Print in rank order to avoid output mixing
+                for r in range(size):
+                    if rank == r:
+                        # Collect all output into a single string first
+                        output_lines = []
+                        output_lines.append("\n[StyleStats Exchange] iter {}, rank {}: ".format(k + 1, rank))
+                        # Print local style vector info
+                        if communicator.local_style_vec is not None:
+                            local_vec = communicator.local_style_vec
+                            output_lines.append("  Local style_vec: shape={}, sample={}".format(
+                                tuple(local_vec.shape), 
+                                local_vec[:3].numpy().tolist() if len(local_vec) >= 3 else local_vec.numpy().tolist()))
+                        else:
+                            output_lines.append("  Local style_vec: None")
+                        # Print neighbor style vectors info
+                        if communicator.neighbor_style_vecs:
+                            neighbor_info = "  Received {} neighbor(s): ".format(len(communicator.neighbor_style_vecs))
+                            for neighbor_rank, neighbor_vec in communicator.neighbor_style_vecs.items():
+                                neighbor_info += "rank{}[shape={}] ".format(neighbor_rank, tuple(neighbor_vec.shape))
+                            output_lines.append(neighbor_info)
+                            # Print unflattened stats info if available
+                            if communicator.neighbor_style_stats:
+                                output_lines.append("  Unflattened neighbor style stats:")
+                                for neighbor_rank, neighbor_stats in communicator.neighbor_style_stats.items():
+                                    output_lines.append("    Rank {}:".format(neighbor_rank))
+                                    for layer_name, layer_stats in neighbor_stats.items():
+                                        output_lines.append("      {}: mu_bar{}, sigma_bar{}, Sigma_mu_sq{}, Sigma_sigma_sq{}".format(
+                                            layer_name,
+                                            tuple(layer_stats["mu_bar"].shape),
+                                            tuple(layer_stats["sigma_bar"].shape),
+                                            tuple(layer_stats["Sigma_mu_sq"].shape),
+                                            tuple(layer_stats["Sigma_sigma_sq"].shape)
+                                        ))
+                        else:
+                            output_lines.append("  No neighbor style_vecs received")
+                        # Print all at once to avoid interleaving
+                        print("\n".join(output_lines))
+                        sys.stdout.flush()
+                    comm.barrier()  # Wait for each rank to finish printing
+        
+        # ========== 第二阶段：正式训练（使用交换到的风格统计量）==========
+        # Now forward with style shift using the exchanged neighbor style statistics
+        use_style_stats = getattr(args, "use_style_stats", False)
+        use_style_shift = getattr(args, "use_style_shift", False)
+        debug_style_shift = ((k % STEPS_PER_EPOCH) == 0) # Enable debug output for style shift
+        
+        if (use_style_stats or use_style_shift) and args.model == "res":
+            # This forward will use communicator.neighbor_style_stats (just exchanged)
+            # If use_style_stats is True, we need return_blocks for potential future use
+            # If use_style_shift is True, we need communicator for style shift
+            if use_style_stats:
+                output, feats = model(data, return_blocks=True, communicator=communicator,
+                                     debug_style_shift=debug_style_shift, iter_num=k+1, rank=rank)
+            else:
+                # Only use_style_shift is True, don't need return_blocks
+                output = model(data, return_blocks=False, communicator=communicator,
+                              debug_style_shift=debug_style_shift, iter_num=k+1, rank=rank)
         else:
             output = model(data)
+        
         loss = criterion(output, target)
 
         # record training loss and accuracy
@@ -223,14 +290,20 @@ def run(rank, size):
 
         # update cosine annealing scheduler (purely step-based)
         scheduler.step()
+        
+        # ========== 第三阶段：交换训练后的模型参数 ==========
+        # Exchange updated model parameters after training step
+        # Note: style_vec is None here since we only exchange model parameters (not style stats)
+        d_comm_time_after = communicator.communicate(model, style_vec=None)
+        comm_time += d_comm_time_after
+        
         end_time = time.time()
 
         d_comp_time = (end_time - start_time - (record_end - record_start))
         comp_time += d_comp_time
-
-        # communication happens here (all ranks use the same k)
-        d_comm_time = communicator.communicate(model)
-        comm_time += d_comm_time
+        
+        # Access neighbor style vectors if needed for loss calculation
+        # neighbor_style_vecs = communicator.neighbor_style_vecs  # Dict: {neighbor_rank: style_vec_tensor}
 
         # 每隔一定次數清理 GPU 緩存，避免記憶體累積（可選，避免頻繁清理影響性能）
         if (k + 1) % 20 == 0:  # 每 20 個 iteration 清理一次
@@ -357,6 +430,14 @@ if __name__ == "__main__":
                         help='compute style statistics from first three conv blocks in a single forward pass')
     parser.add_argument('--style_eta', type=float, default=1e-5,
                         help='numerical stability constant for style statistics')
+    
+    # ===== Style Shift options =====
+    parser.add_argument('--use_style_shift', action='store_true',
+                        help='enable style shift: transform part of batch to neighbor style using AdaIN')
+    parser.add_argument('--style_shift_prob', type=float, default=0.5,
+                        help='probability of activating style shift module (default: 0.5)')
+    parser.add_argument('--style_shift_ratio', type=float, default=0.5,
+                        help='ratio of samples in batch to be transformed (default: 0.5)')
 
     args = parser.parse_args()
 

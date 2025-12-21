@@ -112,6 +112,61 @@ def flatten_style_stats(
     return torch.cat(vecs, dim=0)
 
 
+def unflatten_style_stats(
+    style_vec: torch.Tensor,
+    layer_order: List[str],
+    channels_per_layer: Dict[str, int],
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """
+    Unflatten a 1D style vector back into the original multi-layer style statistics format.
+    
+    This is the inverse operation of flatten_style_stats.
+    
+    Args:
+        style_vec: 1D tensor containing concatenated stats from all layers
+        layer_order: the order of layers, e.g. ["layer1", "layer2", "layer3"]
+        channels_per_layer: dict mapping layer_name -> number of channels, e.g. {"layer1": 64, "layer2": 128, "layer3": 256}
+    
+    Returns:
+        Dict mapping layer_name -> dict of 4 statistics:
+            {
+                "layer1": {"mu_bar": [C1], "sigma_bar": [C1], "Sigma_mu_sq": [C1], "Sigma_sigma_sq": [C1]},
+                "layer2": {"mu_bar": [C2], "sigma_bar": [C2], "Sigma_mu_sq": [C2], "Sigma_sigma_sq": [C2]},
+                ...
+            }
+    """
+    stats = {}
+    offset = 0
+    
+    for layer_name in layer_order:
+        if layer_name not in channels_per_layer:
+            raise KeyError(f"Channel count for layer '{layer_name}' not found in channels_per_layer")
+        
+        C = channels_per_layer[layer_name]
+        # Each layer has 4 statistics, each of size C
+        layer_size = 4 * C
+        
+        # Extract this layer's portion from style_vec
+        layer_vec = style_vec[offset:offset + layer_size]
+        
+        # Split into 4 statistics
+        mu_bar = layer_vec[0*C:(0+1)*C]
+        sigma_bar = layer_vec[1*C:(1+1)*C]
+        Sigma_mu_sq = layer_vec[2*C:(2+1)*C]
+        Sigma_sigma_sq = layer_vec[3*C:(3+1)*C]
+        
+        stats[layer_name] = {
+            "mu_bar": mu_bar,
+            "sigma_bar": sigma_bar,
+            "Sigma_mu_sq": Sigma_mu_sq,
+            "Sigma_sigma_sq": Sigma_sigma_sq,
+        }
+        
+        offset += layer_size
+    
+    return stats
+
+
 def extract_resnet_block_features(
     model: nn.Module,
     x: torch.Tensor,
@@ -187,6 +242,7 @@ __all__ = [
     "compute_layer_style_stats",
     "compute_multi_layer_style_stats",
     "flatten_style_stats",
+    "unflatten_style_stats",
     "extract_resnet_block_features",
     # "get_resnet_style_vector",
 ]

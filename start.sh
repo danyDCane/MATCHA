@@ -3,7 +3,7 @@ mpirun -np 3 \
 -map-by slot \
 -mca pml ob1 -mca btl ^openib \
 python train_mpi.py \
---wandb_project MATCHA_pacs_standard \
+--wandb_project Test_style_shift \
 --dataset pacs \
 --use_style_stats \
 --datasetRoot ../datasets/ \
@@ -20,4 +20,5 @@ python train_mpi.py \
 -p \
 --description Vanilla_DecenSGD_PACS_experiment \
 --savePath ./exp_result_ \
---randomSeed 1234
+--randomSeed 1234 \
+--use_style_shift \
