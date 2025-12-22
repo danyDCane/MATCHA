@@ -255,3 +255,190 @@ class StyleShift(nn.Module):
         
         return features
 
+
+class StyleExplore(nn.Module):
+    """
+    Style Explore module that performs style extrapolation to generate novel, extreme styles.
+    
+    This module:
+    1. Calculates instance-level and batch-level average style statistics
+    2. Selects a subset of samples to modify
+    3. Extrapolates the selected samples' styles away from the batch center
+    4. Applies AdaIN to transfer the extrapolated styles
+    5. Replaces the original samples with the modified ones
+    """
+    
+    def __init__(self, alpha: float = 3.0, explore_ratio: float = 0.5):
+        """
+        Args:
+            alpha: Extrapolation coefficient. The paper recommends alpha = 3.0
+            explore_ratio: Fixed ratio of samples in the batch to be modified (0.0 to 1.0)
+        """
+        super(StyleExplore, self).__init__()
+        self.alpha = alpha
+        self.explore_ratio = explore_ratio
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        layer_name: str = "",
+        training: bool = True,
+        verbose: bool = False,
+        iter_num: int = -1,
+        rank: int = -1
+    ) -> torch.Tensor:
+        """
+        Apply style exploration (extrapolation) to features.
+        
+        Args:
+            x: Input feature map of shape [B, C, H, W]
+            layer_name: Name of the layer (e.g., "layer1", "layer2", "layer3")
+            training: Whether in training mode
+            verbose: If True, print debug information
+            iter_num: Current iteration number (for debugging)
+            rank: Current rank (for debugging)
+        
+        Returns:
+            Features with style exploration applied (or original features if not applied)
+        """
+        # Step 1: Only apply during training
+        if not training:
+            if verbose:
+                print(f"[StyleExplore {layer_name}] Skipped: not in training mode")
+            return x
+        
+        B, C, H, W = x.shape
+        eps = 1e-5
+        device = x.device
+        
+        # Step 2: Statistics Calculation
+        # Calculate instance-level statistics for every sample in the batch
+        x_flat = x.view(B, C, -1)  # [B, C, H*W]
+        
+        # μ_original: instance-level mean for each sample [B, C]
+        mu_original = x_flat.mean(dim=2)  # [B, C]
+        
+        # σ_original: instance-level std for each sample [B, C]
+        var_original = x_flat.var(dim=2, unbiased=False)  # [B, C]
+        sigma_original = torch.sqrt(var_original + eps)  # [B, C]
+        
+        # Calculate batch-level average style statistics
+        # μ_batch_avg = mean(μ_original, dim=0) [C]
+        mu_batch_avg = mu_original.mean(dim=0)  # [C]
+        
+        # σ_batch_avg = mean(σ_original, dim=0) [C]
+        sigma_batch_avg = sigma_original.mean(dim=0)  # [C]
+        
+        # Detach batch averages from computation graph (used as reference point)
+        mu_batch_avg_detached = mu_batch_avg.detach()
+        sigma_batch_avg_detached = sigma_batch_avg.detach()
+        
+        # Step 3: Selection
+        # Determine number of samples to explore: B_e
+        B_e = max(1, int(B * self.explore_ratio))
+        
+        # Randomly select indices
+        explore_indices = torch.randperm(B, device=device)[:B_e]
+        
+        if verbose:
+            print(f"[StyleExplore {layer_name}] explore_indices (first 10): {explore_indices[:10].tolist()}")
+        
+        if len(explore_indices) == 0:
+            if verbose:
+                print(f"[StyleExplore {layer_name}] Skipped: no samples selected")
+            return x
+        
+        # Step 4: Extrapolation (The "Explore" Step)
+        # For selected indices, calculate new target style statistics using extrapolation formula:
+        # μ_new = μ_original + α × (μ_original - μ_batch_avg)
+        # σ_new = σ_original + α × (σ_original - σ_batch_avg)
+        
+        # Extract statistics for selected samples
+        mu_selected = mu_original[explore_indices]  # [B_e, C]
+        sigma_selected = sigma_original[explore_indices]  # [B_e, C]
+        
+        # Calculate extrapolated statistics
+        # μ_new = μ_original + alpha * (μ_original - μ_batch_avg)
+        mu_new = mu_selected + self.alpha * (mu_selected - mu_batch_avg_detached.unsqueeze(0))  # [B_e, C]
+        
+        # σ_new = σ_original + alpha * (σ_original - σ_batch_avg)
+        sigma_new = sigma_selected + self.alpha * (sigma_selected - sigma_batch_avg_detached.unsqueeze(0))  # [B_e, C]
+        
+        # Ensure sigma_new is positive
+        sigma_new = torch.clamp(sigma_new, min=eps)
+        
+        if verbose:
+            d_mu_before = (mu_selected - mu_batch_avg_detached.unsqueeze(0)).norm(dim=1).mean()
+            d_mu_after  = (mu_new      - mu_batch_avg_detached.unsqueeze(0)).norm(dim=1).mean()
+            print(f"[StyleExplore {layer_name}] extrapolation_ratio(mu): "
+                f"{(d_mu_after/(d_mu_before+1e-12)).item():.3f} (expected {1+self.alpha:.3f})")
+
+            d_s_before = (sigma_selected - sigma_batch_avg_detached.unsqueeze(0)).norm(dim=1).mean()
+            d_s_after  = (sigma_new      - sigma_batch_avg_detached.unsqueeze(0)).norm(dim=1).mean()
+            print(f"[StyleExplore {layer_name}] extrapolation_ratio(std): "
+                f"{(d_s_after/(d_s_before+1e-12)).item():.3f} (expected {1+self.alpha:.3f})")
+        
+        # Step 5: Style Transfer
+        # Extract features to modify
+        x_selected = x[explore_indices]  # [B_e, C, H, W]
+        
+        # Apply AdaIN in batch (more efficient than looping)
+        # Since each sample has unique mu_new and sigma_new, we process them together
+        # using broadcasting: mu_new [B_e, C] and sigma_new [B_e, C]
+        x_selected_flat = x_selected.view(B_e, C, -1)  # [B_e, C, H*W]
+        
+        # Compute content statistics (per sample, per channel)
+        content_mean = x_selected_flat.mean(dim=2)  # [B_e, C]
+        content_var = x_selected_flat.var(dim=2, unbiased=False)  # [B_e, C]
+        content_std = torch.sqrt(content_var + eps)  # [B_e, C]
+        
+        # Normalize content: (x - mean) / std
+        content_norm = (x_selected_flat - content_mean.unsqueeze(2)) / content_std.unsqueeze(2)  # [B_e, C, H*W]
+        
+        # Apply target style: normalized * target_std + target_mean
+        # mu_new and sigma_new are [B_e, C], expand to [B_e, C, 1] for broadcasting
+        mu_new_expanded = mu_new.unsqueeze(2)  # [B_e, C, 1]
+        sigma_new_expanded = sigma_new.unsqueeze(2)  # [B_e, C, 1]
+        
+        x_explored_flat = content_norm * sigma_new_expanded + mu_new_expanded  # [B_e, C, H*W]
+        x_explored = x_explored_flat.view(B_e, C, H, W)  # [B_e, C, H, W]
+        
+        if verbose:
+            # Compute stats before/after for debugging
+            def _mean_std_per_sample(z):
+                Be, C, H, W = z.shape
+                zf = z.view(Be, C, -1)
+                mu = zf.mean(dim=2)  # [Be, C]
+                var = zf.var(dim=2, unbiased=False)
+                std = torch.sqrt(var + eps)  # [Be, C]
+                return mu, std
+
+            mu_a, std_a = _mean_std_per_sample(x_explored.detach())      # [Be, C]
+            # 目標就是 mu_new / sigma_new（也是 [Be, C]）
+            rel_mu = (mu_a - mu_new).norm() / (mu_new.norm() + 1e-12)
+            rel_std = (std_a - sigma_new).norm() / (sigma_new.norm() + 1e-12)
+            
+            delta = (x_explored.detach() - x_selected.detach()).abs().mean()
+            has_nan = torch.isnan(x_explored).any().item()
+            has_inf = torch.isinf(x_explored).any().item()
+            
+            print(f"[StyleExplore {layer_name}] AdaIN check: "
+                  f"rel_mu={rel_mu.item():.3e}, rel_std={rel_std.item():.3e}, "
+                  f"mean_abs_delta={delta.item():.3e}, nan={has_nan}, inf={has_inf}")
+        
+        # Step 6: Merge results
+        # Create output copy and replace selected samples
+        output = x.clone()
+        output[explore_indices] = x_explored
+        
+        if verbose:
+            print(f"[StyleExplore {layer_name}] Rank {rank}, Iter {iter_num}: "
+                  f"Applied to {len(explore_indices)}/{B} samples, "
+                  f"alpha={self.alpha}, "
+                  f"mu_new_range=[{mu_new.min():.4f}, {mu_new.max():.4f}], "
+                  f"sigma_new_range=[{sigma_new.min():.4f}, {sigma_new.max():.4f}]")
+            print(f"[StyleExplore {layer_name}] mu_new_norm_mean={mu_new.norm(dim=1).mean().item():.3f} "
+                  f"sigma_new_norm_mean={sigma_new.norm(dim=1).mean().item():.3f}")
+
+        return output
+

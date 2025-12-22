@@ -5,7 +5,7 @@ import torch.nn.init as init # 補上這行避免 conv_init 報錯
 from torch.autograd import Variable
 import sys
 import numpy as np
-from style_transforms import StyleShift
+from style_transforms import StyleShift, StyleExplore
 import random
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=True)
@@ -83,12 +83,15 @@ class Bottleneck(nn.Module):
         return out
 
 class ResNet(nn.Module):
-    def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5):
+    def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5, 
+                 style_explore_alpha=3.0, style_explore_ratio=0.5):
         super(ResNet, self).__init__()
         self.in_planes = 16
         self.style_shift_prob = style_shift_prob  # 保存为实例属性
         self.style_shift_ratio = style_shift_ratio  # 也可以保存（如果需要）
         self.use_style_shift = use_style_shift
+        self.style_explore_alpha = style_explore_alpha
+        self.style_explore_ratio = style_explore_ratio
 
         block, num_blocks = cfg(depth)
 
@@ -99,11 +102,15 @@ class ResNet(nn.Module):
         self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
         self.linear = nn.Linear(64*block.expansion, num_classes)
         
-        # Initialize StyleShift modules for each layer
+        # Initialize StyleShift and StyleExplore modules for each layer
         if self.use_style_shift:
             self.style_shift1 = StyleShift(activation_prob=style_shift_prob, shift_ratio=style_shift_ratio)
             self.style_shift2 = StyleShift(activation_prob=style_shift_prob, shift_ratio=style_shift_ratio)
             self.style_shift3 = StyleShift(activation_prob=style_shift_prob, shift_ratio=style_shift_ratio)
+            # StyleExplore unconditionally follows StyleShift
+            self.style_explore1 = StyleExplore(alpha=style_explore_alpha, explore_ratio=style_explore_ratio)
+            self.style_explore2 = StyleExplore(alpha=style_explore_alpha, explore_ratio=style_explore_ratio)
+            self.style_explore3 = StyleExplore(alpha=style_explore_alpha, explore_ratio=style_explore_ratio)
 
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
@@ -169,18 +176,27 @@ class ResNet(nn.Module):
             if self.training and random.random() <= self.style_shift_prob:
                 out1 = self.style_shift1(out1, "layer1", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                # StyleExplore unconditionally follows StyleShift
+                out1 = self.style_explore1(out1, "layer1", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
         
         out2 = self.layer2(out1)
         if self.use_style_shift and communicator is not None:
             if self.training and random.random() <= self.style_shift_prob:
                 out2 = self.style_shift2(out2, "layer2", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                # StyleExplore unconditionally follows StyleShift
+                out2 = self.style_explore2(out2, "layer2", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
         
         out3 = self.layer3(out2)
         if self.use_style_shift and communicator is not None:
             if self.training and random.random() <= self.style_shift_prob:
                 out3 = self.style_shift3(out3, "layer3", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                # StyleExplore unconditionally follows StyleShift
+                out3 = self.style_explore3(out3, "layer3", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
 
         # Use adaptive average pooling to support different input sizes
         # (e.g., 32x32 for CIFAR-10, 224x224 for PACS)
@@ -203,12 +219,15 @@ class StandardResNetWrapper(nn.Module):
     Wrapper for torchvision ResNet to support return_blocks functionality.
     This allows extracting intermediate features from layer1, layer2, layer3.
     """
-    def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5):
+    def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5,
+                 style_explore_alpha=3.0, style_explore_ratio=0.5):
         super(StandardResNetWrapper, self).__init__()
         from torchvision.models import resnet18, resnet34, resnet50, resnet101, resnet152
         self.style_shift_prob = style_shift_prob  # 保存为实例属性
         self.style_shift_ratio = style_shift_ratio  # 也可以保存（如果需要）
         self.use_style_shift = use_style_shift
+        self.style_explore_alpha = style_explore_alpha
+        self.style_explore_ratio = style_explore_ratio
         
         # 根據 depth 選擇對應的 ResNet
         resnet_dict = {
@@ -228,11 +247,15 @@ class StandardResNetWrapper(nn.Module):
         # 修改最後一層以匹配 num_classes
         self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
         
-        # Initialize StyleShift modules for each layer
+        # Initialize StyleShift and StyleExplore modules for each layer
         if self.use_style_shift:
             self.style_shift1 = StyleShift(activation_prob=style_shift_prob, shift_ratio=style_shift_ratio)
             self.style_shift2 = StyleShift(activation_prob=style_shift_prob, shift_ratio=style_shift_ratio)
             self.style_shift3 = StyleShift(activation_prob=style_shift_prob, shift_ratio=style_shift_ratio)
+            # StyleExplore unconditionally follows StyleShift
+            self.style_explore1 = StyleExplore(alpha=style_explore_alpha, explore_ratio=style_explore_ratio)
+            self.style_explore2 = StyleExplore(alpha=style_explore_alpha, explore_ratio=style_explore_ratio)
+            self.style_explore3 = StyleExplore(alpha=style_explore_alpha, explore_ratio=style_explore_ratio)
     
     def extract_features_to_layer3(self, x):
         """
@@ -294,6 +317,9 @@ class StandardResNetWrapper(nn.Module):
                 if self.training and random.random() <= self.style_shift_prob:
                     out1 = self.style_shift1(out1, "layer1", communicator, self.training, 
                                             verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                    # StyleExplore unconditionally follows StyleShift
+                    out1 = self.style_explore1(out1, "layer1", self.training,
+                                              verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 elif debug_style_shift:
                     print(f"[StyleShift layer1] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
             elif debug_style_shift:
@@ -304,6 +330,9 @@ class StandardResNetWrapper(nn.Module):
                 if self.training and random.random() <= self.style_shift_prob:
                     out2 = self.style_shift2(out2, "layer2", communicator, self.training,
                                             verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                    # StyleExplore unconditionally follows StyleShift
+                    out2 = self.style_explore2(out2, "layer2", self.training,
+                                              verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 elif debug_style_shift:
                     print(f"[StyleShift layer2] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
             elif debug_style_shift:
@@ -314,6 +343,9 @@ class StandardResNetWrapper(nn.Module):
                 if self.training and random.random() <= self.style_shift_prob:
                     out3 = self.style_shift3(out3, "layer3", communicator, self.training,
                                             verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                    # StyleExplore unconditionally follows StyleShift
+                    out3 = self.style_explore3(out3, "layer3", self.training,
+                                              verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 elif debug_style_shift:
                     print(f"[StyleShift layer3] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
             elif debug_style_shift:
@@ -337,16 +369,25 @@ class StandardResNetWrapper(nn.Module):
             if self.use_style_shift and communicator is not None:
                 x = self.style_shift1(x, "layer1", communicator, self.training,
                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                # StyleExplore unconditionally follows StyleShift
+                x = self.style_explore1(x, "layer1", self.training,
+                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
             
             x = self.backbone.layer2(x)
             if self.use_style_shift and communicator is not None:
                 x = self.style_shift2(x, "layer2", communicator, self.training,
                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                # StyleExplore unconditionally follows StyleShift
+                x = self.style_explore2(x, "layer2", self.training,
+                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
             
             x = self.backbone.layer3(x)
             if self.use_style_shift and communicator is not None:
                 x = self.style_shift3(x, "layer3", communicator, self.training,
                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                # StyleExplore unconditionally follows StyleShift
+                x = self.style_explore3(x, "layer3", self.training,
+                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
             
             x = self.backbone.layer4(x)
             

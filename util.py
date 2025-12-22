@@ -354,6 +354,9 @@ def select_model(num_class, args):
     use_style_shift = getattr(args, 'use_style_shift', False)
     style_shift_prob = getattr(args, 'style_shift_prob', 0.5)
     style_shift_ratio = getattr(args, 'style_shift_ratio', 0.5)
+    # Get style explore parameters
+    style_explore_alpha = getattr(args, 'style_explore_alpha', 3.0)
+    style_explore_ratio = getattr(args, 'style_explore_ratio', 0.5)
     
     if args.model == 'VGG':
         model = vggnet.VGG(16, num_class)
@@ -367,25 +370,33 @@ def select_model(num_class, args):
                 model = StandardResNetWrapper(18, num_class, 
                                              use_style_shift=use_style_shift,
                                              style_shift_prob=style_shift_prob,
-                                             style_shift_ratio=style_shift_ratio)
+                                             style_shift_ratio=style_shift_ratio,
+                                             style_explore_alpha=style_explore_alpha,
+                                             style_explore_ratio=style_explore_ratio)
             else:
                 # model = large_resnet.ResNet18()
                 model = resnet.ResNet(18, num_class,
                                      use_style_shift=use_style_shift,
                                      style_shift_prob=style_shift_prob,
-                                     style_shift_ratio=style_shift_ratio)
+                                     style_shift_ratio=style_shift_ratio,
+                                     style_explore_alpha=style_explore_alpha,
+                                     style_explore_ratio=style_explore_ratio)
         elif args.dataset == 'pacs':
             if resnet_type == 'standard':
                 from models.resnet import StandardResNetWrapper
                 model = StandardResNetWrapper(18, num_class,
                                              use_style_shift=use_style_shift,
                                              style_shift_prob=style_shift_prob,
-                                             style_shift_ratio=style_shift_ratio)
+                                             style_shift_ratio=style_shift_ratio,
+                                             style_explore_alpha=style_explore_alpha,
+                                             style_explore_ratio=style_explore_ratio)
             else:
                 model = resnet.ResNet(18, num_class,
                                      use_style_shift=use_style_shift,
                                      style_shift_prob=style_shift_prob,
-                                     style_shift_ratio=style_shift_ratio)
+                                     style_shift_ratio=style_shift_ratio,
+                                     style_explore_alpha=style_explore_alpha,
+                                     style_explore_ratio=style_explore_ratio)
         elif args.dataset == 'imagenet':
             # ImageNet 默認使用標準 ResNet
             model = models.resnet18()
