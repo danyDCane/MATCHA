@@ -207,50 +207,50 @@ def run(rank, size):
         d_comm_time = communicator.communicate(model, style_vec=style_vec)
         comm_time += d_comm_time
 
-        # Verify style statistics exchange (print every epoch)
-        if getattr(args, "use_style_stats", False) and args.model == "res":
-            if k == 0 or (k + 1) % STEPS_PER_EPOCH == 0:
-                # Use MPI barrier to synchronize output
-                comm.barrier()
-                # Print in rank order to avoid output mixing
-                for r in range(size):
-                    if rank == r:
-                        # Collect all output into a single string first
-                        output_lines = []
-                        output_lines.append("\n[StyleStats Exchange] iter {}, rank {}: ".format(k + 1, rank))
-                        # Print local style vector info
-                        if communicator.local_style_vec is not None:
-                            local_vec = communicator.local_style_vec
-                            output_lines.append("  Local style_vec: shape={}, sample={}".format(
-                                tuple(local_vec.shape), 
-                                local_vec[:3].numpy().tolist() if len(local_vec) >= 3 else local_vec.numpy().tolist()))
-                        else:
-                            output_lines.append("  Local style_vec: None")
-                        # Print neighbor style vectors info
-                        if communicator.neighbor_style_vecs:
-                            neighbor_info = "  Received {} neighbor(s): ".format(len(communicator.neighbor_style_vecs))
-                            for neighbor_rank, neighbor_vec in communicator.neighbor_style_vecs.items():
-                                neighbor_info += "rank{}[shape={}] ".format(neighbor_rank, tuple(neighbor_vec.shape))
-                            output_lines.append(neighbor_info)
-                            # Print unflattened stats info if available
-                            if communicator.neighbor_style_stats:
-                                output_lines.append("  Unflattened neighbor style stats:")
-                                for neighbor_rank, neighbor_stats in communicator.neighbor_style_stats.items():
-                                    output_lines.append("    Rank {}:".format(neighbor_rank))
-                                    for layer_name, layer_stats in neighbor_stats.items():
-                                        output_lines.append("      {}: mu_bar{}, sigma_bar{}, Sigma_mu_sq{}, Sigma_sigma_sq{}".format(
-                                            layer_name,
-                                            tuple(layer_stats["mu_bar"].shape),
-                                            tuple(layer_stats["sigma_bar"].shape),
-                                            tuple(layer_stats["Sigma_mu_sq"].shape),
-                                            tuple(layer_stats["Sigma_sigma_sq"].shape)
-                                        ))
-                        else:
-                            output_lines.append("  No neighbor style_vecs received")
-                        # Print all at once to avoid interleaving
-                        print("\n".join(output_lines))
-                        sys.stdout.flush()
-                    comm.barrier()  # Wait for each rank to finish printing
+        # # Verify style statistics exchange (print every epoch)
+        # if getattr(args, "use_style_stats", False) and args.model == "res":
+        #     if k == 0 or (k + 1) % STEPS_PER_EPOCH == 0:
+        #         # Use MPI barrier to synchronize output
+        #         comm.barrier()
+        #         # Print in rank order to avoid output mixing
+        #         for r in range(size):
+        #             if rank == r:
+        #                 # Collect all output into a single string first
+        #                 output_lines = []
+        #                 output_lines.append("\n[StyleStats Exchange] iter {}, rank {}: ".format(k + 1, rank))
+        #                 # Print local style vector info
+        #                 if communicator.local_style_vec is not None:
+        #                     local_vec = communicator.local_style_vec
+        #                     output_lines.append("  Local style_vec: shape={}, sample={}".format(
+        #                         tuple(local_vec.shape), 
+        #                         local_vec[:3].numpy().tolist() if len(local_vec) >= 3 else local_vec.numpy().tolist()))
+        #                 else:
+        #                     output_lines.append("  Local style_vec: None")
+        #                 # Print neighbor style vectors info
+        #                 if communicator.neighbor_style_vecs:
+        #                     neighbor_info = "  Received {} neighbor(s): ".format(len(communicator.neighbor_style_vecs))
+        #                     for neighbor_rank, neighbor_vec in communicator.neighbor_style_vecs.items():
+        #                         neighbor_info += "rank{}[shape={}] ".format(neighbor_rank, tuple(neighbor_vec.shape))
+        #                     output_lines.append(neighbor_info)
+        #                     # Print unflattened stats info if available
+        #                     if communicator.neighbor_style_stats:
+        #                         output_lines.append("  Unflattened neighbor style stats:")
+        #                         for neighbor_rank, neighbor_stats in communicator.neighbor_style_stats.items():
+        #                             output_lines.append("    Rank {}:".format(neighbor_rank))
+        #                             for layer_name, layer_stats in neighbor_stats.items():
+        #                                 output_lines.append("      {}: mu_bar{}, sigma_bar{}, Sigma_mu_sq{}, Sigma_sigma_sq{}".format(
+        #                                     layer_name,
+        #                                     tuple(layer_stats["mu_bar"].shape),
+        #                                     tuple(layer_stats["sigma_bar"].shape),
+        #                                     tuple(layer_stats["Sigma_mu_sq"].shape),
+        #                                     tuple(layer_stats["Sigma_sigma_sq"].shape)
+        #                                 ))
+        #                 else:
+        #                     output_lines.append("  No neighbor style_vecs received")
+        #                 # Print all at once to avoid interleaving
+        #                 print("\n".join(output_lines))
+        #                 sys.stdout.flush()
+        #             comm.barrier()  # Wait for each rank to finish printing
         
         # ========== 第二阶段：正式训练（使用交换到的风格统计量）==========
         # Now forward with style shift using the exchanged neighbor style statistics
@@ -438,6 +438,10 @@ if __name__ == "__main__":
                         help='probability of activating style shift module (default: 0.5)')
     parser.add_argument('--style_shift_ratio', type=float, default=0.5,
                         help='ratio of samples in batch to be transformed (default: 0.5)')
+    parser.add_argument('--style_explore_alpha', type=float, default=3.0,
+                        help='extrapolation coefficient for style explore module (default: 3.0)')
+    parser.add_argument('--style_explore_ratio', type=float, default=0.5,
+                        help='ratio of samples in batch to be explored (default: 0.5)')
 
     args = parser.parse_args()
 
