@@ -263,11 +263,12 @@ class decenCommunicator(Communicator):
         
         # get activated topology at current iteration
         active_flags = self.topology.active_flags[self.iter]
-        self.iter += 1
 
         # if no subgraphs are activated,
         # then directly start next iteration
         if np.sum(active_flags) == 0:
+            if style_vec is None:
+                self.iter += 1
             return 0
 
         if style_vec is not None:
@@ -290,6 +291,8 @@ class decenCommunicator(Communicator):
 
             # update local models
             self.reset_model()
+
+            self.iter += 1
 
         return comm_time
 
