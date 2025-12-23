@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import random
 from typing import Dict, Tuple, Optional
+from torch.distributions import Beta
 
 
 def adain(content: torch.Tensor, target_mean: torch.Tensor, target_std: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -441,4 +442,141 @@ class StyleExplore(nn.Module):
                   f"sigma_new_norm_mean={sigma_new.norm(dim=1).mean().item():.3f}")
 
         return output
+
+
+class MixStyle(nn.Module):
+    """
+    MixStyle module that mixes style statistics within a batch.
+    
+    This module:
+    1. Calculates per-sample, per-channel statistics μ(x) and σ(x) for the current batch
+    2. Generates a random permutation to get paired samples' statistics
+    3. Samples a mixing coefficient λ from Beta(α, α) distribution (batch-wise, shared)
+    4. Computes mixed statistics: μ_mix = λ * μ(x) + (1-λ) * μ(x_perm)
+    5. Applies AdaIN to transfer the mixed style
+    """
+    
+    def __init__(self, alpha: float = 0.1):
+        """
+        Args:
+            alpha: Parameter for Beta distribution Beta(α, α). Default is 0.1 as recommended.
+        """
+        super(MixStyle, self).__init__()
+        self.alpha = alpha
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        layer_name: str = "",
+        training: bool = True,
+        verbose: bool = False,
+        iter_num: int = -1,
+        rank: int = -1
+    ) -> torch.Tensor:
+        """
+        Apply MixStyle to features.
+        
+        Args:
+            x: Input feature map of shape [B, C, H, W]
+            layer_name: Name of the layer (e.g., "layer1", "layer2", "layer3")
+            training: Whether in training mode
+            verbose: If True, print debug information
+            iter_num: Current iteration number (for debugging)
+            rank: Current rank (for debugging)
+        
+        Returns:
+            Features with MixStyle applied (or original features if not applied)
+        """
+        # Step 1: Only apply during training
+        if not training:
+            if verbose:
+                print(f"[MixStyle {layer_name}] Skipped: not in training mode")
+            return x
+        
+        B, C, H, W = x.shape
+        eps = 1e-5
+        device = x.device
+        
+        # Step A: Calculate statistics for current batch
+        # Compute per-sample, per-channel statistics μ(x) and σ(x)
+        x_flat = x.view(B, C, -1)  # [B, C, H*W]
+        
+        # μ(x): instance-level mean for each sample [B, C]
+        mu = x_flat.mean(dim=2)  # [B, C]
+        
+        # σ(x): instance-level std for each sample [B, C]
+        var = x_flat.var(dim=2, unbiased=False)  # [B, C]
+        sigma = torch.sqrt(var + eps)  # [B, C]
+        
+        # Step B: Permutation - generate random permutation indices
+        perm_indices = torch.randperm(B, device=device)
+        
+        # Get paired samples' statistics μ(x_perm) and σ(x_perm)
+        mu_perm = mu[perm_indices]  # [B, C]
+        sigma_perm = sigma[perm_indices]  # [B, C]
+        
+        # Step C: Sample mixing coefficient λ from Beta(α, α)
+        # Batch-wise: the entire batch shares the same λ
+        dist = Beta(self.alpha, self.alpha)
+        lam = dist.sample().item()  # Single scalar for the entire batch
+        
+        # Step D: Compute mixed statistics and apply AdaIN
+        # μ_mix = λ * μ(x) + (1-λ) * μ(x_perm)
+        mu_mix = lam * mu + (1 - lam) * mu_perm  # [B, C]
+        
+        # σ_mix = λ * σ(x) + (1-λ) * σ(x_perm)
+        sigma_mix = lam * sigma + (1 - lam) * sigma_perm  # [B, C]
+        
+        # Ensure sigma_mix is positive
+        sigma_mix = torch.clamp(sigma_mix, min=eps)
+        
+        if verbose:
+            print(f"[MixStyle {layer_name}] Rank {rank}, Iter {iter_num}: "
+                  f"lambda={lam:.4f}, "
+                  f"mu_range=[{mu_mix.min():.4f}, {mu_mix.max():.4f}], "
+                  f"sigma_range=[{sigma_mix.min():.4f}, {sigma_mix.max():.4f}]")
+        
+        # Apply AdaIN in batch (efficient processing)
+        # Since each sample has unique mu_mix and sigma_mix, we process them together
+        # using broadcasting: mu_mix [B, C] and sigma_mix [B, C]
+        
+        # Compute content statistics (per sample, per channel)
+        content_mean = mu  # [B, C] - already computed
+        content_std = sigma  # [B, C] - already computed
+        
+        # Normalize content: (x - mean) / std
+        content_norm = (x_flat - content_mean.unsqueeze(2)) / content_std.unsqueeze(2)  # [B, C, H*W]
+        
+        # Apply target style: normalized * target_std + target_mean
+        # mu_mix and sigma_mix are [B, C], expand to [B, C, 1] for broadcasting
+        mu_mix_expanded = mu_mix.unsqueeze(2)  # [B, C, 1]
+        sigma_mix_expanded = sigma_mix.unsqueeze(2)  # [B, C, 1]
+        
+        x_mixed_flat = content_norm * sigma_mix_expanded + mu_mix_expanded  # [B, C, H*W]
+        x_mixed = x_mixed_flat.view(B, C, H, W)  # [B, C, H, W]
+        
+        if verbose:
+            # Compute stats before/after for debugging
+            def _mean_std_per_sample(z):
+                Bz, Cz, Hz, Wz = z.shape
+                zf = z.view(Bz, Cz, -1)
+                mu_z = zf.mean(dim=2)  # [Bz, Cz]
+                var_z = zf.var(dim=2, unbiased=False)
+                std_z = torch.sqrt(var_z + eps)  # [Bz, Cz]
+                return mu_z, std_z
+
+            mu_a, std_a = _mean_std_per_sample(x_mixed.detach())  # [B, C]
+            # Target is mu_mix / sigma_mix (also [B, C])
+            rel_mu = (mu_a - mu_mix).norm() / (mu_mix.norm() + 1e-12)
+            rel_std = (std_a - sigma_mix).norm() / (sigma_mix.norm() + 1e-12)
+            
+            delta = (x_mixed.detach() - x.detach()).abs().mean()
+            has_nan = torch.isnan(x_mixed).any().item()
+            has_inf = torch.isinf(x_mixed).any().item()
+            
+            print(f"[MixStyle {layer_name}] AdaIN check: "
+                  f"rel_mu={rel_mu.item():.3e}, rel_std={rel_std.item():.3e}, "
+                  f"mean_abs_delta={delta.item():.3e}, nan={has_nan}, inf={has_inf}")
+
+        return x_mixed
 
