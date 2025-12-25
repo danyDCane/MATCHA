@@ -357,6 +357,10 @@ def select_model(num_class, args):
     # Get style explore parameters
     style_explore_alpha = getattr(args, 'style_explore_alpha', 3.0)
     style_explore_ratio = getattr(args, 'style_explore_ratio', 0.5)
+    # Get mixstyle parameter
+    mixstyle_alpha = getattr(args, 'mixstyle_alpha', 0.1)
+    # Get pretrained parameter
+    pretrained = getattr(args, 'pretrained', False)
     
     if args.model == 'VGG':
         model = vggnet.VGG(16, num_class)
@@ -372,7 +376,9 @@ def select_model(num_class, args):
                                              style_shift_prob=style_shift_prob,
                                              style_shift_ratio=style_shift_ratio,
                                              style_explore_alpha=style_explore_alpha,
-                                             style_explore_ratio=style_explore_ratio)
+                                             style_explore_ratio=style_explore_ratio,
+                                             mixstyle_alpha=mixstyle_alpha,
+                                             pretrained=pretrained)
             else:
                 # model = large_resnet.ResNet18()
                 model = resnet.ResNet(18, num_class,
@@ -389,7 +395,9 @@ def select_model(num_class, args):
                                              style_shift_prob=style_shift_prob,
                                              style_shift_ratio=style_shift_ratio,
                                              style_explore_alpha=style_explore_alpha,
-                                             style_explore_ratio=style_explore_ratio)
+                                             style_explore_ratio=style_explore_ratio,
+                                             mixstyle_alpha=mixstyle_alpha,
+                                             pretrained=pretrained)
             else:
                 model = resnet.ResNet(18, num_class,
                                      use_style_shift=use_style_shift,

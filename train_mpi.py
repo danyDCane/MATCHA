@@ -133,9 +133,34 @@ def run(rank, size):
     else:
         communicator = decenCommunicator(rank, size, GP)
 
+    # [DEBUG START] 請加入這段來檢查拓撲結構
+    # if rank == 0:
+    #     print("\n====== TOPOLOGY CHECK ======")
+    #     print(f"Total Subgraphs: {len(GP.subGraphs)}")
+    #     print(f"Neighbor Weight (Alpha): {GP.neighbor_weight}")
+    #     # 檢查每個子圖的鄰居定義
+    #     for i, neighbors in enumerate(GP.neighbors_info):
+    #         print(f"Subgraph {i} Neighbors: {neighbors}")
+    #     print("============================\n")
+    
+    # # 確保所有 Rank 都印完再繼續
+    # comm.barrier()
+    # [DEBUG END]
+
     # select neural network model
     num_classes = 7 if args.dataset == 'pacs' else 10
-    model = util.select_model(num_classes, args)
+    # For pretrained models: let rank 0 download first to avoid concurrent download conflicts
+    if getattr(args, 'pretrained', False):
+        if rank == 0:
+            print(f"[Rank {rank}] Initializing model with pretrained weights (downloading if needed)...")
+            model = util.select_model(num_classes, args)
+            comm.barrier()  # Signal that rank 0 is done downloading
+        else:
+            comm.barrier()  # Other ranks wait for rank 0 to finish downloading
+            model = util.select_model(num_classes, args)  # Now use cached weights
+    else:
+        # No pretrained weights, all ranks can create model simultaneously
+        model = util.select_model(num_classes, args)
     model = model.cuda()
     criterion = nn.CrossEntropyLoss().cuda()
     optimizer = optim.SGD(model.parameters(), 
@@ -256,7 +281,8 @@ def run(rank, size):
         # Now forward with style shift using the exchanged neighbor style statistics
         use_style_stats = getattr(args, "use_style_stats", False)
         use_style_shift = getattr(args, "use_style_shift", False)
-        debug_style_shift = ((k % STEPS_PER_EPOCH) == 0) # Enable debug output for style shift
+        # debug_style_shift = ((k % STEPS_PER_EPOCH) == 0) # Enable debug output for style shift
+        debug_style_shift = getattr(args, "debug_style_shift", False)
         
         if (use_style_stats or use_style_shift) and args.model == "res":
             # This forward will use communicator.neighbor_style_stats (just exchanged)
@@ -297,6 +323,24 @@ def run(rank, size):
         d_comm_time_after = communicator.communicate(model, style_vec=None)
         comm_time += d_comm_time_after
         
+        # 立即检查通信后的参数（在测试之前）
+        if (k + 1) % STEPS_PER_EPOCH == 0:
+            comm.barrier()
+            first_param_immediate = list(model.parameters())[0].view(-1)[0].item()
+            if rank == 0:
+                params_immediate = [first_param_immediate]
+                for r in range(1, size):
+                    params_immediate.append(comm.recv(source=r, tag=400))
+                print(f"*** IMMEDIATE after comm iter {k+1}: {[f'{p:.6f}' for p in params_immediate]} ***")
+                # 检查是否一致
+                if len(set([round(p, 4) for p in params_immediate])) == 1:
+                    print("✓ Parameters are CONSISTENT after communication!")
+                else:
+                    print("✗ Parameters are INCONSISTENT after communication!")
+            else:
+                comm.send(first_param_immediate, dest=0, tag=400)
+            comm.barrier()
+        
         end_time = time.time()
 
         d_comp_time = (end_time - start_time - (record_end - record_start))
@@ -327,6 +371,10 @@ def run(rank, size):
             
             # 測試後再次清理緩存，確保記憶體被釋放
             torch.cuda.empty_cache()
+
+            # 檢查模型共識度，取模型第一層的第一個權重數值
+            first_param = list(model.parameters())[0].view(-1)[0].item()
+            print(f"*** Iter {k+1} Rank {rank} Param[0]: {first_param:.6f} ***")
 
             recorder.add_new(record_time, comp_time, comm_time, epoch_time,
                              top1.avg, losses.avg, test_acc)
@@ -442,6 +490,8 @@ if __name__ == "__main__":
                         help='extrapolation coefficient for style explore module (default: 3.0)')
     parser.add_argument('--style_explore_ratio', type=float, default=0.5,
                         help='ratio of samples in batch to be explored (default: 0.5)')
+    parser.add_argument('--pretrained', action='store_true',
+                        help='use pretrained ImageNet weights for ResNet (default: False). Only works with resnet_type=standard')
 
     args = parser.parse_args()
 

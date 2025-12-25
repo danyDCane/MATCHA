@@ -222,12 +222,55 @@ class decenCommunicator(Communicator):
                         self.recv_tmp = self.comm.sendrecv(self.send_buffer, source=neighbor_rank, dest = neighbor_rank)
                         # 融合：把他的參數乘上權重，加到我的接收區
                         # recv_buffer += alpha * neighbor_model
-                        self.recv_buffer.add_(self.neighbor_weight, self.recv_tmp)
+                        self.recv_buffer.add_(self.recv_tmp, alpha=self.neighbor_weight)
+
+                        if self.iter % 100 == 0:  # 每100次打印一次
+                            print(f"Rank {self.rank} communicated with {neighbor_rank}, degree={degree}, alpha={self.neighbor_weight}")
             
             # 檢查完子圖後，計算我的權重
             selfweight = 1 - degree * self.neighbor_weight
+            if self.rank == 0 and self.iter % 62 == 0:
+                print(f"DEBUG: rank={self.rank}, send_buffer[0]={self.send_buffer[0]:.6f}, "
+                    f"recv_buffer[0]={self.recv_buffer[0]:.6f}, "
+                    f"degree={degree}, alpha={self.neighbor_weight:.6f}, "
+                    f"selfweight={selfweight:.6f}")
             # compute weighted average: (1-d*alpha)x_i + alpha * sum_j x_j
-            self.recv_buffer.add_(selfweight, self.send_buffer)
+            self.recv_buffer.add_(self.send_buffer, alpha=selfweight)
+            # 在 communicator.py 第238行后添加（在加上自身权重之后）
+            if self.iter % 62 == 0:
+                # 收集所有 rank 的 send_buffer 值
+                self.comm.barrier()
+                if self.rank == 0:
+                    # rank0 收集所有值
+                    send_buffers = [self.send_buffer[0].item()]
+                    recv_buffers_final = [self.recv_buffer[0].item()]
+                    for r in range(1, self.size):
+                        send_buffers.append(self.comm.recv(source=r, tag=500))
+                        recv_buffers_final.append(self.comm.recv(source=r, tag=501))
+                    
+                    # 计算期望值：(1/3) * (x0 + x1 + x2)
+                    expected = (1.0 / self.size) * sum(send_buffers)
+                    
+                    print(f"\n=== Verification at iter {self.iter} ===")
+                    print(f"Send buffers: {[f'{x:.6f}' for x in send_buffers]}")
+                    print(f"Recv buffers (final): {[f'{x:.6f}' for x in recv_buffers_final]}")
+                    print(f"Expected (average): {expected:.6f}")
+                    
+                    # 检查是否一致（允许小的浮点误差）
+                    all_same = all(abs(r - expected) < 1e-5 for r in recv_buffers_final)
+                    if all_same:
+                        print("✓ Calculation is CORRECT! All ranks have the same averaged value.")
+                    else:
+                        print("✗ Calculation is WRONG! Values differ.")
+                        for i, r in enumerate(recv_buffers_final):
+                            diff = abs(r - expected)
+                            print(f"  Rank {i}: diff = {diff:.8f}")
+                    print("=" * 50)
+                else:
+                    # 其他 rank 发送值
+                    self.comm.send(self.send_buffer[0].item(), dest=0, tag=500)
+                    self.comm.send(self.recv_buffer[0].item(), dest=0, tag=501)
+                self.comm.barrier()
 
         self.comm.barrier()
         toc = time.time()
@@ -240,7 +283,7 @@ class decenCommunicator(Communicator):
         unflattened = unflatten_tensors(
             self.recv_buffer.cuda(), self.tensor_list)
         for f, t in zip(unflattened, self.tensor_list):
-            t.set_(f)
+            t.copy_(f)
         # 明確釋放臨時變量，避免記憶體累積
         del unflattened
 
@@ -278,6 +321,7 @@ class decenCommunicator(Communicator):
         else:
             # Only exchange model parameters, skip style statistics exchange
             # stack all model parameters into one tensor list
+            self.iter += 1
             self.tensor_list = list()
             for param in model.parameters():
                 self.tensor_list.append(param.data)
@@ -292,7 +336,6 @@ class decenCommunicator(Communicator):
             # update local models
             self.reset_model()
 
-            self.iter += 1
 
         return comm_time
 
