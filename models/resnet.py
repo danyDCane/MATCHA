@@ -234,7 +234,7 @@ class StandardResNetWrapper(nn.Module):
     This allows extracting intermediate features from layer1, layer2, layer3.
     """
     def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5,
-                 style_explore_alpha=3.0, style_explore_ratio=0.5, mixstyle_alpha=0.1):
+                 style_explore_alpha=3.0, style_explore_ratio=0.5, mixstyle_alpha=0.1, pretrained=False):
         super(StandardResNetWrapper, self).__init__()
         from torchvision.models import resnet18, resnet34, resnet50, resnet101, resnet152
         self.style_shift_prob = style_shift_prob  # 保存为实例属性
@@ -256,8 +256,25 @@ class StandardResNetWrapper(nn.Module):
         if depth not in resnet_dict:
             raise ValueError(f"ResNet depth {depth} not supported. Choose from {list(resnet_dict.keys())}")
         
-        # 創建 ResNet 模型（pretrained=False）
-        self.backbone = resnet_dict[depth](pretrained=False)
+        # 創建 ResNet 模型（支持预训练权重）
+        # 兼容新版本 torchvision (>=0.13) 和旧版本 (<0.13)
+        try:
+            # Try new API (torchvision >= 0.13)
+            if pretrained:
+                from torchvision.models import ResNet18_Weights, ResNet34_Weights, ResNet50_Weights, ResNet101_Weights, ResNet152_Weights
+                weights_dict = {
+                    18: ResNet18_Weights.IMAGENET1K_V1,
+                    34: ResNet34_Weights.IMAGENET1K_V1,
+                    50: ResNet50_Weights.IMAGENET1K_V1,
+                    101: ResNet101_Weights.IMAGENET1K_V1,
+                    152: ResNet152_Weights.IMAGENET1K_V1
+                }
+                self.backbone = resnet_dict[depth](weights=weights_dict[depth])
+            else:
+                self.backbone = resnet_dict[depth](weights=None)
+        except (ImportError, AttributeError):
+            # Fall back to old API (torchvision < 0.13)
+            self.backbone = resnet_dict[depth](pretrained=pretrained)
         
         # 修改最後一層以匹配 num_classes
         self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)

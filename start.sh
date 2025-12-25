@@ -3,7 +3,7 @@ mpirun -np 3 \
 -map-by slot \
 -mca pml ob1 -mca btl ^openib \
 python train_mpi.py \
---wandb_project Test_style_shift \
+--wandb_project Test_style_pretrained_Bs0.8 \
 --dataset pacs \
 --use_style_stats \
 --datasetRoot ../datasets/ \
@@ -11,7 +11,7 @@ python train_mpi.py \
 --graphid -1 \
 --lr 0.001 \
 --bs 64 \
---epoch 200 \
+--epoch 80 \
 --budget 1.0 \
 --momentum 0.9 \
 -n Vanilla_DecenSGD \
@@ -22,3 +22,6 @@ python train_mpi.py \
 --savePath ./exp_result_ \
 --randomSeed 1234 \
 --use_style_shift \
+--pretrained \
+--style_shift_prob 0.8 \
+--style_shift_ratio 0.5 \
