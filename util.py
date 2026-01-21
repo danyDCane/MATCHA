@@ -260,10 +260,6 @@ def partition_dataset(rank, size, args):
         print(f'[PACS Dataset] Rank: {rank}, Total nodes: {size}')
         print('=' * 60)
         
-        # Validate size == 3 for PACS
-        if size != 3:
-            raise ValueError(f'PACS dataset requires exactly 3 nodes, but {size} nodes were provided.')
-        
         # PACS domains
         all_domains = ['art_painting', 'cartoon', 'photo', 'sketch']
         if not args.leave_out:
@@ -278,24 +274,36 @@ def partition_dataset(rank, size, args):
         available_domains = [d for d in all_domains if d != args.leave_out]
         print(f'[PACS Dataset] Available training domains: {available_domains}')
         
-        # Assign domain to each rank
-        domain_for_rank = available_domains[rank]
+        # 為每個 rank 分配 domain（如果節點數 > 可用 domain 數，則循環分配）
+        domain_for_rank = available_domains[rank % len(available_domains)]
         print(f'[PACS Dataset] Rank {rank} assigned to domain: {domain_for_rank}')
+        
+        # 計算有多少節點與此 rank 共享相同的 domain
+        # 統計具有相同 domain 分配的節點
+        nodes_with_same_domain = []
+        for r in range(size):
+            if available_domains[r % len(available_domains)] == domain_for_rank:
+                nodes_with_same_domain.append(r)
+        num_nodes_sharing_domain = len(nodes_with_same_domain)
+        local_index_in_domain = nodes_with_same_domain.index(rank)  # 此 rank 在共享相同 domain 的節點中的索引
+        
+        if num_nodes_sharing_domain > 1:
+            print(f'[PACS Dataset] Note: {num_nodes_sharing_domain} nodes share domain "{domain_for_rank}" (rank {rank} is index {local_index_in_domain} of {num_nodes_sharing_domain})')
         print('-' * 60)
         
-        # Transform for training (matching Dassl's PACS setting)
+        # 訓練用的資料轉換（符合 Dassl 的 PACS 設定）
         print(f'[PACS Dataset] Rank {rank}: Setting up training transforms...')
         print(f'[PACS Dataset] Rank {rank}: Using Dassl-compatible transforms (random_flip, random_translation, normalize)')
-        # Equivalent to Dassl's Random2DTranslation:
-        # 50% chance: resize to 1.125x (252x252) then random crop to 224x224
-        # 50% chance: directly resize to 224x224
+        # 等同於 Dassl 的 Random2DTranslation：
+        # 50% 機率：縮放到 1.125x (252x252) 然後隨機裁剪到 224x224
+        # 50% 機率：直接縮放到 224x224
         transform_train = transforms.Compose([
-            transforms.Resize((224, 224)),  # Base resize to 224x224
-            # RandomApply with p=0.5: 50% chance to apply enlargement + random crop
+            transforms.Resize((224, 224)),  # 基礎縮放到 224x224
+            # RandomApply，p=0.5：50% 機率應用放大 + 隨機裁剪
             transforms.RandomApply([
                 transforms.Compose([
-                    transforms.Resize((252, 252)),  # 224 * 1.125 = 252 (enlarge)
-                    transforms.RandomCrop(224)      # Random crop back to 224x224
+                    transforms.Resize((252, 252)),  # 224 * 1.125 = 252 (放大)
+                    transforms.RandomCrop(224)      # 隨機裁剪回 224x224
                 ])
             ], p=0.5),
             transforms.RandomHorizontalFlip(),
@@ -303,12 +311,25 @@ def partition_dataset(rank, size, args):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         
-        # Load training data for this rank's domain
+        # 載入此 rank 的 domain 的訓練資料
         print(f'[PACS Dataset] Rank {rank}: Loading training data from domain "{domain_for_rank}"...')
         print(f'[PACS Dataset] Rank {rank}: Dataset root: {args.datasetRoot}')
-        train_dataset = PACSDataset(root=args.datasetRoot, 
-                                   dataset_name=domain_for_rank, 
-                                   transform=transform_train)
+        full_domain_dataset = PACSDataset(root=args.datasetRoot, 
+                                         dataset_name=domain_for_rank, 
+                                         transform=transform_train)
+        
+        # 如果多個節點共享相同的 domain，則在它們之間分割該 domain 的資料
+        if num_nodes_sharing_domain > 1:
+            # 在共享此 domain 的節點之間平均分割 domain 的資料
+            partition_sizes = [1.0 / num_nodes_sharing_domain for _ in range(num_nodes_sharing_domain)]
+            partitioner = DataPartitioner(full_domain_dataset, partition_sizes, seed=args.randomSeed, isNonIID=False)
+            train_dataset = partitioner.use(local_index_in_domain)
+            print(f'[PACS Dataset] Rank {rank}: Partitioned domain "{domain_for_rank}" data: using partition {local_index_in_domain} of {num_nodes_sharing_domain}')
+        else:
+            # 只有一個節點使用此 domain，使用完整資料集
+            train_dataset = full_domain_dataset
+            print(f'[PACS Dataset] Rank {rank}: Using full domain "{domain_for_rank}" data (no partitioning needed)')
+        
         train_loader = torch.utils.data.DataLoader(
             train_dataset, 
             batch_size=args.bs, 
@@ -415,19 +436,88 @@ def select_model(num_class, args):
             model = MLP.MNIST_MLP(47)
     return model
 
-def select_graph(graphid):
-    # Special case: graphid == -1 for fully connected 3-node graph (used for PACS)
+def select_graph(graphid, num_nodes=None, radius=None, seed=None):
+    """
+    根據 graphid 選擇圖形拓撲結構。
+    
+    特殊 graphid：
+    - -1: 3 節點全連接圖（用於 PACS）
+    - 6: 隨機幾何圖（Random Geometric Graph, RGG），9 個節點，半徑=0.8
+    
+    參數：
+        graphid: 圖形 ID
+        num_nodes: 節點數量（RGG 使用，預設=9）
+        radius: 連接半徑（RGG 使用，預設=0.8）
+        seed: 隨機種子（RGG 使用，如果為 None 則使用預設值）
+    """
+    # 特殊情況：graphid == -1 為 3 節點全連接圖（用於 PACS）
     if graphid == -1:
-        # Fully connected graph for 3 nodes
-        # Decomposed into 3 matchings:
-        # - [(0,1)] (node 2 isolated)
-        # - [(0,2)] (node 1 isolated)
-        # - [(1,2)] (node 0 isolated)
+        # 3 節點全連接圖
+        # 分解為 3 個 matchings：
+        # - [(0,1)] (節點 2 孤立)
+        # - [(0,2)] (節點 1 孤立)
+        # - [(1,2)] (節點 0 孤立)
         return [
-            [(0, 1)],  # matching 1: edge between node 0 and 1
-            [(0, 2)],  # matching 2: edge between node 0 and 2
-            [(1, 2)]   # matching 3: edge between node 1 and 2
+            [(0, 1)],  # matching 1: 節點 0 和 1 之間的邊
+            [(0, 2)],  # matching 2: 節點 0 和 2 之間的邊
+            [(1, 2)]   # matching 3: 節點 1 和 2 之間的邊
         ]
+    
+    # 特殊情況：graphid == 6 為隨機幾何圖（Random Geometric Graph, RGG）
+    if graphid == 6:
+        num_nodes = num_nodes or 9
+        radius = radius or 0.8
+        seed = seed or 42  # 預設種子以確保可重現性
+        
+        # 生成 RGG，確保連通性
+        max_attempts = 100
+        G = None
+        for attempt in range(max_attempts):
+            try:
+                G = nx.random_geometric_graph(num_nodes, radius, seed=seed + attempt)
+                if nx.is_connected(G):
+                    break
+            except:
+                continue
+        else:
+            raise RuntimeError(f"在 {max_attempts} 次嘗試後仍無法生成連通的 RGG，參數：num_nodes={num_nodes}, radius={radius}")
+        
+        # 將 NetworkX 圖轉換為 matchings 格式
+        # matching 是一組不相交的邊（沒有共享節點）
+        matchings = []
+        G_remaining = G.copy()
+        
+        # 使用貪心演算法將圖分解為 matchings
+        while G_remaining.number_of_edges() > 0:
+            # 尋找最大匹配
+            matching = nx.max_weight_matching(G_remaining)
+            if len(matching) > 0:
+                # 將 matching 集合轉換為元組列表
+                matching_list = list(matching)
+                matchings.append(matching_list)
+                # 從剩餘圖中移除已匹配的邊
+                G_remaining.remove_edges_from(matching_list)
+            else:
+                # 如果找不到匹配，將剩餘的邊單獨添加
+                # 這種情況很少發生，但用於處理邊緣情況
+                remaining_edges = list(G_remaining.edges())
+                for edge in remaining_edges:
+                    matchings.append([edge])
+                break
+        
+        # 驗證所有邊都被覆蓋
+        all_edges_in_matchings = set()
+        for matching in matchings:
+            for edge in matching:
+                # 標準化邊的方向（確保較小的節點在前）
+                normalized_edge = tuple(sorted(edge))
+                all_edges_in_matchings.add(normalized_edge)
+        
+        original_edges = set(tuple(sorted(edge)) for edge in G.edges())
+        if all_edges_in_matchings != original_edges:
+            raise RuntimeError("Matchings 分解失敗：並非所有邊都被覆蓋")
+        
+        return matchings
     
     # pre-defined base network topologies
     # you can add more by extending the list
@@ -493,6 +583,10 @@ def select_graph(graphid):
               [(0, 7), (2, 1), (4, 3), (6, 5)]]
 
             ]
+    
+    # 驗證預定義圖形的 graphid
+    if graphid < 0 or graphid >= len(Graphs):
+        raise ValueError(f"無效的 graphid: {graphid}。有效範圍：0-{len(Graphs)-1}，或特殊 ID：-1 (3 節點全連接), 6 (RGG)")
             
     return Graphs[graphid] 
 
