@@ -114,10 +114,14 @@ def run(rank, size):
 
     train_iter = get_infinite_iterator(train_loader)
 
-    # load base network topology
-    # For PACS, use fully connected graph for 3 nodes (graphid = -1)
-    if args.dataset == 'pacs':
+    # 載入基礎網路拓撲結構
+    # graphid=-1：使用 3 節點全連接圖（用於 PACS）
+    # graphid=6：使用隨機幾何圖（RGG），9 個節點
+    if args.graphid == -1:
         subGraphs = util.select_graph(-1)
+    elif args.graphid == 6:
+        # RGG：9 個節點，半徑=0.8，使用 randomSeed 確保可重現性
+        subGraphs = util.select_graph(6, num_nodes=9, radius=0.8, seed=args.randomSeed)
     else:
         subGraphs = util.select_graph(args.graphid)
     
@@ -505,11 +509,6 @@ if __name__ == "__main__":
 
     # Validate PACS requirements
     if args.dataset == 'pacs':
-        if size != 3:
-            if rank == 0:
-                print(f'Error: PACS dataset requires exactly 3 nodes, but {size} nodes were provided.')
-                print('Please use: mpirun -np 3 python train_mpi.py ...')
-            exit(1)
         if not args.leave_out:
             if rank == 0:
                 print('Error: --leave_out must be specified when using PACS dataset.')
