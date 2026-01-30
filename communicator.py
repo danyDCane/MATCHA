@@ -52,8 +52,13 @@ class Communicator(object):
             # Only exchange model parameters, skip style statistics exchange
             # stack all model parameters into one tensor list
             self.tensor_list = list()
+            # Add backbone model parameters
             for param in model.parameters():
                 self.tensor_list.append(param.data)
+            # Add diffusion model parameters if exists
+            if hasattr(model, 'diffusion_model') and model.diffusion_model is not None:
+                for param in model.diffusion_model.parameters():
+                    self.tensor_list.append(param.data)
 
             # necessary preprocessing
             self.prepare_comm_buffer()
@@ -323,8 +328,13 @@ class decenCommunicator(Communicator):
             # stack all model parameters into one tensor list
             self.iter += 1
             self.tensor_list = list()
+            # Add backbone model parameters
             for param in model.parameters():
                 self.tensor_list.append(param.data)
+            # Add diffusion model parameters if exists
+            if hasattr(model, 'diffusion_model') and model.diffusion_model is not None:
+                for param in model.diffusion_model.parameters():
+                    self.tensor_list.append(param.data)
 
             # necessary preprocess
             self.prepare_comm_buffer()
@@ -485,8 +495,13 @@ class ChocoCommunicator(Communicator):
             # Only exchange model parameters, skip style statistics exchange
             # stack all model parameters into one tensor list
             self.tensor_list = list()
+            # Add backbone model parameters
             for param in model.parameters():
                 self.tensor_list.append(param.data)
+            # Add diffusion model parameters if exists
+            if hasattr(model, 'diffusion_model') and model.diffusion_model is not None:
+                for param in model.diffusion_model.parameters():
+                    self.tensor_list.append(param.data)
 
             # necessary preprocess
             # there is an additional encoding time

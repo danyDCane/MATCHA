@@ -293,6 +293,31 @@ class StandardResNetWrapper(nn.Module):
             self.mixstyle2 = MixStyle(alpha=mixstyle_alpha)
             self.mixstyle3 = MixStyle(alpha=mixstyle_alpha)
     
+    def intermediate_forward(self, x):
+        """
+        Extract intermediate features, returning 512-dim feature vector (before fc layer).
+        Used for OOD detection with diffusion model.
+        
+        Args:
+            x: input tensor [B, 3, H, W]
+        
+        Returns:
+            features: flattened feature vector (B, 512)
+        """
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+        
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+        
+        x = self.backbone.avgpool(x)
+        x = torch.flatten(x, 1)
+        return x
+    
     def extract_features_to_layer3(self, x):
         """
         Extract features up to layer3 without applying style shift.
