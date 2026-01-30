@@ -315,8 +315,8 @@ def partition_dataset(rank, size, args):
         print(f'[PACS Dataset] Rank {rank}: Loading training data from domain "{domain_for_rank}"...')
         print(f'[PACS Dataset] Rank {rank}: Dataset root: {args.datasetRoot}')
         full_domain_dataset = PACSDataset(root=args.datasetRoot, 
-                                         dataset_name=domain_for_rank, 
-                                         transform=transform_train)
+                                   dataset_name=domain_for_rank, 
+                                   transform=transform_train)
         
         # 如果多個節點共享相同的 domain，則在它們之間分割該 domain 的資料
         if num_nodes_sharing_domain > 1:

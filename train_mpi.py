@@ -173,6 +173,27 @@ def run(rank, size):
                           weight_decay=5e-4,
                           nesterov=args.nesterov)
     
+    # Initialize diffusion model for OOD detection if enabled
+    diffusion_model = None
+    optimizer_diffusion = None
+    if getattr(args, 'use_ood', False):
+        from dood.utils.diffusion import get_diffusion_model
+        # ResNet18 intermediate features are 512-dim
+        diffusion_model = get_diffusion_model(
+            ft_size=512,
+            denoiser_type="unet0d",
+            diffusion_denoiser_channels=getattr(args, 'diffusion_channels', 512),
+            num_diffusion_steps=getattr(args, 'diffusion_steps', 1000),
+        ).cuda()
+        optimizer_diffusion = optim.Adam(
+            diffusion_model.parameters(),
+            lr=getattr(args, 'lr_diffusion', 5e-5)
+        )
+        # Attach diffusion model to model for easier access during communication
+        model.diffusion_model = diffusion_model
+        if rank == 0:
+            print(f"[Rank {rank}] Diffusion model initialized for OOD detection")
+    
     # CosineAnnealingLR: T_max = K (total iterations), purely step-based
     scheduler = CosineAnnealingLR(optimizer, T_max=K, eta_min=0.0)
     
@@ -185,6 +206,7 @@ def run(rank, size):
     recorder = util.Recorder(args,rank)
     losses = util.AverageMeter()
     top1 = util.AverageMeter()
+    loss_diff_meter = util.AverageMeter() if getattr(args, 'use_ood', False) else None
     tic = time.time()
 
     # ===== start training with fixed total steps K (Algorithm 1) =====
@@ -303,6 +325,27 @@ def run(rank, size):
             output = model(data)
         
         loss = criterion(output, target)
+        
+        # Compute diffusion loss if OOD detection is enabled
+        loss_diff = None
+        if getattr(args, 'use_ood', False) and diffusion_model is not None:
+            # Extract intermediate features for diffusion model
+            latents = model.intermediate_forward(data)
+            
+            # Normalize features and compute diffusion loss
+            # Detach latents to avoid affecting backbone gradients
+            latents_for_diff = latents.detach().requires_grad_(True)
+            latents_normalized = diffusion_model.normalize(latents_for_diff)
+            loss_diff = diffusion_model.get_loss_iter(latents_normalized)
+            
+            # Backward pass for diffusion model
+            optimizer_diffusion.zero_grad()
+            loss_diff.backward()
+            optimizer_diffusion.step()
+            
+            # Record diffusion loss for averaging
+            if loss_diff_meter is not None:
+                loss_diff_meter.update(loss_diff.item(), data.size(0))
 
         # record training loss and accuracy
         record_start = time.time()
@@ -311,7 +354,7 @@ def run(rank, size):
         top1.update(acc1[0], data.size(0))
         record_end = time.time()
 
-        # backward pass
+        # backward pass for classification
         loss.backward()
 
         # gradient step
@@ -386,7 +429,7 @@ def run(rank, size):
                   % (rank, epoch, losses.avg, top1.avg, test_acc, epoch_time))
             
             # log to wandb for each rank
-            wandb.log({
+            log_dict = {
                 "epoch": epoch,
                 "iter": k,
                 "loss": losses.avg.item() if hasattr(losses.avg, 'item') else float(losses.avg),
@@ -396,7 +439,18 @@ def run(rank, size):
                 "comp_time": comp_time,
                 "comm_time": comm_time,
                 "epoch_time": epoch_time,
-            })
+            }
+            # Add diffusion loss if OOD detection is enabled
+            if getattr(args, 'use_ood', False) and diffusion_model is not None:
+                if loss_diff_meter is not None:
+                    log_dict["diffusion_loss"] = loss_diff_meter.avg.item() if hasattr(loss_diff_meter.avg, 'item') else float(loss_diff_meter.avg)
+                # Add diffusion model monitoring info if available
+                if hasattr(diffusion_model.diffusion_process, '_last_snr_info'):
+                    snr_info = diffusion_model.diffusion_process._last_snr_info
+                    log_dict["snr"] = snr_info.get('snr', 0.0)
+                    if 'identity_correlation' in snr_info:
+                        log_dict["identity_correlation"] = snr_info['identity_correlation']
+            wandb.log(log_dict)
             
             if rank == 0:
                 print("comp_time: %.3f, comm_time: %.3f, comp_time_budget: %.3f, comm_time_budget: %.3f"
@@ -406,6 +460,8 @@ def run(rank, size):
             comp_time, comm_time = 0, 0
             losses.reset()
             top1.reset()
+            if loss_diff_meter is not None:
+                loss_diff_meter.reset()
             tic = time.time()
 
     recorder.save_to_file()
@@ -496,6 +552,18 @@ if __name__ == "__main__":
                         help='ratio of samples in batch to be explored (default: 0.5)')
     parser.add_argument('--pretrained', action='store_true',
                         help='use pretrained ImageNet weights for ResNet (default: False). Only works with resnet_type=standard')
+
+    # ===== OOD Detection (Diffusion) options =====
+    parser.add_argument('--use_ood', action='store_true',
+                        help='enable OOD detection with diffusion model')
+    parser.add_argument('--diffusion_channels', type=int, default=512,
+                        help='Diffusion denoiser channels (default: 512)')
+    parser.add_argument('--diffusion_steps', type=int, default=1000,
+                        help='Number of diffusion steps (default: 1000)')
+    parser.add_argument('--lr_diffusion', type=float, default=5e-5,
+                        help='Learning rate for diffusion model (default: 5e-5)')
+    parser.add_argument('--lambda_diff', type=float, default=1.0,
+                        help='Weight for diffusion loss (default: 1.0)')
 
     args = parser.parse_args()
 
