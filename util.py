@@ -3,7 +3,13 @@ import numpy as np
 import time
 import argparse
 
-from mpi4py import MPI
+# MPI import is optional (only needed for partition_dataset, which is deprecated in single-process mode)
+try:
+    from mpi4py import MPI
+    MPI_AVAILABLE = True
+except ImportError:
+    MPI_AVAILABLE = False
+    MPI = None
 from math import ceil
 from random import Random
 import networkx as nx
@@ -112,6 +118,12 @@ class DataPartitioner(object):
         return partitions
 
 def partition_dataset(rank, size, args):
+    """
+    DEPRECATED: This function is for MPI multi-process training.
+    For single-process training, use load_dataset_single_process() instead.
+    """
+    if not MPI_AVAILABLE:
+        raise ImportError("MPI is required for partition_dataset. Use load_dataset_single_process() for single-process training.")
     print('==> load train data')
     if args.dataset == 'cifar10':
         transform_train = transforms.Compose([
@@ -369,6 +381,190 @@ def partition_dataset(rank, size, args):
         print('=' * 60)
 
     return train_loader, test_loader
+
+def load_dataset_single_process(args):
+    """
+    Load dataset for single process training.
+    This is the main data loading function for single-process decentralized learning.
+    
+    Returns:
+        For PACS: dictionary of {domain_name: (train_loader, test_loader)}
+        For other datasets: (train_loader, test_loader) tuple
+    """
+    print('==> load train data (single process mode)')
+    
+    if args.dataset == 'pacs':
+        print('=' * 60)
+        print(f'[PACS Dataset] Initializing PACS dataset loading (single process)...')
+        print('=' * 60)
+        
+        # PACS domains
+        all_domains = ['art_painting', 'cartoon', 'photo', 'sketch']
+        if not args.leave_out:
+            raise ValueError('--leave_out must be specified when using PACS dataset.')
+        if args.leave_out not in all_domains:
+            raise ValueError(f'Invalid leave_out domain: {args.leave_out}. Valid options: {all_domains}')
+        
+        print(f'[PACS Dataset] Leave-out domain: {args.leave_out}')
+        print(f'[PACS Dataset] All domains: {all_domains}')
+        
+        # Get available domains (exclude leave_out)
+        available_domains = [d for d in all_domains if d != args.leave_out]
+        print(f'[PACS Dataset] Available training domains: {available_domains}')
+        print('-' * 60)
+        
+        # Training transforms (same as MPI version)
+        transform_train = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomApply([
+                transforms.Compose([
+                    transforms.Resize((252, 252)),
+                    transforms.RandomCrop(224)
+                ])
+            ], p=0.5),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        # Test transforms
+        transform_test = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        # Load data for each training domain
+        domain_loaders = {}
+        for domain in available_domains:
+            print(f'[PACS Dataset] Loading training data from domain "{domain}"...')
+            print(f'[PACS Dataset] Dataset root: {args.datasetRoot}')
+            
+            train_dataset = PACSDataset(
+                root=args.datasetRoot, 
+                dataset_name=domain, 
+                transform=transform_train
+            )
+            
+            train_loader = torch.utils.data.DataLoader(
+                train_dataset, 
+                batch_size=args.bs, 
+                shuffle=True, 
+                pin_memory=True
+            )
+            
+            print(f'[PACS Dataset] Domain "{domain}": {len(train_dataset)} training samples, {len(train_loader)} batches per epoch')
+            
+            # All domains use the same test set (leave_out domain)
+            if domain == available_domains[0]:  # Only load test set once
+                print(f'[PACS Dataset] Loading test data from leave-out domain "{args.leave_out}"...')
+                test_dataset = PACSDataset(
+                    root=args.datasetRoot, 
+                    dataset_name=args.leave_out, 
+                    transform=transform_test
+                )
+                test_loader = torch.utils.data.DataLoader(
+                    test_dataset, 
+                    batch_size=64, 
+                    shuffle=False, 
+                    pin_memory=True
+                )
+                print(f'[PACS Dataset] Test samples: {len(test_dataset)}, Test batches: {len(test_loader)}')
+            else:
+                # Reuse the same test_loader for all domains
+                test_loader = domain_loaders[available_domains[0]][1]
+            
+            domain_loaders[domain] = (train_loader, test_loader)
+        
+        print('=' * 60)
+        print(f'[PACS Dataset] Single process dataset loading completed!')
+        print(f'[PACS Dataset] Loaded {len(available_domains)} training domains')
+        print('=' * 60)
+        
+        return domain_loaders
+    
+    elif args.dataset == 'cifar10':
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        trainset = torchvision.datasets.CIFAR10(
+            root=args.datasetRoot, 
+            train=True, 
+            download=True, 
+            transform=transform_train
+        )
+        train_loader = torch.utils.data.DataLoader(
+            trainset, 
+            batch_size=args.bs, 
+            shuffle=True, 
+            pin_memory=True
+        )
+        
+        print('==> load test data')
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        ])
+        testset = torchvision.datasets.CIFAR10(
+            root=args.datasetRoot, 
+            train=False, 
+            download=True, 
+            transform=transform_test
+        )
+        test_loader = torch.utils.data.DataLoader(
+            testset, 
+            batch_size=64, 
+            shuffle=False, 
+            pin_memory=True
+        )
+        
+        return train_loader, test_loader
+    
+    elif args.dataset == 'cifar100':
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        ])
+        trainset = torchvision.datasets.CIFAR100(
+            root=args.datasetRoot, 
+            train=True, 
+            download=True, 
+            transform=transform_train
+        )
+        train_loader = torch.utils.data.DataLoader(
+            trainset, 
+            batch_size=args.bs, 
+            shuffle=True, 
+            pin_memory=True
+        )
+        
+        print('==> load test data')
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        ])
+        testset = torchvision.datasets.CIFAR100(
+            root=args.datasetRoot, 
+            train=False, 
+            download=True, 
+            transform=transform_test
+        )
+        test_loader = torch.utils.data.DataLoader(
+            testset, 
+            batch_size=64, 
+            shuffle=False, 
+            pin_memory=True
+        )
+        
+        return train_loader, test_loader
+    
+    else:
+        raise NotImplementedError(f"Dataset {args.dataset} not supported in single process mode yet")
 
 def select_model(num_class, args):
     # Get style shift parameters
@@ -635,8 +831,10 @@ class Recorder(object):
         self.args = args
         self.rank = rank
         self.saveFolderName = args.savePath + args.name + '_' + args.model
-        if rank == 0 and os.path.isdir(self.saveFolderName)==False and getattr(self.args, 'save', self.args.savePath is not None):
-            os.mkdir(self.saveFolderName)
+        # Create directory if it doesn't exist (for single process, rank can be any value)
+        # For MPI, only rank 0 creates; for single process, we always create
+        if os.path.isdir(self.saveFolderName)==False and getattr(self.args, 'save', self.args.savePath is not None):
+            os.makedirs(self.saveFolderName, exist_ok=True)
     
     def add_new(self, record_time, comp_time, comm_time, epoch_time, top1, losses, test_acc):
         self.total_record_timing.append(record_time)

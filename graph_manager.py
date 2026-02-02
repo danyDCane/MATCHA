@@ -16,10 +16,17 @@ GraphProcessor
 """
 
 class GraphProcessor(object):
-    def __init__(self, base_graph, commBudget, rank, size, iterations, issubgraph):
+    def __init__(self, base_graph, commBudget, rank, size, iterations, issubgraph, comm=None):
         self.rank = rank # index of worker
         self.size = size # totoal number of workers
-        self.comm = MPI.COMM_WORLD
+        # Allow comm to be None for single process mode
+        if comm is None:
+            try:
+                self.comm = MPI.COMM_WORLD
+            except:
+                self.comm = None  # Single process mode
+        else:
+            self.comm = comm
         self.commBudget = commBudget # user defined budget
 
         if issubgraph:
@@ -188,8 +195,8 @@ class GraphProcessor(object):
 class FixedProcessor(GraphProcessor):
     """ wrapper for fixed communication graph """
 
-    def __init__(self, base_graph, commBudget, rank, size, iterations, issubgraph):
-        super(FixedProcessor, self).__init__(base_graph, commBudget, rank, size, iterations, issubgraph)
+    def __init__(self, base_graph, commBudget, rank, size, iterations, issubgraph, comm=None):
+        super(FixedProcessor, self).__init__(base_graph, commBudget, rank, size, iterations, issubgraph, comm=comm)
         self.probabilities = self.getProbability()
         self.neighbor_weight = self.getAlpha()
         self.active_flags = self.set_flags(iterations + 1)
@@ -239,8 +246,8 @@ class MatchaProcessor(GraphProcessor):
         At each iteration, only a random subset of subgraphs are activated
     """
 
-    def __init__(self, base_graph, commBudget, rank, size, iterations, issubgraph):
-        super(MatchaProcessor, self).__init__(base_graph, commBudget, rank, size, iterations, issubgraph)
+    def __init__(self, base_graph, commBudget, rank, size, iterations, issubgraph, comm=None):
+        super(MatchaProcessor, self).__init__(base_graph, commBudget, rank, size, iterations, issubgraph, comm=comm)
         self.probabilities = self.getProbability()
         self.neighbor_weight = self.getAlpha()
         self.active_flags = self.set_flags(iterations + 1)

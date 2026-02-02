@@ -312,15 +312,10 @@ def run(rank, size):
         
         if (use_style_stats or use_style_shift) and args.model == "res":
             # This forward will use communicator.neighbor_style_stats (just exchanged)
-            # If use_style_stats is True, we need return_blocks for potential future use
-            # If use_style_shift is True, we need communicator for style shift
-            if use_style_stats:
-                output, feats = model(data, return_blocks=True, communicator=communicator,
-                                     debug_style_shift=debug_style_shift, iter_num=k+1, rank=rank)
-            else:
-                # Only use_style_shift is True, don't need return_blocks
-                output = model(data, return_blocks=False, communicator=communicator,
-                              debug_style_shift=debug_style_shift, iter_num=k+1, rank=rank)
+            # Style statistics are computed in the first phase, so we don't need return_blocks here
+            # Only need communicator for style shift application
+            output = model(data, return_blocks=False, communicator=communicator,
+                          debug_style_shift=debug_style_shift, iter_num=k+1, rank=rank)
         else:
             output = model(data)
         

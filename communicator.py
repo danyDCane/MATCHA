@@ -298,7 +298,7 @@ class decenCommunicator(Communicator):
             return
         
         # Convert to CPU tensor if needed and detach from computation graph
-        # Style vec should already be on CPU and detached from train_mpi.py, but we ensure it here
+        # Style vec should already be on CPU and detached from train.py, but we ensure it here
         if self.local_style_vec.is_cuda:
             self.style_send_buffer = self.local_style_vec.detach().cpu().clone()
         else:
@@ -467,7 +467,7 @@ class ChocoCommunicator(Communicator):
             return
         
         # Convert to CPU tensor if needed and detach from computation graph
-        # Style vec should already be on CPU and detached from train_mpi.py, but we ensure it here
+        # Style vec should already be on CPU and detached from train.py, but we ensure it here
         if self.local_style_vec.is_cuda:
             self.style_send_buffer = self.local_style_vec.detach().cpu().clone()
         else:
@@ -517,3 +517,228 @@ class ChocoCommunicator(Communicator):
             return encode_time + comm_time
 
         return comm_time
+
+
+class SingleProcessCommunicator(object):
+    """
+    Single process communicator for decentralized training without MPI.
+    Performs model and style statistics aggregation directly in GPU memory.
+    """
+    def __init__(self, domain_names, topology):
+        """
+        Args:
+            domain_names: List of domain names (e.g., ['art_painting', 'photo', 'sketch'])
+            topology: GraphProcessor instance (can be MatchaProcessor or FixedProcessor)
+        """
+        # Map domain names to indices (0, 1, 2, ...)
+        self.domain_to_idx = {name: idx for idx, name in enumerate(domain_names)}
+        self.idx_to_domain = {idx: name for name, idx in self.domain_to_idx.items()}
+        self.num_domains = len(domain_names)
+        
+        # Create a mapping from domain names to rank-like indices for topology
+        # The topology uses rank indices, so we map domains to 0, 1, 2, ...
+        self.topology = topology
+        self.neighbor_weight = topology.neighbor_weight
+        self.iter = 0
+        
+        # Style statistics storage (same as base class)
+        self.local_style_vec = None
+        self.neighbor_style_vecs = {}  # {domain_name: style_vec_tensor}
+        self.neighbor_style_stats = {}  # {domain_name: {layer_name: {stat_name: tensor}}}
+        self.channels_per_layer = None
+        
+        # Build adjacency list for domains based on topology
+        self._build_domain_adjacency()
+    
+    def _build_domain_adjacency(self):
+        """Build adjacency list for domains based on topology structure."""
+        self.domain_adj = {domain: [] for domain in self.domain_to_idx.keys()}
+        
+        # For each subgraph in the topology, extract edges
+        for subgraph in self.topology.subGraphs:
+            for edge in subgraph:
+                if len(edge) == 2:
+                    idx1, idx2 = edge
+                    # Map topology indices to domain names
+                    if idx1 < self.num_domains and idx2 < self.num_domains:
+                        domain1 = self.idx_to_domain[idx1]
+                        domain2 = self.idx_to_domain[idx2]
+                        if domain2 not in self.domain_adj[domain1]:
+                            self.domain_adj[domain1].append(domain2)
+                        if domain1 not in self.domain_adj[domain2]:
+                            self.domain_adj[domain2].append(domain1)
+    
+    def set_style_channels(self, channels_per_layer: Dict[str, int]):
+        """Set channel information for each layer to enable style statistics unflattening."""
+        self.channels_per_layer = channels_per_layer
+    
+    def prepare_comm_buffer(self):
+        """Not needed for single process, but kept for interface compatibility."""
+        pass
+    
+    def prepare_style_buffer(self):
+        """Prepare style statistics buffer (keep on GPU for single process)."""
+        if self.local_style_vec is None:
+            return
+        # Keep on GPU, no need to move to CPU
+        if self.local_style_vec.is_cuda:
+            self.style_send_buffer = self.local_style_vec.detach().clone()
+        else:
+            self.style_send_buffer = self.local_style_vec.detach().cuda()
+    
+    def _aggregate_style_stats(self, style_vecs_dict, active_flags):
+        """
+        Aggregate style statistics directly in GPU memory.
+        
+        Args:
+            style_vecs_dict: Dict mapping domain_name -> style_vec (GPU tensor)
+            active_flags: Active topology flags for current iteration
+        """
+        self.neighbor_style_vecs.clear()
+        self.neighbor_style_stats.clear()
+        
+        # For each active subgraph, exchange style statistics
+        for graph_id, flag in enumerate(active_flags):
+            if flag == 0:
+                continue
+            
+            # Get neighbors for this subgraph
+            if graph_id < len(self.topology.neighbors_info):
+                neighbors_info = self.topology.neighbors_info[graph_id]
+                
+                # For each domain, find its neighbor in this subgraph
+                for domain_name, domain_idx in self.domain_to_idx.items():
+                    if domain_idx < len(neighbors_info):
+                        neighbor_idx = neighbors_info[domain_idx]
+                        if neighbor_idx != -1 and neighbor_idx < self.num_domains:
+                            neighbor_domain = self.idx_to_domain[neighbor_idx]
+                            
+                            # Directly access neighbor's style vector (already in GPU)
+                            if neighbor_domain in style_vecs_dict:
+                                self.neighbor_style_vecs[neighbor_domain] = style_vecs_dict[neighbor_domain].clone()
+                                
+                                # Unflatten if channel info is available
+                                if self.channels_per_layer is not None:
+                                    try:
+                                        layer_order = ["layer1", "layer2", "layer3"]
+                                        unflattened_stats = unflatten_style_stats(
+                                            style_vecs_dict[neighbor_domain],
+                                            layer_order=layer_order,
+                                            channels_per_layer=self.channels_per_layer
+                                        )
+                                        self.neighbor_style_stats[neighbor_domain] = unflattened_stats
+                                    except Exception as e:
+                                        pass
+    
+    def _aggregate_models(self, models_dict, active_flags):
+        """
+        Aggregate model parameters directly in GPU memory.
+        Formula: x_i^{t+1} = (1 - d*alpha) * x_i^t + alpha * sum_{j in neighbors} x_j^t
+        
+        Args:
+            models_dict: Dict mapping domain_name -> model
+            active_flags: Active topology flags for current iteration
+        """
+        from copy import deepcopy
+        
+        # Create local copies of model state dicts (all operations on GPU)
+        local_models = {}
+        for domain_name, model in models_dict.items():
+            local_models[domain_name] = deepcopy(model.state_dict())
+        
+        # Aggregate based on active topology
+        with torch.no_grad():  # Aggregation doesn't need gradients
+            # For each domain, compute its degree and aggregate with neighbors
+            for domain_name in models_dict:
+                domain_idx = self.domain_to_idx[domain_name]
+                original_state = models_dict[domain_name].state_dict()
+                
+                # Count active neighbors and accumulate their parameters
+                degree = 0
+                neighbor_sum = {}  # Accumulate sum of neighbor parameters
+                
+                for graph_id, flag in enumerate(active_flags):
+                    if flag == 0:
+                        continue
+                    if graph_id < len(self.topology.neighbors_info):
+                        neighbors_info = self.topology.neighbors_info[graph_id]
+                        if domain_idx < len(neighbors_info):
+                            neighbor_idx = neighbors_info[domain_idx]
+                            if neighbor_idx != -1 and neighbor_idx < self.num_domains:
+                                neighbor_domain = self.idx_to_domain[neighbor_idx]
+                                
+                                if neighbor_domain in models_dict:
+                                    degree += 1
+                                    neighbor_state = models_dict[neighbor_domain].state_dict()
+                                    
+                                    # Accumulate neighbor parameters
+                                    for layer_name in original_state:
+                                        if 'bn' not in layer_name:  # Skip BatchNorm layers
+                                            if layer_name not in neighbor_sum:
+                                                neighbor_sum[layer_name] = torch.zeros_like(original_state[layer_name])
+                                            neighbor_sum[layer_name] += neighbor_state[layer_name]
+                
+                # Apply decentralized averaging formula:
+                # x_i^{t+1} = (1 - d*alpha) * x_i^t + alpha * sum_{j in neighbors} x_j^t
+                selfweight = 1 - degree * self.neighbor_weight
+                
+                for layer_name in local_models[domain_name]:
+                    if 'bn' not in layer_name:
+                        if layer_name in neighbor_sum:
+                            # Formula: (1 - d*alpha) * x_i + alpha * sum_j x_j
+                            local_models[domain_name][layer_name] = (
+                                selfweight * original_state[layer_name] +
+                                self.neighbor_weight * neighbor_sum[layer_name]
+                            )
+                        else:
+                            # No active neighbors, keep original
+                            local_models[domain_name][layer_name] = original_state[layer_name]
+        
+        # Load aggregated parameters back to models
+        for domain_name, model in models_dict.items():
+            model.load_state_dict(local_models[domain_name])
+    
+    def averaging(self, active_flags=None):
+        """
+        Perform averaging operation (no-op for single process, but kept for compatibility).
+        Actual aggregation is done in communicate() method.
+        """
+        return 0.0  # No communication time
+    
+    def reset_model(self):
+        """Not needed for single process, but kept for interface compatibility."""
+        pass
+    
+    def communicate(self, models_dict, style_vecs_dict=None):
+        """
+        Communicate model parameters and/or style statistics in single process.
+        
+        Args:
+            models_dict: Dict mapping domain_name -> model (required if style_vecs_dict is None)
+            style_vecs_dict: Dict mapping domain_name -> style_vec (optional)
+        
+        Returns:
+            comm_time: Always 0.0 for single process (no actual communication)
+        """
+        # Get active topology flags for current iteration
+        if hasattr(self.topology, 'active_flags') and self.iter < len(self.topology.active_flags):
+            active_flags = self.topology.active_flags[self.iter]
+        else:
+            # If no active flags, assume all subgraphs are active
+            active_flags = [1] * len(self.topology.subGraphs)
+        
+        # If no subgraphs are activated, skip communication
+        if sum(active_flags) == 0:
+            if style_vecs_dict is None:
+                self.iter += 1
+            return 0.0
+        
+        if style_vecs_dict is not None:
+            # Exchange style statistics only
+            self._aggregate_style_stats(style_vecs_dict, active_flags)
+        else:
+            # Exchange model parameters only
+            self.iter += 1
+            self._aggregate_models(models_dict, active_flags)
+        
+        return 0.0  # No communication time for single process
