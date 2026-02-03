@@ -635,27 +635,41 @@ class SingleProcessCommunicator(object):
         Aggregate model parameters directly in GPU memory.
         Formula: x_i^{t+1} = (1 - d*alpha) * x_i^t + alpha * sum_{j in neighbors} x_j^t
         
+        Only aggregates trainable parameters (weight, bias), NOT buffers (running_mean, running_var).
+        This matches multi-process behavior where only model.parameters() are aggregated.
+        
+        IMPORTANT: All domains must use the SAME snapshot of parameters for aggregation
+        to ensure consistency (matching multi-process behavior where all ranks exchange simultaneously).
+        
         Args:
             models_dict: Dict mapping domain_name -> model
             active_flags: Active topology flags for current iteration
         """
-        from copy import deepcopy
-        
-        # Create local copies of model state dicts (all operations on GPU)
-        local_models = {}
-        for domain_name, model in models_dict.items():
-            local_models[domain_name] = deepcopy(model.state_dict())
-        
-        # Aggregate based on active topology
         with torch.no_grad():  # Aggregation doesn't need gradients
-            # For each domain, compute its degree and aggregate with neighbors
+            # CRITICAL: Save parameter snapshots for ALL domains BEFORE aggregation
+            # This ensures all domains aggregate based on the same parameter values
+            # (matching multi-process behavior where all ranks exchange simultaneously)
+            param_snapshots = {}
+            for domain_name, model in models_dict.items():
+                param_snapshots[domain_name] = {
+                    name: param.data.clone() 
+                    for name, param in model.named_parameters()
+                }
+            
+            # Now aggregate based on snapshots (all domains use the same snapshot)
             for domain_name in models_dict:
                 domain_idx = self.domain_to_idx[domain_name]
-                original_state = models_dict[domain_name].state_dict()
+                model = models_dict[domain_name]
+                param_dict = dict(model.named_parameters())
                 
-                # Count active neighbors and accumulate their parameters
+                # Use snapshot for this domain's original parameters
+                original_params = param_snapshots[domain_name]
+                
+                # Count active neighbors and accumulate their parameters from snapshots
+                # Note: degree counts the number of active subgraphs with neighbors
+                # This matches decenCommunicator logic where degree increments for each active subgraph
                 degree = 0
-                neighbor_sum = {}  # Accumulate sum of neighbor parameters
+                neighbor_sum = {}  # Accumulate sum of neighbor parameters (only parameters, not buffers)
                 
                 for graph_id, flag in enumerate(active_flags):
                     if flag == 0:
@@ -669,34 +683,52 @@ class SingleProcessCommunicator(object):
                                 
                                 if neighbor_domain in models_dict:
                                     degree += 1
-                                    neighbor_state = models_dict[neighbor_domain].state_dict()
+                                    # Use snapshot instead of current model parameters
+                                    neighbor_params = param_snapshots[neighbor_domain]
                                     
-                                    # Accumulate neighbor parameters
-                                    for layer_name in original_state:
-                                        if 'bn' not in layer_name:  # Skip BatchNorm layers
-                                            if layer_name not in neighbor_sum:
-                                                neighbor_sum[layer_name] = torch.zeros_like(original_state[layer_name])
-                                            neighbor_sum[layer_name] += neighbor_state[layer_name]
+                                    # Accumulate neighbor parameters from snapshot
+                                    for param_name in param_dict.keys():
+                                        if param_name not in neighbor_sum:
+                                            neighbor_sum[param_name] = torch.zeros_like(original_params[param_name])
+                                        neighbor_sum[param_name] += neighbor_params[param_name]
                 
-                # Apply decentralized averaging formula:
+                # Apply decentralized averaging formula (same as decenCommunicator):
                 # x_i^{t+1} = (1 - d*alpha) * x_i^t + alpha * sum_{j in neighbors} x_j^t
+                # This matches: recv_buffer = (1 - d*alpha) * send_buffer + alpha * sum(neighbor_buffers)
+                # Multi-process logic:
+                #   1. recv_buffer = 0
+                #   2. For each neighbor: recv_buffer += alpha * neighbor_buffer
+                #   3. recv_buffer += (1 - d*alpha) * send_buffer
+                #   4. Result: (1 - d*alpha) * x_i + alpha * sum_j x_j
                 selfweight = 1 - degree * self.neighbor_weight
                 
-                for layer_name in local_models[domain_name]:
-                    if 'bn' not in layer_name:
-                        if layer_name in neighbor_sum:
-                            # Formula: (1 - d*alpha) * x_i + alpha * sum_j x_j
-                            local_models[domain_name][layer_name] = (
-                                selfweight * original_state[layer_name] +
-                                self.neighbor_weight * neighbor_sum[layer_name]
-                            )
-                        else:
-                            # No active neighbors, keep original
-                            local_models[domain_name][layer_name] = original_state[layer_name]
-        
-        # Load aggregated parameters back to models
-        for domain_name, model in models_dict.items():
-            model.load_state_dict(local_models[domain_name])
+                # Debug output (similar to decenCommunicator line 237-241)
+                if self.iter % 100 == 0 and domain_name == list(models_dict.keys())[0]:
+                    first_param_name = list(param_dict.keys())[0]
+                    first_param_before = original_params[first_param_name].view(-1)[0].item()
+                    first_neighbor_sum = neighbor_sum[first_param_name].view(-1)[0].item() if first_param_name in neighbor_sum else 0.0
+                    print(f"DEBUG [SingleProcess] domain={domain_name}, iter={self.iter}, "
+                          f"first_param={first_param_name}, "
+                          f"first_param_before={first_param_before:.6f}, "
+                          f"degree={degree}, alpha={self.neighbor_weight:.6f}, "
+                          f"selfweight={selfweight:.6f}, "
+                          f"neighbor_sum[0]={first_neighbor_sum:.6f}")
+                
+                # Apply aggregation to parameters only (matching multi-process behavior)
+                # Only update parameters, buffers (running_mean, running_var) remain unchanged
+                # Use original_params from snapshot, not current param.data
+                for param_name, param in param_dict.items():
+                    if param_name in neighbor_sum:
+                        # Formula: (1 - d*alpha) * x_i + alpha * sum_j x_j
+                        # This matches decenCommunicator: 
+                        #   recv_buffer.add_(neighbor_buffer, alpha=neighbor_weight) for each neighbor
+                        #   recv_buffer.add_(send_buffer, alpha=selfweight)
+                        # Use original_params from snapshot to ensure consistency
+                        param.data.copy_(
+                            selfweight * original_params[param_name] +
+                            self.neighbor_weight * neighbor_sum[param_name]
+                        )
+                    # If no active neighbors, param remains unchanged (selfweight = 1, so no change)
     
     def averaging(self, active_flags=None):
         """

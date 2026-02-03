@@ -193,6 +193,21 @@ def run(num_domains):
     # All models already have identical initial parameters (copied from first model)
     print(f"[Single Process] All models initialized with identical parameters")
 
+    # ====== Initialize BatchNorm state isolation for each domain =======
+    # In multi-process mode, each rank has independent BatchNorm statistics.
+    # In single-process mode, we need to maintain separate BatchNorm states for each domain
+    # to prevent cross-domain contamination of running_mean/running_var.
+    bn_states_dict = {}
+    for domain in domain_names:
+        bn_states_dict[domain] = {}
+        for name, module in models_dict[domain].named_modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                bn_states_dict[domain][name] = {
+                    'running_mean': module.running_mean.clone(),
+                    'running_var': module.running_var.clone(),
+                    'num_batches_tracked': module.num_batches_tracked.clone() if hasattr(module, 'num_batches_tracked') else None
+                }
+    print(f"[Single Process] BatchNorm state isolation initialized for {num_domains} domains")
     # init recorders for each domain
     comp_time, comm_time = 0, 0
     # Use domain index for recorder (compatible with existing Recorder interface)
@@ -263,6 +278,17 @@ def run(num_domains):
             optimizer = optimizers_dict[domain]
             criterion = nn.CrossEntropyLoss().cuda()
             
+            # ====== Restore BatchNorm state for this domain ======
+            # This ensures each domain maintains independent BatchNorm statistics,
+            # matching multi-process behavior where each rank has separate BatchNorm states.
+            for name, module in model.named_modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    if name in bn_states_dict[domain]:
+                        module.running_mean.copy_(bn_states_dict[domain][name]['running_mean'])
+                        module.running_var.copy_(bn_states_dict[domain][name]['running_var'])
+                        if bn_states_dict[domain][name]['num_batches_tracked'] is not None:
+                            module.num_batches_tracked.copy_(bn_states_dict[domain][name]['num_batches_tracked'])
+            
             # Get batch for this domain (reuse the same batch from style stats computation if available)
             # For efficiency, we could reuse, but for correctness, we get a new batch
             data, target = next(train_iters[domain])
@@ -319,12 +345,46 @@ def run(num_domains):
 
             # update cosine annealing scheduler (purely step-based)
             schedulers_dict[domain].step()
+            
+            # ====== Save updated BatchNorm state for this domain ======
+            # After training, save the updated BatchNorm statistics to maintain domain isolation.
+            # This prevents BatchNorm statistics from one domain from contaminating others.
+            for name, module in model.named_modules():
+                if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                    if name not in bn_states_dict[domain]:
+                        bn_states_dict[domain][name] = {}
+                    bn_states_dict[domain][name]['running_mean'] = module.running_mean.clone()
+                    bn_states_dict[domain][name]['running_var'] = module.running_var.clone()
+                    if hasattr(module, 'num_batches_tracked'):
+                        bn_states_dict[domain][name]['num_batches_tracked'] = module.num_batches_tracked.clone()
         
         # ========== 第三阶段：交换训练后的模型参数 ==========
         # Exchange updated model parameters after training step
         # Note: style_vecs_dict is None here since we only exchange model parameters (not style stats)
         d_comm_time_after = communicator.communicate(models_dict, style_vecs_dict=None)
         comm_time += d_comm_time_after
+        
+        # 立即检查通信后的参数一致性（类似 train_mpi.py line 368-384）
+        if (k + 1) % STEPS_PER_EPOCH == 0:
+            # 收集所有 domain 的第一个参数值
+            first_params = {}
+            for domain in domain_names:
+                first_param = list(models_dict[domain].parameters())[0].view(-1)[0].item()
+                first_params[domain] = first_param
+            
+            # 打印参数值
+            param_values = [f'{first_params[d]:.6f}' for d in domain_names]
+            print(f"\n*** IMMEDIATE after comm iter {k+1}: {param_values} ***")
+            
+            # 检查是否一致（允许小的数值误差）
+            param_set = set([round(first_params[d], 4) for d in domain_names])
+            if len(param_set) == 1:
+                print("✓ Parameters are CONSISTENT after communication!")
+            else:
+                print(f"✗ Parameters are INCONSISTENT after communication! Values: {param_set}")
+                # 打印每个 domain 的详细参数
+                for domain in domain_names:
+                    print(f"  {domain}: {first_params[domain]:.6f}")
         
         end_time = time.time()
         d_comp_time = (end_time - start_time - (record_end - record_start))
