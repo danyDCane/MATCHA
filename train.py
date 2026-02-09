@@ -132,9 +132,7 @@ def run(num_domains):
     diffusion_models_dict = {}
     optimizers_diffusion_dict = {}
     
-    print(f"[Single Process] Initializing {num_domains} models...")
     if getattr(args, 'pretrained', False):
-        print(f"[Single Process] Initializing models with pretrained weights (downloading if needed)...")
         # Create first model (download pretrained weights if needed)
         first_model = util.select_model(num_classes, args)
         first_model = first_model.cuda()
@@ -187,11 +185,7 @@ def run(num_domains):
             models_dict[domain].diffusion_model = diffusion_model
             diffusion_models_dict[domain] = diffusion_model
     
-    if getattr(args, 'use_ood', False):
-        print(f"[Single Process] Diffusion models initialized for OOD detection")
-    
     # All models already have identical initial parameters (copied from first model)
-    print(f"[Single Process] All models initialized with identical parameters")
 
     # ====== Initialize BatchNorm state isolation for each domain =======
     # In multi-process mode, each rank has independent BatchNorm statistics.
@@ -207,7 +201,6 @@ def run(num_domains):
                     'running_var': module.running_var.clone(),
                     'num_batches_tracked': module.num_batches_tracked.clone() if hasattr(module, 'num_batches_tracked') else None
                 }
-    print(f"[Single Process] BatchNorm state isolation initialized for {num_domains} domains")
     # init recorders for each domain
     comp_time, comm_time = 0, 0
     # Use domain index for recorder (compatible with existing Recorder interface)
@@ -318,6 +311,7 @@ def run(num_domains):
                 # Detach latents to avoid affecting backbone gradients
                 latents_for_diff = latents.detach().requires_grad_(True)
                 latents_normalized = diffusion_model.normalize(latents_for_diff)
+                
                 loss_diff = diffusion_model.get_loss_iter(latents_normalized)
                 
                 # Backward pass for diffusion model
@@ -364,27 +358,17 @@ def run(num_domains):
         d_comm_time_after = communicator.communicate(models_dict, style_vecs_dict=None)
         comm_time += d_comm_time_after
         
-        # 立即检查通信后的参数一致性（类似 train_mpi.py line 368-384）
+        # 检查通信后的参数一致性（每epoch检查一次，只在不一致时打印）
         if (k + 1) % STEPS_PER_EPOCH == 0:
-            # 收集所有 domain 的第一个参数值
             first_params = {}
             for domain in domain_names:
                 first_param = list(models_dict[domain].parameters())[0].view(-1)[0].item()
                 first_params[domain] = first_param
             
-            # 打印参数值
-            param_values = [f'{first_params[d]:.6f}' for d in domain_names]
-            print(f"\n*** IMMEDIATE after comm iter {k+1}: {param_values} ***")
-            
-            # 检查是否一致（允许小的数值误差）
+            # 只在参数不一致时打印警告
             param_set = set([round(first_params[d], 4) for d in domain_names])
-            if len(param_set) == 1:
-                print("✓ Parameters are CONSISTENT after communication!")
-            else:
-                print(f"✗ Parameters are INCONSISTENT after communication! Values: {param_set}")
-                # 打印每个 domain 的详细参数
-                for domain in domain_names:
-                    print(f"  {domain}: {first_params[domain]:.6f}")
+            if len(param_set) > 1:
+                print(f"⚠ WARNING: Parameters INCONSISTENT after comm iter {k+1}: {param_set}")
         
         end_time = time.time()
         d_comp_time = (end_time - start_time - (record_end - record_start))
@@ -397,8 +381,10 @@ def run(num_domains):
         # Print progress (average across domains)
         avg_loss = sum(losses_dict[d].avg for d in domain_names) / len(domain_names)
         avg_acc = sum(top1_dict[d].avg for d in domain_names) / len(domain_names)
+        avg_loss_val = avg_loss.item() if hasattr(avg_loss, 'item') else float(avg_loss)
+        avg_acc_val = avg_acc.item() if hasattr(avg_acc, 'item') else float(avg_acc)
         print("iter: %d/%d, comp_time: %.3f, comm_time: %.3f, total time: %.3f, avg_loss: %.3f, avg_acc: %.3f"
-              % (k+1, K, d_comp_time, d_comm_time_after, comp_time + comm_time, avg_loss, avg_acc), end='\r')
+              % (k+1, K, d_comp_time, d_comm_time_after, comp_time + comm_time, avg_loss_val, avg_acc_val), end='\r')
 
         # measure and log after each pseudo-epoch
         if (k + 1) % STEPS_PER_EPOCH == 0:
@@ -421,7 +407,9 @@ def run(num_domains):
             torch.cuda.empty_cache()
 
             # Log results for each domain
-            avg_test_acc = sum(test_accs.values()) / len(test_accs)
+            # Convert test_accs to float values before averaging
+            test_accs_float = {d: (acc.item() if hasattr(acc, 'item') else float(acc)) for d, acc in test_accs.items()}
+            avg_test_acc = sum(test_accs_float.values()) / len(test_accs_float)
             avg_train_loss = sum(losses_dict[d].avg for d in domain_names) / len(domain_names)
             avg_train_acc = sum(top1_dict[d].avg for d in domain_names) / len(domain_names)
             
@@ -429,8 +417,13 @@ def run(num_domains):
                 recorder = recorders[domain]
                 recorder.add_new(record_time, comp_time, comm_time, epoch_time,
                                top1_dict[domain].avg, losses_dict[domain].avg, test_accs[domain])
-                print("domain: %s, epoch: %d, loss: %.3f, train_acc: %.3f, test_acc: %.3f epoch time: %.3f"
-                      % (domain, epoch, losses_dict[domain].avg, top1_dict[domain].avg, test_accs[domain], epoch_time))
+            
+            # 简化的epoch总结打印（先换行清除\r的效果）
+            print()  # 换行，清除之前使用\r的进度条
+            avg_train_loss_val = avg_train_loss.item() if hasattr(avg_train_loss, 'item') else float(avg_train_loss)
+            avg_train_acc_val = avg_train_acc.item() if hasattr(avg_train_acc, 'item') else float(avg_train_acc)
+            avg_test_acc_val = avg_test_acc.item() if hasattr(avg_test_acc, 'item') else float(avg_test_acc)
+            print(f"Epoch {epoch}: avg_loss={avg_train_loss_val:.3f}, avg_train_acc={avg_train_acc_val:.2f}%, avg_test_acc={avg_test_acc_val:.2f}%")
             
             # log to wandb (average across domains)
             log_dict = {
@@ -453,13 +446,70 @@ def run(num_domains):
             
             # Add diffusion loss if OOD detection is enabled
             if getattr(args, 'use_ood', False) and loss_diff_meters is not None:
-                avg_diff_loss = sum(loss_diff_meters[d].avg for d in domain_names) / len(domain_names)
-                log_dict["diffusion_loss"] = avg_diff_loss.item() if hasattr(avg_diff_loss, 'item') else float(avg_diff_loss)
+                # ===== 为每个domain记录各自的diffusion监控指标 =====
+                # 虽然denoiser参数会被聚合，但normalization buffers是独立的，所以每个domain的指标不同
+                for domain in domain_names:
+                    if domain in diffusion_models_dict:
+                        diffusion_model = diffusion_models_dict[domain]
+                        
+                        # 为每个domain记录diffusion loss
+                        log_dict[f"{domain}/diffusion_loss"] = loss_diff_meters[domain].avg.item() if hasattr(loss_diff_meters[domain].avg, 'item') else float(loss_diff_meters[domain].avg)
+                        
+                        # 预测噪声余弦相似度指标（每个domain独立）
+                        if hasattr(diffusion_model.diffusion_process, '_last_snr_info'):
+                            monitor_info = diffusion_model.diffusion_process._last_snr_info
+                            if 'noise_pred_cosine' in monitor_info:
+                                log_dict[f"{domain}/noise_pred_cosine/mean"] = monitor_info['noise_pred_cosine']
+                                if 'noise_pred_cosine_std' in monitor_info:
+                                    log_dict[f"{domain}/noise_pred_cosine/std"] = monitor_info['noise_pred_cosine_std']
+                        
+                        # ID vs Pseudo-OOD Score Gap（使用固定时间步 t=15）
+                        try:
+                            with torch.no_grad():
+                                # 获取真实特征（ID）
+                                sample_data, _ = next(iter(domain_loaders[domain][1]))  # test_loader
+                                sample_data = sample_data.cuda()
+                                sample_latents = models_dict[domain].intermediate_forward(sample_data)
+                                sample_latents_normalized = diffusion_model.normalize(sample_latents.detach())
+                                
+                                # 生成纯噪声（Pseudo-OOD）
+                                noise_latents = torch.randn_like(sample_latents_normalized)
+                                
+                                # 使用固定时间步 t=15 计算 score
+                                t_fixed = torch.full((sample_latents_normalized.size(0),), 15, 
+                                                    device=sample_latents_normalized.device, dtype=torch.long)
+                                
+                                # 计算 ID 的 score norm
+                                id_pred_noise = diffusion_model.denoiser(sample_latents_normalized, t_fixed)
+                                # 计算 std_t for t=15
+                                sqrt_one_minus_alpha_cumprod_t = diffusion_model.diffusion_process._extract(
+                                    diffusion_model.diffusion_process.sqrt_one_minus_alphas_cumprod.to(sample_latents_normalized.device),
+                                    t_fixed, sample_latents_normalized.shape
+                                )
+                                std_t = sqrt_one_minus_alpha_cumprod_t
+                                id_score = -id_pred_noise / (std_t + 1e-8)
+                                id_score_norm = id_score.norm(p=2, dim=1).mean().item()
+                                
+                                # 计算 Noise (Pseudo-OOD) 的 score norm
+                                noise_pred_noise = diffusion_model.denoiser(noise_latents, t_fixed)
+                                noise_score = -noise_pred_noise / (std_t + 1e-8)
+                                noise_score_norm = noise_score.norm(p=2, dim=1).mean().item()
+                                
+                                # 计算 Gap
+                                score_gap = noise_score_norm - id_score_norm
+                                
+                                log_dict[f"{domain}/score_gap/id_score_norm"] = id_score_norm
+                                log_dict[f"{domain}/score_gap/noise_score_norm"] = noise_score_norm
+                                log_dict[f"{domain}/score_gap/gap"] = score_gap
+                        except Exception as e:
+                            # 如果计算失败，跳过（不影响训练）
+                            pass
+                        
+                        # Diffusion学习率（所有domain应该相同，只记录一次）
+                        if domain == domain_names[0]:
+                            log_dict["train/lr_diffusion"] = optimizers_diffusion_dict[domain].param_groups[0]['lr']
             
             wandb.log(log_dict)
-            
-            print("comp_time: %.3f, comm_time: %.3f, comp_time_budget: %.3f, comm_time_budget: %.3f"
-                  % (comp_time, comm_time, comp_time/epoch_time, comm_time/epoch_time))
 
             # reset recorders for next epoch
             comp_time, comm_time = 0, 0
@@ -469,6 +519,35 @@ def run(num_domains):
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].reset()
             tic = time.time()
+
+    # ===== Save final models (backbone + diffusion + normalization stats) =====
+    # We save one checkpoint per domain so that:
+    # - Backbone (feature extractor + classifier head) weights are preserved per domain
+    # - Diffusion model (denoiser + diffusion process + FeatureNormalization buffers) are preserved per domain
+    # - Domain-specific FeatureNormalization statistics (mean/std/shift/scale) are not lost
+    save_dir = args.savePath if args.savePath is not None else "./checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+
+    for domain in domain_names:
+        model = models_dict[domain]
+        checkpoint = {
+            "args": args,
+            "domain": domain,
+            "all_domains": domain_names,
+            "dataset": args.dataset,
+            "leave_out": getattr(args, "leave_out", None),
+            # Full backbone model (feature extractor + classifier head)
+            "backbone_state": model.state_dict(),
+        }
+
+        # Save full diffusion model state (includes denoiser + diffusion process + FeatureNormalization buffers)
+        if hasattr(model, "diffusion_model") and model.diffusion_model is not None:
+            checkpoint["diffusion_state"] = model.diffusion_model.state_dict()
+
+        save_name = f"{args.description}_{domain}_final.pth"
+        save_path = os.path.join(save_dir, save_name)
+        torch.save(checkpoint, save_path)
+        print(f"[Checkpoint] Saved final backbone + diffusion model for domain '{domain}' to: {save_path}")
 
     # Save recorders
     for domain, recorder in recorders.items():

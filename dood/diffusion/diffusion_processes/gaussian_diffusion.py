@@ -203,37 +203,6 @@ class GaussianDiffusion:
             noise = torch.randn(x_start.shape, dtype=x_start.dtype, device=x_start.device)
         assert noise.shape == x_start.shape and noise.dtype == x_start.dtype
         
-        # ================= [START] 添加 SNR 監控指標 =================
-        with torch.no_grad():
-            # 1. Signal Magnitude (x_0 能量)
-            x0_norms = x_start.norm(p=2, dim=1)  # shape: (N,)
-            x0_norm = x0_norms.mean()
-            x0_norm_std = x0_norms.std()
-            
-            # 2. Noise Magnitude (雜訊能量)
-            noise_norms = noise.norm(p=2, dim=1)  # shape: (N,)
-            noise_norm = noise_norms.mean()
-            noise_norm_std = noise_norms.std()
-            
-            # 3. SNR Ratio
-            snr_energy = x0_norm / (noise_norm + 1e-8)
-            
-            # 4. 理论期望值（对于标准正态分布，||epsilon|| 的期望约为 sqrt(D)）
-            expected_norm = np.sqrt(dim)
-            
-            # 存储到类属性以便在训练循环中访问
-            self._last_snr_info = {
-                'snr': snr_energy.item(),
-                'x0_norm': x0_norm.item(),
-                'x0_norm_std': x0_norm_std.item(),
-                'noise_norm': noise_norm.item(),
-                'noise_norm_std': noise_norm_std.item(),
-                'expected_norm': expected_norm,
-                'x0_norm_ratio': (x0_norm.item() / expected_norm) if expected_norm > 0 else 0.0,
-                'noise_norm_ratio': (noise_norm.item() / expected_norm) if expected_norm > 0 else 0.0,
-            }
-        # ================= [END] 添加 SNR 監控指標 =================
-        
         # 用 noise 與 原圖 x_start 合成髒圖 x_t
         x_t = self.q_sample(x_start=x_start, t=t, noise=noise)
 
@@ -262,35 +231,23 @@ class GaussianDiffusion:
             else:
                 kl = 0.
             
-            # ================= [START] 添加 Trivial Solution Indicator =================
+            # ================= [START] 添加预测噪声余弦相似度监控 =================
             with torch.no_grad():
-                # Prediction vs Input Correlation (是否只是輸出輸入?)
-                # 預測出的雜訊 vs 含噪輸入
-                # 如果 x0 很小，x_t 就全是 noise，那 model_output 也會很像 x_t
-                # 如果模型学会了偷懒（Trivial Solution），它会发现只要输出输入 (output = input)
-                # 就能得到完美的 epsilon 预测
+                # 计算预测噪声与真实噪声的余弦相似度
+                # 理想情况下应该接近 1.0（至少 > 0.8）
+                # 如果接近 0，说明模型只是在猜测幅度，方向错误
+                noise_pred_cosine = torch.nn.functional.cosine_similarity(noise, model_output, dim=1)  # shape: (N,)
+                noise_pred_cosine_mean = noise_pred_cosine.mean().item()
+                noise_pred_cosine_std = noise_pred_cosine.std().item()
                 
-                # 使用 PyTorch 内置函数计算余弦相似度（更简洁高效）
-                pred_input_cos = torch.nn.functional.cosine_similarity(model_output, x_t, dim=1)  # shape: (N,)
-                
-                # 计算统计量
-                identity_correlation_mean = pred_input_cos.mean().item()
-                identity_correlation_std = pred_input_cos.std().item()
-                identity_correlation_max = pred_input_cos.max().item()
-                
-                # 判断是否出现 Trivial Solution（如果 > 0.99 则警告）
-                is_trivial_solution = identity_correlation_mean > 0.99
-                
-                # 更新监控信息字典
+                # 存储到类属性以便在训练循环中访问
                 if not hasattr(self, '_last_snr_info'):
                     self._last_snr_info = {}
                 self._last_snr_info.update({
-                    'identity_correlation': identity_correlation_mean,
-                    'identity_correlation_std': identity_correlation_std,
-                    'identity_correlation_max': identity_correlation_max,
-                    'is_trivial_solution': is_trivial_solution,
+                    'noise_pred_cosine': noise_pred_cosine_mean,
+                    'noise_pred_cosine_std': noise_pred_cosine_std,
                 })
-            # ================= [END] 添加 Trivial Solution Indicator =================
+            # ================= [END] 添加预测噪声余弦相似度监控 =================
             
             loss = ((noise - model_output)**2).mean(-1)
             loss = loss + kl

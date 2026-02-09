@@ -641,6 +641,8 @@ class SingleProcessCommunicator(object):
         IMPORTANT: All domains must use the SAME snapshot of parameters for aggregation
         to ensure consistency (matching multi-process behavior where all ranks exchange simultaneously).
         
+        Now also aggregates diffusion_model parameters (denoiser only, not normalization buffers).
+        
         Args:
             models_dict: Dict mapping domain_name -> model
             active_flags: Active topology flags for current iteration
@@ -650,11 +652,25 @@ class SingleProcessCommunicator(object):
             # This ensures all domains aggregate based on the same parameter values
             # (matching multi-process behavior where all ranks exchange simultaneously)
             param_snapshots = {}
+            diffusion_param_snapshots = {}
             for domain_name, model in models_dict.items():
+                # Save backbone model parameters
                 param_snapshots[domain_name] = {
                     name: param.data.clone() 
                     for name, param in model.named_parameters()
                 }
+                
+                # Save diffusion model parameters if exists
+                if hasattr(model, 'diffusion_model') and model.diffusion_model is not None:
+                    # Only aggregate denoiser parameters, NOT normalization buffers
+                    # normalization buffers (mins, maxs, means, stds, etc.) are domain-specific statistics
+                    # and should remain independent per domain
+                    diffusion_param_snapshots[domain_name] = {
+                        name: param.data.clone()
+                        for name, param in model.diffusion_model.named_parameters()
+                        # Filter out normalization buffers - they are registered as buffers, not parameters
+                        # so named_parameters() should only return denoiser parameters
+                    }
             
             # Now aggregate based on snapshots (all domains use the same snapshot)
             for domain_name in models_dict:
@@ -668,8 +684,17 @@ class SingleProcessCommunicator(object):
                 # Count active neighbors and accumulate their parameters from snapshots
                 # Note: degree counts the number of active subgraphs with neighbors
                 # This matches decenCommunicator logic where degree increments for each active subgraph
+                # Backbone and diffusion share the same topology, so we compute degree once and accumulate both
                 degree = 0
-                neighbor_sum = {}  # Accumulate sum of neighbor parameters (only parameters, not buffers)
+                neighbor_sum = {}  # Accumulate sum of neighbor backbone parameters
+                diffusion_neighbor_sum = {}  # Accumulate sum of neighbor diffusion parameters (if exists)
+                
+                # Check if this domain has diffusion model
+                has_diffusion = (hasattr(model, 'diffusion_model') and model.diffusion_model is not None and 
+                               domain_name in diffusion_param_snapshots)
+                if has_diffusion:
+                    diffusion_param_dict = dict(model.diffusion_model.named_parameters())
+                    original_diffusion_params = diffusion_param_snapshots[domain_name]
                 
                 for graph_id, flag in enumerate(active_flags):
                     if flag == 0:
@@ -686,11 +711,19 @@ class SingleProcessCommunicator(object):
                                     # Use snapshot instead of current model parameters
                                     neighbor_params = param_snapshots[neighbor_domain]
                                     
-                                    # Accumulate neighbor parameters from snapshot
+                                    # Accumulate neighbor backbone parameters from snapshot
                                     for param_name in param_dict.keys():
                                         if param_name not in neighbor_sum:
                                             neighbor_sum[param_name] = torch.zeros_like(original_params[param_name])
                                         neighbor_sum[param_name] += neighbor_params[param_name]
+                                    
+                                    # Accumulate neighbor diffusion parameters if both domains have diffusion models
+                                    if has_diffusion and neighbor_domain in diffusion_param_snapshots:
+                                        neighbor_diffusion_params = diffusion_param_snapshots[neighbor_domain]
+                                        for param_name in diffusion_param_dict.keys():
+                                            if param_name not in diffusion_neighbor_sum:
+                                                diffusion_neighbor_sum[param_name] = torch.zeros_like(original_diffusion_params[param_name])
+                                            diffusion_neighbor_sum[param_name] += neighbor_diffusion_params[param_name]
                 
                 # Apply decentralized averaging formula (same as decenCommunicator):
                 # x_i^{t+1} = (1 - d*alpha) * x_i^t + alpha * sum_{j in neighbors} x_j^t
@@ -702,19 +735,7 @@ class SingleProcessCommunicator(object):
                 #   4. Result: (1 - d*alpha) * x_i + alpha * sum_j x_j
                 selfweight = 1 - degree * self.neighbor_weight
                 
-                # Debug output (similar to decenCommunicator line 237-241)
-                if self.iter % 100 == 0 and domain_name == list(models_dict.keys())[0]:
-                    first_param_name = list(param_dict.keys())[0]
-                    first_param_before = original_params[first_param_name].view(-1)[0].item()
-                    first_neighbor_sum = neighbor_sum[first_param_name].view(-1)[0].item() if first_param_name in neighbor_sum else 0.0
-                    print(f"DEBUG [SingleProcess] domain={domain_name}, iter={self.iter}, "
-                          f"first_param={first_param_name}, "
-                          f"first_param_before={first_param_before:.6f}, "
-                          f"degree={degree}, alpha={self.neighbor_weight:.6f}, "
-                          f"selfweight={selfweight:.6f}, "
-                          f"neighbor_sum[0]={first_neighbor_sum:.6f}")
-                
-                # Apply aggregation to parameters only (matching multi-process behavior)
+                # Apply aggregation to backbone parameters only (matching multi-process behavior)
                 # Only update parameters, buffers (running_mean, running_var) remain unchanged
                 # Use original_params from snapshot, not current param.data
                 for param_name, param in param_dict.items():
@@ -729,6 +750,17 @@ class SingleProcessCommunicator(object):
                             self.neighbor_weight * neighbor_sum[param_name]
                         )
                     # If no active neighbors, param remains unchanged (selfweight = 1, so no change)
+                
+                # ===== Aggregate diffusion model parameters =====
+                # Reuse the same degree and selfweight computed above (same topology)
+                if has_diffusion:
+                    # Apply aggregation to diffusion model parameters
+                    for param_name, param in diffusion_param_dict.items():
+                        if param_name in diffusion_neighbor_sum:
+                            param.data.copy_(
+                                selfweight * original_diffusion_params[param_name] +
+                                self.neighbor_weight * diffusion_neighbor_sum[param_name]
+                            )
     
     def averaging(self, active_flags=None):
         """
