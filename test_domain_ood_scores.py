@@ -470,29 +470,85 @@ def evaluate_domain_ood_scores(args):
         checkpoint_domain = checkpoint.get('domain', train_domain)
         print(f'Loaded checkpoint for domain: {checkpoint_domain}')
         
-        # 如果启用噪声OOD评估，先计算ID和噪声OOD分数
-        if args.use_noise_ood:
-            print(f'\n  Evaluating Noise OOD Detection for train_domain={train_domain}')
+        # =====================================================================
+        # 步骤1: 先计算所有test_domain的分数（包括train_domain）
+        # =====================================================================
+        domain_scores = {}  # 存储每个domain的分数和样本数
+        
+        for test_domain in domains:
+            print(f'\n  Test Domain: {test_domain}')
             
-            # 加载ID数据（使用train_domain的测试数据）
-            id_loader, id_num_samples = load_pacs_test_data(
+            # 判断是否为ID数据
+            is_id = (train_domain == test_domain)
+            
+            # 加载测试数据
+            test_loader, num_samples = load_pacs_test_data(
                 args.datasetRoot,
-                train_domain,
+                test_domain,
                 args.batch_size,
                 args.num_workers
             )
-            print(f'  Loaded {id_num_samples} ID samples from {train_domain}')
             
-            # 计算ID分数
-            print(f'  Computing ID scores...')
-            id_scores = compute_ood_scores(
+            print(f'  Loaded {num_samples} test samples')
+            
+            # 计算分数
+            scores = compute_ood_scores(
                 backbone,
                 diffusion_model,
-                id_loader,
+                test_loader,
                 diffusion_steps,
                 args.ood_eval_scores_type,
                 device
             )
+            
+            # 保存分数
+            domain_scores[test_domain] = {
+                'scores': scores,
+                'num_samples': num_samples,
+                'is_id': is_id
+            }
+            
+            # 计算统计量
+            mean_score = np.mean(scores)
+            std_score = np.std(scores)
+            min_score = np.min(scores)
+            max_score = np.max(scores)
+            
+            label = 'ID' if is_id else 'Neighbor'
+            print(f'  Label: {label}')
+            print(f'  Mean Score: {mean_score:.6f}, Std: {std_score:.6f}')
+            print(f'  Min Score: {min_score:.6f}, Max Score: {max_score:.6f}')
+            
+            # 保存结果（暂时不包含AUROC和FPR95，后面如果需要会更新）
+            result_dict = {
+                'train_domain': train_domain,
+                'test_domain': test_domain,
+                'scores': scores,
+                'mean_score': mean_score,
+                'std_score': std_score,
+                'min_score': min_score,
+                'max_score': max_score,
+                'num_samples': num_samples,
+                'score_type': args.ood_eval_scores_type,
+                'is_id': is_id,
+                'label': label,
+                'auroc': None,
+                'fpr95': None
+            }
+            results.append(result_dict)
+        
+        # =====================================================================
+        # 步骤2: 如果需要噪声OOD评估，计算噪声OOD分数和指标
+        # =====================================================================
+        if args.use_noise_ood:
+            print(f'\n  Evaluating Noise OOD Detection for train_domain={train_domain}')
+            
+            # 从已计算的分数中获取ID分数（train_domain的分数）
+            id_scores = domain_scores[train_domain]['scores']
+            id_num_samples = domain_scores[train_domain]['num_samples']
+            
+            print(f'  Using ID scores from {train_domain} (already computed above)')
+            print(f'    ID scores: mean={np.mean(id_scores):.4f}, std={np.std(id_scores):.4f}')
             
             # 加载噪声OOD数据
             print(f'  Loading {args.noise_samples} noise samples as OOD...')
@@ -514,8 +570,8 @@ def evaluate_domain_ood_scores(args):
                 device
             )
             
-            # 计算AUROC和FPR95
-            print(f'  Computing metrics...')
+            # 计算AUROC和FPR95（与噪声OOD分数计算放在一起）
+            print(f'  Computing AUROC and FPR95 metrics...')
             
             # 如果ID分数更高，需要反转（确保OOD分数更高）
             if np.mean(id_scores) > np.mean(noise_ood_scores):
@@ -526,14 +582,14 @@ def evaluate_domain_ood_scores(args):
                 id_scores_for_metric = id_scores
                 noise_ood_scores_for_metric = noise_ood_scores
             
-            auroc = compute_auroc(id_scores_for_metric, noise_ood_scores_for_metric)
-            fpr95 = compute_fpr_at_tpr(id_scores_for_metric, noise_ood_scores_for_metric, tpr=0.95)
+            noise_ood_auroc = compute_auroc(id_scores_for_metric, noise_ood_scores_for_metric)
+            noise_ood_fpr95 = compute_fpr_at_tpr(id_scores_for_metric, noise_ood_scores_for_metric, tpr=0.95)
             
             print(f'\n  Noise OOD Detection Results:')
             print(f'    ID scores: mean={np.mean(id_scores):.4f}, std={np.std(id_scores):.4f}')
             print(f'    Noise OOD scores: mean={np.mean(noise_ood_scores):.4f}, std={np.std(noise_ood_scores):.4f}')
-            print(f'    AUROC: {auroc:.4f}')
-            print(f'    FPR@95%TPR: {fpr95:.4f}')
+            print(f'    AUROC: {noise_ood_auroc:.4f}')
+            print(f'    FPR@95%TPR: {noise_ood_fpr95:.4f}')
             
             # 保存噪声OOD评估结果
             results.append({
@@ -548,85 +604,18 @@ def evaluate_domain_ood_scores(args):
                 'score_type': args.ood_eval_scores_type,
                 'is_id': False,
                 'label': 'Noise_OOD',
-                'auroc': auroc,
-                'fpr95': fpr95
+                'auroc': noise_ood_auroc,
+                'fpr95': noise_ood_fpr95
             })
             
-            # 也保存ID结果（用于噪声OOD评估的ID部分）
-            results.append({
-                'train_domain': train_domain,
-                'test_domain': train_domain,
-                'scores': id_scores,
-                'mean_score': np.mean(id_scores),
-                'std_score': np.std(id_scores),
-                'min_score': np.min(id_scores),
-                'max_score': np.max(id_scores),
-                'num_samples': id_num_samples,
-                'score_type': args.ood_eval_scores_type,
-                'is_id': True,
-                'label': 'ID_for_noise_ood',
-                'auroc': auroc,  # 同一个评估的AUROC
-                'fpr95': fpr95  # 同一个评估的FPR95
-            })
-        
-        # 对每个test_domain进行测试
-        for test_domain in domains:
-            print(f'\n  Test Domain: {test_domain}')
-            
-            # 加载测试数据
-            test_loader, num_samples = load_pacs_test_data(
-                args.datasetRoot,
-                test_domain,
-                args.batch_size,
-                args.num_workers
-            )
-            
-            print(f'  Loaded {num_samples} test samples')
-            
-            # 计算OOD分数
-            scores = compute_ood_scores(
-                backbone,
-                diffusion_model,
-                test_loader,
-                diffusion_steps,
-                args.ood_eval_scores_type,
-                device
-            )
-            
-            # 保存所有样本级别的分数（用于后续分析）
-            # 判断是否为ID数据
-            is_id = (train_domain == test_domain)
-            label = 'ID' if is_id else 'Neighbor'
-            
-            # 计算统计量
-            mean_score = np.mean(scores)
-            std_score = np.std(scores)
-            min_score = np.min(scores)
-            max_score = np.max(scores)
-            
-            print(f'  Label: {label}')
-            print(f'  Mean Score: {mean_score:.6f}, Std: {std_score:.6f}')
-            print(f'  Min Score: {min_score:.6f}, Max Score: {max_score:.6f}')
-            
-            # 保存结果
-            result_dict = {
-                'train_domain': train_domain,
-                'test_domain': test_domain,
-                'scores': scores,  # 保存所有样本级别的分数
-                'mean_score': mean_score,
-                'std_score': std_score,
-                'min_score': min_score,
-                'max_score': max_score,
-                'num_samples': num_samples,
-                'score_type': args.ood_eval_scores_type,
-                'is_id': is_id,
-                'label': label
-            }
-            # 如果不是噪声OOD评估，AUROC和FPR95为None
-            if not args.use_noise_ood or test_domain != 'noise':
-                result_dict['auroc'] = None
-                result_dict['fpr95'] = None
-            results.append(result_dict)
+            # 更新train_domain的结果，添加AUROC和FPR95（用于噪声OOD评估的ID部分）
+            # 找到对应的结果并更新
+            for result in results:
+                if result['train_domain'] == train_domain and result['test_domain'] == train_domain:
+                    result['label'] = 'ID_for_noise_ood'
+                    result['auroc'] = noise_ood_auroc
+                    result['fpr95'] = noise_ood_fpr95
+                    break
     
     # 保存结果到CSV（不包含scores数组，只保存统计量）
     results_for_csv = []
