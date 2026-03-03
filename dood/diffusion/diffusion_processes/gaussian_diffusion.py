@@ -231,22 +231,17 @@ class GaussianDiffusion:
             else:
                 kl = 0.
             
-            # ================= [START] 添加预测噪声余弦相似度监控 =================
-            with torch.no_grad():
-                # 计算预测噪声与真实噪声的余弦相似度
-                # 理想情况下应该接近 1.0（至少 > 0.8）
-                # 如果接近 0，说明模型只是在猜测幅度，方向错误
-                noise_pred_cosine = torch.nn.functional.cosine_similarity(noise, model_output, dim=1)  # shape: (N,)
-                noise_pred_cosine_mean = noise_pred_cosine.mean().item()
-                noise_pred_cosine_std = noise_pred_cosine.std().item()
-                
-                # 存储到类属性以便在训练循环中访问
-                if not hasattr(self, '_last_snr_info'):
-                    self._last_snr_info = {}
-                self._last_snr_info.update({
-                    'noise_pred_cosine': noise_pred_cosine_mean,
-                    'noise_pred_cosine_std': noise_pred_cosine_std,
-                })
+            # ================= [START] 添加预测噪声余弦相似度监控（已關閉） =================
+            # with torch.no_grad():
+            #     noise_pred_cosine = torch.nn.functional.cosine_similarity(noise, model_output, dim=1)
+            #     noise_pred_cosine_mean = noise_pred_cosine.mean().item()
+            #     noise_pred_cosine_std = noise_pred_cosine.std().item()
+            #     if not hasattr(self, '_last_snr_info'):
+            #         self._last_snr_info = {}
+            #     self._last_snr_info.update({
+            #         'noise_pred_cosine': noise_pred_cosine_mean,
+            #         'noise_pred_cosine_std': noise_pred_cosine_std,
+            #     })
             # ================= [END] 添加预测噪声余弦相似度监控 =================
             
             loss = ((noise - model_output)**2).mean(-1)

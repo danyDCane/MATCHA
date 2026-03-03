@@ -868,6 +868,9 @@ def test(model, test_loader):
         for batch_idx, (inputs, targets) in enumerate(test_loader):
             inputs, targets = inputs.cuda(non_blocking=True), targets.cuda(non_blocking=True)
             outputs = model(inputs)
+            # Support models that may return (logits, feature)
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
             acc1 = comp_accuracy(outputs, targets)
             top1.update(acc1[0], inputs.size(0))
             # 每個 batch 後清理臨時變量，避免記憶體累積

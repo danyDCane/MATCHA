@@ -310,13 +310,23 @@ def run(rank, size):
         # debug_style_shift = ((k % STEPS_PER_EPOCH) == 0) # Enable debug output for style shift
         debug_style_shift = getattr(args, "debug_style_shift", False)
         
-        if (use_style_stats or use_style_shift) and args.model == "res":
-            # This forward will use communicator.neighbor_style_stats (just exchanged)
-            # Style statistics are computed in the first phase, so we don't need return_blocks here
-            # Only need communicator for style shift application
-            output = model(data, return_blocks=False, communicator=communicator,
-                          debug_style_shift=debug_style_shift, iter_num=k+1, rank=rank)
+        if args.model == "res":
+            # ResNet: optionally apply style shift and also obtain the final
+            # flattened feature (after style shift) with the same format as
+            # intermediate_forward.
+            if use_style_stats or use_style_shift:
+                output, feat = model(
+                    data,
+                    communicator=communicator,
+                    debug_style_shift=debug_style_shift,
+                    iter_num=k + 1,
+                    rank=rank,
+                    return_feature=True,
+                )
+            else:
+                output, feat = model(data, return_feature=True)
         else:
+            # Other model types keep original API
             output = model(data)
         
         loss = criterion(output, target)

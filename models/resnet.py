@@ -150,35 +150,36 @@ class ResNet(nn.Module):
             "layer3": out3,
         }
         return features
-
-    def forward(self, x, return_blocks: bool = False, communicator=None, debug_style_shift=False, iter_num=-1, rank=-1):
+    
+    def forward(self, x, communicator=None, debug_style_shift=False, iter_num=-1, rank=-1, return_feature: bool = False, force_style_shift: bool = False):
         """
         Forward pass.
 
         Args:
             x: input tensor [B, 3, H, W]
-            return_blocks: if True, also return outputs of the first three
-                           convolutional blocks (layer1, layer2, layer3).
             communicator: Communicator object with neighbor_style_stats attribute
                           (used for style shift if enabled)
             debug_style_shift: If True, print debug information for style shift
             iter_num: Current iteration number (for debugging)
             rank: Current rank (for debugging)
+            return_feature: if True, also return the final flattened feature
+                            vector after style shift (if enabled), with shape
+                            [B, C].
+            force_style_shift: if True, always apply style shift (skip random check)
 
         Returns:
-            If return_blocks is False (default):
+            If return_feature is False (default):
                 logits: [B, num_classes]
-            If return_blocks is True:
+            If return_feature is True:
                 logits: [B, num_classes]
-                features: dict with keys 'layer1', 'layer2', 'layer3',
-                          each of shape [B, C, H, W].
+                feat: flattened feature vector [B, C].
         """
         out = F.relu(self.bn1(self.conv1(x)))
 
         # First three convolutional blocks with optional style shift
         out1 = self.layer1(out)
         if self.use_style_shift and communicator is not None:
-            if self.training and random.random() <= self.style_shift_prob:
+            if force_style_shift or (self.training and random.random() <= self.style_shift_prob):
                 out1 = self.style_shift1(out1, "layer1", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
@@ -190,7 +191,7 @@ class ResNet(nn.Module):
         
         out2 = self.layer2(out1)
         if self.use_style_shift and communicator is not None:
-            if self.training and random.random() <= self.style_shift_prob:
+            if force_style_shift or (self.training and random.random() <= self.style_shift_prob):
                 out2 = self.style_shift2(out2, "layer2", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
@@ -202,7 +203,7 @@ class ResNet(nn.Module):
         
         out3 = self.layer3(out2)
         if self.use_style_shift and communicator is not None:
-            if self.training and random.random() <= self.style_shift_prob:
+            if force_style_shift or (self.training and random.random() <= self.style_shift_prob):
                 out3 = self.style_shift3(out3, "layer3", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
@@ -218,20 +219,15 @@ class ResNet(nn.Module):
         feat = feat.view(feat.size(0), -1)
         logits = self.linear(feat)
 
-        if return_blocks:
-            features = {
-                "layer1": out1,
-                "layer2": out2,
-                "layer3": out3,
-            }
-            return logits, features
+        if return_feature:
+            return logits, feat
 
         return logits
 
 class StandardResNetWrapper(nn.Module):
     """
-    Wrapper for torchvision ResNet to support return_blocks functionality.
-    This allows extracting intermediate features from layer1, layer2, layer3.
+    Wrapper for torchvision ResNet with optional style shift and feature
+    extraction utilities.
     """
     def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5,
                  style_explore_alpha=3.0, style_explore_ratio=0.5, mixstyle_alpha=0.1, pretrained=False):
@@ -346,134 +342,95 @@ class StandardResNetWrapper(nn.Module):
         }
         return features
     
-    def forward(self, x, return_blocks: bool = False, communicator=None, debug_style_shift=False, iter_num=-1, rank=-1):
+    def forward(self, x, communicator=None, debug_style_shift=False, iter_num=-1, rank=-1, return_feature: bool = False, force_style_shift: bool = False):
         """
-        Forward pass with optional intermediate feature extraction.
-        
+        Forward pass with optional style shift and optional final feature output.
+
         Args:
             x: input tensor [B, 3, H, W]
-            return_blocks: if True, also return outputs of layer1, layer2, layer3
             communicator: Communicator object with neighbor_style_stats attribute
                           (used for style shift if enabled)
             debug_style_shift: If True, print debug information for style shift
             iter_num: Current iteration number (for debugging)
             rank: Current rank (for debugging)
-        
+            return_feature: if True, also return the final flattened feature
+                            vector after style shift (if enabled), with shape
+                            [B, 512] for ResNet18/34.
+            force_style_shift: if True, always apply style shift (skip random check)
+
         Returns:
-            If return_blocks is False:
+            If return_feature is False:
                 logits: [B, num_classes]
-            If return_blocks is True:
+            If return_feature is True:
                 logits: [B, num_classes]
-                features: dict with keys 'layer1', 'layer2', 'layer3'
+                feat: flattened feature vector [B, 512] (same format as
+                      intermediate_forward).
         """
         x = self.backbone.conv1(x)
         x = self.backbone.bn1(x)
         x = self.backbone.relu(x)
         x = self.backbone.maxpool(x)
         
-        # Extract intermediate features if needed
-        if return_blocks:
-            out1 = self.backbone.layer1(x)
-            if self.use_style_shift and communicator is not None:
-                if self.training and random.random() <= self.style_shift_prob:
-                    out1 = self.style_shift1(out1, "layer1", communicator, self.training, 
-                                            verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                    # StyleExplore unconditionally follows StyleShift
-                    out1 = self.style_explore1(out1, "layer1", self.training,
-                                              verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                    # MixStyle follows StyleExplore
-                    out1 = self.mixstyle1(out1, "layer1", self.training,
-                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                elif debug_style_shift:
-                    print(f"[StyleShift layer1] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
-            elif debug_style_shift:
-                print(f"[ResNet] Rank {rank} Iter {iter_num} layer1: skip (use_style_shift={self.use_style_shift}, comm={communicator is not None})")
-
-            out2 = self.backbone.layer2(out1)
-            if self.use_style_shift and communicator is not None:
-                if self.training and random.random() <= self.style_shift_prob:
-                    out2 = self.style_shift2(out2, "layer2", communicator, self.training,
-                                            verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                    # StyleExplore unconditionally follows StyleShift
-                    out2 = self.style_explore2(out2, "layer2", self.training,
-                                              verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                    # MixStyle follows StyleExplore
-                    out2 = self.mixstyle2(out2, "layer2", self.training,
-                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                elif debug_style_shift:
-                    print(f"[StyleShift layer2] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
-            elif debug_style_shift:
-                print(f"[ResNet] Rank {rank} Iter {iter_num} layer2: skip (use_style_shift={self.use_style_shift}, comm={communicator is not None})")
-
-            out3 = self.backbone.layer3(out2)
-            if self.use_style_shift and communicator is not None:
-                if self.training and random.random() <= self.style_shift_prob:
-                    out3 = self.style_shift3(out3, "layer3", communicator, self.training,
-                                            verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                    # StyleExplore unconditionally follows StyleShift
-                    out3 = self.style_explore3(out3, "layer3", self.training,
-                                              verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                    # MixStyle follows StyleExplore
-                    out3 = self.mixstyle3(out3, "layer3", self.training,
-                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-                elif debug_style_shift:
-                    print(f"[StyleShift layer3] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
-            elif debug_style_shift:
-                print(f"[ResNet] Rank {rank} Iter {iter_num} layer3: skip (use_style_shift={self.use_style_shift}, comm={communicator is not None})")
-            
-            out4 = self.backbone.layer4(out3)
-            
-            # Global average pooling
-            feat = self.backbone.avgpool(out4)
-            feat = feat.view(feat.size(0), -1)
-            logits = self.backbone.fc(feat)
-            
-            features = {
-                "layer1": out1,
-                "layer2": out2,
-                "layer3": out3,
-            }
-            return logits, features
-        else:
-            x = self.backbone.layer1(x)
-            if self.use_style_shift and communicator is not None:
+        # Main residual layers with optional style shift
+        x = self.backbone.layer1(x)
+        if self.use_style_shift and communicator is not None:
+            if force_style_shift or (self.training and random.random() <= self.style_shift_prob):
                 x = self.style_shift1(x, "layer1", communicator, self.training,
-                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
                 x = self.style_explore1(x, "layer1", self.training,
-                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # MixStyle follows StyleExplore
                 x = self.mixstyle1(x, "layer1", self.training,
-                                  verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-            
-            x = self.backbone.layer2(x)
-            if self.use_style_shift and communicator is not None:
+                                   verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+            elif debug_style_shift:
+                print(f"[StyleShift layer1] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
+        elif debug_style_shift:
+            print(f"[ResNet] Rank {rank} Iter {iter_num} layer1: skip (use_style_shift={self.use_style_shift}, comm={communicator is not None})")
+
+        x = self.backbone.layer2(x)
+        if self.use_style_shift and communicator is not None:
+            if force_style_shift or (self.training and random.random() <= self.style_shift_prob):
                 x = self.style_shift2(x, "layer2", communicator, self.training,
-                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
                 x = self.style_explore2(x, "layer2", self.training,
-                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # MixStyle follows StyleExplore
                 x = self.mixstyle2(x, "layer2", self.training,
-                                  verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-            
-            x = self.backbone.layer3(x)
-            if self.use_style_shift and communicator is not None:
+                                   verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+            elif debug_style_shift:
+                print(f"[StyleShift layer2] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
+        elif debug_style_shift:
+            print(f"[ResNet] Rank {rank} Iter {iter_num} layer2: skip (use_style_shift={self.use_style_shift}, comm={communicator is not None})")
+
+        x = self.backbone.layer3(x)
+        if self.use_style_shift and communicator is not None:
+            if force_style_shift or (self.training and random.random() <= self.style_shift_prob):
                 x = self.style_shift3(x, "layer3", communicator, self.training,
-                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
                 x = self.style_explore3(x, "layer3", self.training,
-                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # MixStyle follows StyleExplore
                 x = self.mixstyle3(x, "layer3", self.training,
-                                  verbose=debug_style_shift, iter_num=iter_num, rank=rank)
-            
-            x = self.backbone.layer4(x)
-            
-            x = self.backbone.avgpool(x)
-            x = x.view(x.size(0), -1)
-            logits = self.backbone.fc(x)
-            return logits
+                                   verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+            elif debug_style_shift:
+                print(f"[StyleShift layer3] Rank {rank}, Iter {iter_num}: Skipped at first-level check (prob={self.style_shift_prob})")
+        elif debug_style_shift:
+            print(f"[ResNet] Rank {rank} Iter {iter_num} layer3: skip (use_style_shift={self.use_style_shift}, comm={communicator is not None})")
+        
+        x = self.backbone.layer4(x)
+        
+        # Global average pooling and classifier head
+        feat = self.backbone.avgpool(x)
+        feat = feat.view(feat.size(0), -1)
+        logits = self.backbone.fc(feat)
+
+        if return_feature:
+            return logits, feat
+
+        return logits
 
 if __name__ == '__main__':
     net=ResNet(50, 10)

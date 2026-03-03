@@ -53,7 +53,7 @@ def parse_args():
     # 噪声OOD评估相关
     parser.add_argument('--use_noise_ood', action='store_true', 
                        help='Use noise as OOD dataset for evaluation')
-    parser.add_argument('--noise_samples', type=int, default=10000, 
+    parser.add_argument('--noise_samples', type=int, default=3000, 
                        help='Number of noise samples to generate for OOD evaluation')
     
     return parser.parse_args()
@@ -381,8 +381,8 @@ def evaluate_domain_ood_scores(args):
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
-    # PACS的3个domain
-    domains = ['art_painting', 'photo', 'sketch']
+    # PACS的4個 domain（含 cartoon 當作 ID-C 看分數）
+    domains = ['art_painting', 'cartoon', 'photo', 'sketch']
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
@@ -538,7 +538,21 @@ def evaluate_domain_ood_scores(args):
             results.append(result_dict)
         
         # =====================================================================
-        # 步骤2: 如果需要噪声OOD评估，计算噪声OOD分数和指标
+        # 準備每張圖分數表：每欄一個 test domain + 稍後可加 OOD，依圖片編號順序
+        # 各 domain 樣本數不同，以最大長度為準，較短欄位用 NaN 補齊
+        # =====================================================================
+        max_len = max(len(domain_scores[d]['scores']) for d in domains)
+        per_image_df = pd.DataFrame({
+            test_domain: np.concatenate([
+                domain_scores[test_domain]['scores'],
+                np.full(max_len - len(domain_scores[test_domain]['scores']), np.nan)
+            ])
+            for test_domain in domains
+        })
+        per_image_df.insert(0, 'image_idx', np.arange(max_len))
+        
+        # =====================================================================
+        # 步骤2: 如果需要噪声OOD评估，计算噪声OOD分数並加入表格
         # =====================================================================
         if args.use_noise_ood:
             print(f'\n  Evaluating Noise OOD Detection for train_domain={train_domain}')
@@ -569,6 +583,22 @@ def evaluate_domain_ood_scores(args):
                 args.ood_eval_scores_type,
                 device
             )
+            # 確保只使用請求的 noise 數量（DataLoader 可能因 batch 邊界產生不同數量）
+            noise_ood_scores = np.asarray(noise_ood_scores)[: args.noise_samples]
+            print(f'  Noise OOD scores: {len(noise_ood_scores)} (requested {args.noise_samples})')
+            # 將 OOD（noise）分數加入每張圖分數表（noise 較少時後段為 NaN；noise 較多時擴充表格）
+            new_len = max(len(per_image_df), len(noise_ood_scores))
+            if new_len > len(per_image_df):
+                extra = new_len - len(per_image_df)
+                extra_df = pd.DataFrame(
+                    {c: [np.nan] * extra for c in per_image_df.columns},
+                    index=np.arange(len(per_image_df), new_len)
+                )
+                extra_df['image_idx'] = np.arange(len(per_image_df), new_len)
+                per_image_df = pd.concat([per_image_df, extra_df], ignore_index=True)
+            noise_col = np.full(new_len, np.nan, dtype=float)
+            noise_col[: len(noise_ood_scores)] = np.asarray(noise_ood_scores)
+            per_image_df['noise_ood'] = noise_col
             
             # 计算AUROC和FPR95（与噪声OOD分数计算放在一起）
             print(f'  Computing AUROC and FPR95 metrics...')
@@ -616,6 +646,15 @@ def evaluate_domain_ood_scores(args):
                     result['auroc'] = noise_ood_auroc
                     result['fpr95'] = noise_ood_fpr95
                     break
+        
+        # 儲存此 train_domain 的每張圖分數 CSV（含各 test domain；若有跑 noise OOD 則含 noise_ood 欄）
+        per_image_path = os.path.join(
+            args.output_dir,
+            f'per_image_scores_{train_domain}_{args.ood_eval_scores_type}.csv'
+        )
+        per_image_df.to_csv(per_image_path, index=False)
+        cols_note = 'test domains + noise_ood' if args.use_noise_ood else 'test domains'
+        print(f'  Per-image scores saved: {per_image_path} (rows=image index, cols={cols_note})')
     
     # 保存结果到CSV（不包含scores数组，只保存统计量）
     results_for_csv = []

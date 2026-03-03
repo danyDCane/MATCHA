@@ -208,6 +208,17 @@ def run(num_domains):
     losses_dict = {domain: util.AverageMeter() for domain in domain_names}
     top1_dict = {domain: util.AverageMeter() for domain in domain_names}
     loss_diff_meters = {domain: util.AverageMeter() for domain in domain_names} if getattr(args, 'use_ood', False) else None
+    loss_pair_meters = {domain: util.AverageMeter() for domain in domain_names} if (getattr(args, 'use_ood', False) and getattr(args, 'use_style_shift', False)) else None
+    # Style Removal Power (指標二) + SVD Effective Rank，只在三個 domain 時計算
+    style_removal_mse_z_zs = None
+    style_removal_mse_z_zs0hat = None
+    svd_effective_rank_95 = None
+    svd_top10_energy_ratio = None
+    if num_domains == 3 and loss_pair_meters is not None:
+        style_removal_mse_z_zs = {domain: util.AverageMeter() for domain in domain_names}
+        style_removal_mse_z_zs0hat = {domain: util.AverageMeter() for domain in domain_names}
+        svd_effective_rank_95 = {domain: util.AverageMeter() for domain in domain_names}
+        svd_top10_energy_ratio = {domain: util.AverageMeter() for domain in domain_names}
     tic = time.time()
 
     # ===== start training with fixed total steps K (Algorithm 1) =====
@@ -264,6 +275,20 @@ def run(num_domains):
         use_style_stats = getattr(args, "use_style_stats", False)
         use_style_shift = getattr(args, "use_style_shift", False)
         debug_style_shift = getattr(args, "debug_style_shift", False)
+        use_ood = getattr(args, 'use_ood', False)
+        warmup_epochs = getattr(args, 'warmup_epochs', 50)
+        pair_warmup_end_epoch = getattr(args, 'pair_warmup_end_epoch', 100)
+        lambda_pair = getattr(args, 'lambda_pair', 0.2)
+        pair_t_min = getattr(args, 'pair_t_min', 200)
+        pair_t_max = getattr(args, 'pair_t_max', 400)
+        
+        # Epoch for Pair Loss schedule (1-based)
+        epoch = (k + 1) // STEPS_PER_EPOCH
+        if epoch < warmup_epochs:
+            current_lambda_pair = 0.0
+        else:
+            progress = (epoch - warmup_epochs) / max(1, pair_warmup_end_epoch - warmup_epochs)
+            current_lambda_pair = lambda_pair * min(1.0, progress)
         
         # Process each domain sequentially
         for domain in domain_names:
@@ -282,60 +307,159 @@ def run(num_domains):
                         if bn_states_dict[domain][name]['num_batches_tracked'] is not None:
                             module.num_batches_tracked.copy_(bn_states_dict[domain][name]['num_batches_tracked'])
             
-            # Get batch for this domain (reuse the same batch from style stats computation if available)
-            # For efficiency, we could reuse, but for correctness, we get a new batch
+            # Get batch for this domain
             data, target = next(train_iters[domain])
             data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
             
-            # Forward pass with style shift if enabled
-            # Note: communicator.neighbor_style_stats uses domain names as keys in single process mode
-            if (use_style_stats or use_style_shift) and args.model == "res":
-                # Style statistics are computed in the first phase, so we don't need return_blocks here
-                # Only need communicator for style shift application
-                output = model(data, return_blocks=False, communicator=communicator,
-                              debug_style_shift=debug_style_shift, iter_num=k+1, rank=domain_names.index(domain))
+            # Dual forward when use_style_shift (for Pair Loss); otherwise single forward
+            if args.model == "res" and use_style_shift:
+                # Clean forward (no style shift): communicator=None
+                out_clean, z = model(data, communicator=None, return_feature=True)
+                # Style-shifted forward (force style shift)
+                out_shift, z_s = model(
+                    data,
+                    communicator=communicator,
+                    force_style_shift=True,
+                    debug_style_shift=debug_style_shift,
+                    iter_num=k + 1,
+                    rank=domain_names.index(domain),
+                    return_feature=True,
+                )
+                loss_cls = criterion(out_clean, target) + criterion(out_shift, target)
+                output = out_clean  # for accuracy logging (use clean as primary)
+            elif args.model == "res":
+                if use_style_stats or use_style_shift:
+                    output, feat = model(
+                        data,
+                        communicator=communicator,
+                        debug_style_shift=debug_style_shift,
+                        iter_num=k + 1,
+                        rank=domain_names.index(domain),
+                        return_feature=True,
+                    )
+                else:
+                    output, feat = model(data, return_feature=True)
+                loss_cls = criterion(output, target)
+                z = feat
             else:
                 output = model(data)
+                loss_cls = criterion(output, target)
+                z = None
             
-            loss = criterion(output, target)
+            # Pair Loss (only when epoch >= warmup_epochs, use_ood, use_style_shift)
+            loss_pair = None
+            if (epoch >= warmup_epochs and use_ood and use_style_shift and 
+                domain in diffusion_models_dict and args.model == "res" and current_lambda_pair > 0):
+                diffusion_model = diffusion_models_dict[domain]
+                dp = diffusion_model.diffusion_process
+                
+                # Use eval() to avoid in-place buffer updates in FeatureNormalization
+                # (normalize() updates shift/scale in-place when training, which breaks grad for z/z_s)
+                was_diffusion_training = diffusion_model.training
+                diffusion_model.eval()
+                z_norm = diffusion_model.normalize(z)
+                z_s_norm = diffusion_model.normalize(z_s)
+                
+                # 檢測哪些樣本有被風格偏移（因 style_shift_prob/ratio 可能使部分未偏移）
+                with torch.no_grad():
+                    diff_per_sample = (z_norm - z_s_norm).pow(2).sum(dim=1)
+                    shifted_mask = diff_per_sample > 1e-8
+                    n_shifted = shifted_mask.sum().item()
+                
+                N = z.size(0)
+                t = torch.randint(pair_t_min, pair_t_max + 1, (N,), device=z.device, dtype=torch.long)
+                epsilon = torch.randn_like(z, device=z.device)
+                # 將z加噪聲得到z_t
+                z_t = dp.q_sample(z_norm, t, noise=epsilon)
+                # 將z_s加噪聲得到z_s_t
+                z_s_t = dp.q_sample(z_s_norm, t, noise=epsilon)
+                
+                with torch.no_grad():
+                    # 用denoiser預測z_t和z_s_t的x_0
+                    eps_hat = diffusion_model.denoiser(z_t, t)
+                    eps_hat_s = diffusion_model.denoiser(z_s_t, t)
+                
+                # 用denoiser預測z_t和z_s_t的噪聲後，去噪得到z_0_hat和z_s_0_hat
+                z_0_hat = dp._predict_xstart_from_eps(z_t, t=t, eps=eps_hat)
+                z_s_0_hat = dp._predict_xstart_from_eps(z_s_t, t=t, eps=eps_hat_s)
+                
+                # Pair Loss：只對有風格偏移的樣本計算，否則無意義（z≈z_s 時 loss 本就接近 0）
+                if n_shifted > 0:
+                    z_0_hat_shifted = z_0_hat[shifted_mask]
+                    z_s_0_hat_shifted = z_s_0_hat[shifted_mask]
+                    # Stop-Gradient 於 z_0_hat：z 作為固定錨點，z_s_0_hat 單向逼近
+                    loss_pair = F.mse_loss(z_s_0_hat_shifted, z_0_hat_shifted.detach())
+                    if loss_pair_meters is not None:
+                        loss_pair_meters[domain].update(loss_pair.item(), n_shifted)
+                else:
+                    loss_pair = 0.0
+                
+                # 指標二：風格濾除力 / 語義還原度 (Style Removal Power)，僅在三個 domain 時計算
+                if style_removal_mse_z_zs is not None and style_removal_mse_z_zs0hat is not None:
+                    with torch.no_grad():
+                        if n_shifted > 0:
+                            z_norm_shifted = z_norm[shifted_mask]
+                            z_s_norm_shifted = z_s_norm[shifted_mask]
+                            z_s_0_hat_shifted = z_s_0_hat[shifted_mask]
+                            mse_z_zs_val = F.mse_loss(z_norm_shifted, z_s_norm_shifted).item()
+                            mse_z_zs0hat_val = F.mse_loss(z_norm_shifted, z_s_0_hat_shifted).item()
+                            style_removal_mse_z_zs[domain].update(mse_z_zs_val, n_shifted)
+                            style_removal_mse_z_zs0hat[domain].update(mse_z_zs0hat_val, n_shifted)
+                
+                if was_diffusion_training:
+                    diffusion_model.train()
             
-            # Compute diffusion loss if OOD detection is enabled
-            if getattr(args, 'use_ood', False) and domain in diffusion_models_dict:
+            # SVD - 有效秩 (Effective Rank)：維度坍縮指標，能量集中於少數奇異值
+            # 從一開始就監測 backbone 特徵的有效維度，而非僅在 Pair Loss 啟用後
+            if svd_effective_rank_95 is not None and svd_top10_energy_ratio is not None and z is not None:
+                with torch.no_grad():
+                    z_centered = z - z.mean(dim=0, keepdim=True)
+                    S = torch.linalg.svdvals(z_centered)
+                    total = S.sum().clamp(min=1e-8)
+                    cumsum = S.cumsum(0)
+                    idx_95 = (cumsum / total >= 0.95).nonzero(as_tuple=True)[0]
+                    eff_rank_95 = (idx_95[0].item() + 1) if len(idx_95) > 0 else len(S)
+                    top10 = min(10, len(S))
+                    top10_ratio = S[:top10].sum() / total
+                    svd_effective_rank_95[domain].update(float(eff_rank_95), data.size(0))
+                    svd_top10_energy_ratio[domain].update(top10_ratio.item(), data.size(0))
+            
+            # Total loss for backbone
+            loss_total = loss_cls
+            if loss_pair is not None:
+                loss_total = loss_total + current_lambda_pair * loss_pair
+
+            # Record training loss and accuracy
+            record_start = time.time()
+            acc1 = util.comp_accuracy(output, target)
+            losses_dict[domain].update(loss_total.item(), data.size(0))
+            top1_dict[domain].update(acc1[0], data.size(0))
+            record_end = time.time()
+
+            # Backbone update (must be BEFORE Diffusion update to avoid in-place buffer overwrite)
+            # Pair Loss uses normalize(z) which references shift/scale; Diffusion update's
+            # normalize() modifies them in-place. backward() needs unmodified buffers.
+            optimizer.zero_grad()
+            loss_total.backward()
+            optimizer.step()
+
+            # Diffusion update (teacher self-learning, use clean features z)
+            # Done AFTER backbone backward so FeatureNormalization buffers are not overwritten
+            # before loss_total.backward() runs
+            if use_ood and domain in diffusion_models_dict and z is not None:
                 diffusion_model = diffusion_models_dict[domain]
                 optimizer_diffusion = optimizers_diffusion_dict[domain]
                 
-                # Extract intermediate features for diffusion model
-                latents = model.intermediate_forward(data)
-                
-                # Normalize features and compute diffusion loss
-                # Detach latents to avoid affecting backbone gradients
-                latents_for_diff = latents.detach().requires_grad_(True)
+                latents_for_diff = z.detach().requires_grad_(True)
                 latents_normalized = diffusion_model.normalize(latents_for_diff)
-                
                 loss_diff = diffusion_model.get_loss_iter(latents_normalized)
                 
-                # Backward pass for diffusion model
                 optimizer_diffusion.zero_grad()
                 loss_diff.backward()
                 optimizer_diffusion.step()
                 
-                # Record diffusion loss for averaging
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].update(loss_diff.item(), data.size(0))
-
-            # record training loss and accuracy
-            record_start = time.time()
-            acc1 = util.comp_accuracy(output, target)
-            losses_dict[domain].update(loss.item(), data.size(0))
-            top1_dict[domain].update(acc1[0], data.size(0))
-            record_end = time.time()
-
-            # backward pass for classification
-            loss.backward()
-
-            # gradient step
-            optimizer.step()
-            optimizer.zero_grad()
 
             # update cosine annealing scheduler (purely step-based)
             schedulers_dict[domain].step()
@@ -390,6 +514,27 @@ def run(num_domains):
         if (k + 1) % STEPS_PER_EPOCH == 0:
             epoch = (k + 1) // STEPS_PER_EPOCH
             toc = time.time()
+            
+            # 每輪模型交換聚合結束後存 checkpoint（若啟用）
+            if getattr(args, 'save_every_epoch', False):
+                save_dir = args.savePath if args.savePath is not None else "./checkpoints"
+                os.makedirs(save_dir, exist_ok=True)
+                for domain in domain_names:
+                    model = models_dict[domain]
+                    ckpt = {
+                        "args": args,
+                        "domain": domain,
+                        "all_domains": domain_names,
+                        "dataset": args.dataset,
+                        "leave_out": getattr(args, "leave_out", None),
+                        "epoch": epoch,
+                        "backbone_state": model.state_dict(),
+                    }
+                    if hasattr(model, "diffusion_model") and model.diffusion_model is not None:
+                        ckpt["diffusion_state"] = model.diffusion_model.state_dict()
+                    path = os.path.join(save_dir, f"{args.description}_{domain}_latest.pth")
+                    torch.save(ckpt, path)
+                print(f"[Checkpoint] Saved latest (epoch {epoch}, post-comm) to {save_dir}")
             record_time = toc - tic  # includes everything
             epoch_time = comp_time + comm_time  # only important parts
 
@@ -444,6 +589,45 @@ def run(num_domains):
                 log_dict[f"{domain}/train_acc"] = top1_dict[domain].avg.item() if hasattr(top1_dict[domain].avg, 'item') else float(top1_dict[domain].avg)
                 log_dict[f"{domain}/test_acc"] = test_accs[domain].item() if hasattr(test_accs[domain], 'item') else float(test_accs[domain])
             
+            # Add Pair Loss if Diffusion-guided Pair Loss is enabled
+            if loss_pair_meters is not None:
+                for domain in domain_names:
+                    log_dict[f"{domain}/loss_pair"] = loss_pair_meters[domain].avg.item() if hasattr(loss_pair_meters[domain].avg, 'item') else float(loss_pair_meters[domain].avg)
+                avg_pair = sum(loss_pair_meters[d].avg for d in domain_names) / len(domain_names)
+                log_dict["loss_pair"] = avg_pair.item() if hasattr(avg_pair, 'item') else float(avg_pair)
+                # Log current Pair Loss weight for monitoring warmup schedule
+                if epoch < warmup_epochs:
+                    current_lambda = 0.0
+                else:
+                    progress = (epoch - warmup_epochs) / max(1, pair_warmup_end_epoch - warmup_epochs)
+                    current_lambda = lambda_pair * min(1.0, progress)
+                log_dict["train/current_lambda_pair"] = current_lambda
+            
+            # 指標二：風格濾除力 / 語義還原度 (Style Removal Power)，僅在三個 domain 時計算
+            # 判讀：MSE(z,z_s_0_hat) < MSE(z,z_s) 代表 Diffusion 老師成功還原語義（卸妝能力）
+            if style_removal_mse_z_zs is not None and style_removal_mse_z_zs0hat is not None:
+                for domain in domain_names:
+                    mse_z_zs = style_removal_mse_z_zs[domain].avg.item() if hasattr(style_removal_mse_z_zs[domain].avg, 'item') else float(style_removal_mse_z_zs[domain].avg)
+                    mse_z_zs0hat = style_removal_mse_z_zs0hat[domain].avg.item() if hasattr(style_removal_mse_z_zs0hat[domain].avg, 'item') else float(style_removal_mse_z_zs0hat[domain].avg)
+                    log_dict[f"{domain}/style_removal/MSE_z_zs"] = mse_z_zs
+                    log_dict[f"{domain}/style_removal/MSE_z_zs0hat"] = mse_z_zs0hat
+                    log_dict[f"{domain}/style_removal/removal_power"] = mse_z_zs - mse_z_zs0hat  # >0 代表還原成功
+                avg_mse_z_zs = sum(style_removal_mse_z_zs[d].avg for d in domain_names) / len(domain_names)
+                avg_mse_z_zs0hat = sum(style_removal_mse_z_zs0hat[d].avg for d in domain_names) / len(domain_names)
+                log_dict["style_removal/MSE_z_zs"] = avg_mse_z_zs.item() if hasattr(avg_mse_z_zs, 'item') else float(avg_mse_z_zs)
+                log_dict["style_removal/MSE_z_zs0hat"] = avg_mse_z_zs0hat.item() if hasattr(avg_mse_z_zs0hat, 'item') else float(avg_mse_z_zs0hat)
+                log_dict["style_removal/removal_power"] = (avg_mse_z_zs - avg_mse_z_zs0hat).item() if hasattr(avg_mse_z_zs, 'item') else float(avg_mse_z_zs - avg_mse_z_zs0hat)
+            
+            # SVD - 有效秩 (Effective Rank)：維度坍縮，前10奇異值佔95%+代表特徵本質約10維
+            if svd_effective_rank_95 is not None and svd_top10_energy_ratio is not None:
+                for domain in domain_names:
+                    log_dict[f"{domain}/svd/effective_rank_95"] = svd_effective_rank_95[domain].avg.item() if hasattr(svd_effective_rank_95[domain].avg, 'item') else float(svd_effective_rank_95[domain].avg)
+                    log_dict[f"{domain}/svd/top10_energy_ratio"] = svd_top10_energy_ratio[domain].avg.item() if hasattr(svd_top10_energy_ratio[domain].avg, 'item') else float(svd_top10_energy_ratio[domain].avg)
+                avg_eff_rank = sum(svd_effective_rank_95[d].avg for d in domain_names) / len(domain_names)
+                avg_top10_ratio = sum(svd_top10_energy_ratio[d].avg for d in domain_names) / len(domain_names)
+                log_dict["svd/effective_rank_95"] = avg_eff_rank.item() if hasattr(avg_eff_rank, 'item') else float(avg_eff_rank)
+                log_dict["svd/top10_energy_ratio"] = avg_top10_ratio.item() if hasattr(avg_top10_ratio, 'item') else float(avg_top10_ratio)
+            
             # Add diffusion loss if OOD detection is enabled
             if getattr(args, 'use_ood', False) and loss_diff_meters is not None:
                 # ===== 为每个domain记录各自的diffusion监控指标 =====
@@ -455,13 +639,13 @@ def run(num_domains):
                         # 为每个domain记录diffusion loss
                         log_dict[f"{domain}/diffusion_loss"] = loss_diff_meters[domain].avg.item() if hasattr(loss_diff_meters[domain].avg, 'item') else float(loss_diff_meters[domain].avg)
                         
-                        # 预测噪声余弦相似度指标（每个domain独立）
-                        if hasattr(diffusion_model.diffusion_process, '_last_snr_info'):
-                            monitor_info = diffusion_model.diffusion_process._last_snr_info
-                            if 'noise_pred_cosine' in monitor_info:
-                                log_dict[f"{domain}/noise_pred_cosine/mean"] = monitor_info['noise_pred_cosine']
-                                if 'noise_pred_cosine_std' in monitor_info:
-                                    log_dict[f"{domain}/noise_pred_cosine/std"] = monitor_info['noise_pred_cosine_std']
+                        # 预测噪声余弦相似度指标（每个domain独立）- 已關閉以減少雜亂
+                        # if hasattr(diffusion_model.diffusion_process, '_last_snr_info'):
+                        #     monitor_info = diffusion_model.diffusion_process._last_snr_info
+                        #     if 'noise_pred_cosine' in monitor_info:
+                        #         log_dict[f"{domain}/noise_pred_cosine/mean"] = monitor_info['noise_pred_cosine']
+                        #         if 'noise_pred_cosine_std' in monitor_info:
+                        #             log_dict[f"{domain}/noise_pred_cosine/std"] = monitor_info['noise_pred_cosine_std']
                         
                         # ID vs Pseudo-OOD Score Gap（使用固定时间步 t=15）
                         try:
@@ -518,6 +702,14 @@ def run(num_domains):
                 top1_dict[domain].reset()
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].reset()
+                if loss_pair_meters is not None:
+                    loss_pair_meters[domain].reset()
+                if style_removal_mse_z_zs is not None and style_removal_mse_z_zs0hat is not None:
+                    style_removal_mse_z_zs[domain].reset()
+                    style_removal_mse_z_zs0hat[domain].reset()
+                if svd_effective_rank_95 is not None and svd_top10_energy_ratio is not None:
+                    svd_effective_rank_95[domain].reset()
+                    svd_top10_energy_ratio[domain].reset()
             tic = time.time()
 
     # ===== Save final models (backbone + diffusion + normalization stats) =====
@@ -581,6 +773,8 @@ if __name__ == "__main__":
     parser.add_argument('--leave_out', type=str, default=None, help='leave out domain for PACS dataset (art_painting, cartoon, photo, sketch)')
     parser.add_argument('--p', '-p', action='store_true', help='partition the dataset or not')
     parser.add_argument('--savePath' ,type=str, help='save path')
+    parser.add_argument('--save_every_epoch', action='store_true',
+                        help='save checkpoint every epoch after model exchange (default: only save at end)')
     
     parser.add_argument('--compress', action='store_true', help='use chocoSGD or not')    
     parser.add_argument('--consensus_lr', default=0.1, type=float, help='consensus_lr')
@@ -619,6 +813,18 @@ if __name__ == "__main__":
                         help='Learning rate for diffusion model (default: 5e-5)')
     parser.add_argument('--lambda_diff', type=float, default=1.0,
                         help='Weight for diffusion loss (default: 1.0)')
+
+    # Pair Loss (Diffusion-guided) options
+    parser.add_argument('--lambda_pair', type=float, default=0.2,
+                        help='Final target weight for Pair Loss (default: 0.2)')
+    parser.add_argument('--warmup_epochs', type=int, default=50,
+                        help='Epoch when Pair Loss starts (default: 50)')
+    parser.add_argument('--pair_warmup_end_epoch', type=int, default=100,
+                        help='Epoch when Pair Loss weight reaches lambda_pair (linear warmup, default: 100)')
+    parser.add_argument('--pair_t_min', type=int, default=15,
+                        help='Min timestep for Pair Loss sampling (default: 15)')
+    parser.add_argument('--pair_t_max', type=int, default=100,
+                        help='Max timestep for Pair Loss sampling (default: 100)')
 
     args = parser.parse_args()
 
