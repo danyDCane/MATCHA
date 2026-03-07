@@ -50,7 +50,6 @@ def run(num_domains):
         config={
             "num_domains": num_domains,
             "model": args.model,
-            "lr": args.lr,
             "epoch": args.epoch,
             "batch_size": args.bs,
             "budget": args.budget,
@@ -543,10 +542,76 @@ def run(num_domains):
             
             # evaluate test accuracy for each domain
             test_accs = {}
+            # 特徵類別分離度：紀錄每個 domain 在驗證集上的類內/類間距離
+            class_sep_intra = {}
+            class_sep_inter = {}
+            class_sep_ratio = {}
             for domain in domain_names:
                 _, test_loader = domain_loaders[domain]
-                test_acc = util.test(models_dict[domain], test_loader)
+                model_eval = models_dict[domain]
+                test_acc = util.test(model_eval, test_loader)
                 test_accs[domain] = test_acc
+                
+                # 只有支援 intermediate_forward 的模型才計算特徵類別分離度
+                if hasattr(model_eval, "intermediate_forward"):
+                    # 第一步：掃過整個 test_loader，估計每個類別的 centroid
+                    centroids = {}
+                    counts = {}
+                    with torch.no_grad():
+                        for data_val, target_val in test_loader:
+                            data_val = data_val.cuda(non_blocking=True)
+                            target_val = target_val.cuda(non_blocking=True)
+                            feats = model_eval.intermediate_forward(data_val).detach()
+                            feats = feats.view(feats.size(0), -1)
+                            for cls in target_val.unique():
+                                cls_int = int(cls.item())
+                                mask = (target_val == cls)
+                                z_cls = feats[mask]
+                                if z_cls.numel() == 0:
+                                    continue
+                                if cls_int not in centroids:
+                                    centroids[cls_int] = z_cls.sum(dim=0)
+                                    counts[cls_int] = z_cls.size(0)
+                                else:
+                                    centroids[cls_int] += z_cls.sum(dim=0)
+                                    counts[cls_int] += z_cls.size(0)
+                    if len(centroids) >= 2:
+                        for c in centroids:
+                            centroids[c] = centroids[c] / max(1, counts[c])
+                        
+                        # 第二步：重新掃一遍 test_loader，計算類內平均距離 D_intra
+                        intra_sum = 0.0
+                        total_samples = 0
+                        with torch.no_grad():
+                            for data_val, target_val in test_loader:
+                                data_val = data_val.cuda(non_blocking=True)
+                                target_val = target_val.cuda(non_blocking=True)
+                                feats = model_eval.intermediate_forward(data_val).detach()
+                                feats = feats.view(feats.size(0), -1)
+                                for c, mu_c in centroids.items():
+                                    mask = (target_val == c)
+                                    if mask.any():
+                                        z_c = feats[mask]
+                                        diff = z_c - mu_c.unsqueeze(0)
+                                        intra_sum += diff.norm(p=2, dim=1).sum().item()
+                                        total_samples += z_c.size(0)
+                        D_intra = intra_sum / max(1, total_samples)
+                        
+                        # 第三步：計算類間中心點平均距離 D_inter
+                        keys = sorted(centroids.keys())
+                        inter_sum = 0.0
+                        num_pairs = 0
+                        for i in range(len(keys)):
+                            for j in range(i + 1, len(keys)):
+                                ci, cj = keys[i], keys[j]
+                                inter_sum += (centroids[ci] - centroids[cj]).norm(p=2).item()
+                                num_pairs += 1
+                        D_inter = inter_sum / max(1, num_pairs)
+                        ratio = D_intra / (D_inter + 1e-8)
+                        
+                        class_sep_intra[domain] = D_intra
+                        class_sep_inter[domain] = D_inter
+                        class_sep_ratio[domain] = ratio
             
             # 測試後再次清理緩存，確保記憶體被釋放
             torch.cuda.empty_cache()
@@ -577,7 +642,6 @@ def run(num_domains):
                 "loss": avg_train_loss.item() if hasattr(avg_train_loss, 'item') else float(avg_train_loss),
                 "train_acc": avg_train_acc.item() if hasattr(avg_train_acc, 'item') else float(avg_train_acc),
                 "test_acc": avg_test_acc.item() if hasattr(avg_test_acc, 'item') else float(avg_test_acc),
-                "lr": optimizers_dict[domain_names[0]].param_groups[0]['lr'],
                 "comp_time": comp_time,
                 "comm_time": comm_time,
                 "epoch_time": epoch_time,
@@ -588,6 +652,11 @@ def run(num_domains):
                 log_dict[f"{domain}/loss"] = losses_dict[domain].avg.item() if hasattr(losses_dict[domain].avg, 'item') else float(losses_dict[domain].avg)
                 log_dict[f"{domain}/train_acc"] = top1_dict[domain].avg.item() if hasattr(top1_dict[domain].avg, 'item') else float(top1_dict[domain].avg)
                 log_dict[f"{domain}/test_acc"] = test_accs[domain].item() if hasattr(test_accs[domain], 'item') else float(test_accs[domain])
+                # 特徵類別分離度：類內/類間距離比，越小代表類別越分得開
+                if domain in class_sep_ratio:
+                    log_dict[f"{domain}/class_sep/D_intra"] = float(class_sep_intra[domain])
+                    log_dict[f"{domain}/class_sep/D_inter"] = float(class_sep_inter[domain])
+                    log_dict[f"{domain}/class_sep/ratio_intra_over_inter"] = float(class_sep_ratio[domain])
             
             # Add Pair Loss if Diffusion-guided Pair Loss is enabled
             if loss_pair_meters is not None:
@@ -595,13 +664,6 @@ def run(num_domains):
                     log_dict[f"{domain}/loss_pair"] = loss_pair_meters[domain].avg.item() if hasattr(loss_pair_meters[domain].avg, 'item') else float(loss_pair_meters[domain].avg)
                 avg_pair = sum(loss_pair_meters[d].avg for d in domain_names) / len(domain_names)
                 log_dict["loss_pair"] = avg_pair.item() if hasattr(avg_pair, 'item') else float(avg_pair)
-                # Log current Pair Loss weight for monitoring warmup schedule
-                if epoch < warmup_epochs:
-                    current_lambda = 0.0
-                else:
-                    progress = (epoch - warmup_epochs) / max(1, pair_warmup_end_epoch - warmup_epochs)
-                    current_lambda = lambda_pair * min(1.0, progress)
-                log_dict["train/current_lambda_pair"] = current_lambda
             
             # 指標二：風格濾除力 / 語義還原度 (Style Removal Power)，僅在三個 domain 時計算
             # 判讀：MSE(z,z_s_0_hat) < MSE(z,z_s) 代表 Diffusion 老師成功還原語義（卸妝能力）
