@@ -208,6 +208,7 @@ def run(num_domains):
     top1_dict = {domain: util.AverageMeter() for domain in domain_names}
     loss_diff_meters = {domain: util.AverageMeter() for domain in domain_names} if getattr(args, 'use_ood', False) else None
     loss_pair_meters = {domain: util.AverageMeter() for domain in domain_names} if (getattr(args, 'use_ood', False) and getattr(args, 'use_style_shift', False)) else None
+    loss_supcon_meters = {domain: util.AverageMeter() for domain in domain_names} if (getattr(args, 'use_style_shift', False) and getattr(args, 'use_supcon', False)) else None
     # Style Removal Power (指標二) + SVD Effective Rank，只在三個 domain 時計算
     style_removal_mse_z_zs = None
     style_removal_mse_z_zs0hat = None
@@ -278,6 +279,8 @@ def run(num_domains):
         warmup_epochs = getattr(args, 'warmup_epochs', 50)
         pair_warmup_end_epoch = getattr(args, 'pair_warmup_end_epoch', 100)
         lambda_pair = getattr(args, 'lambda_pair', 0.2)
+        lambda_supcon = getattr(args, 'lambda_supcon', 0.1)
+        supcon_temperature = getattr(args, 'supcon_temperature', 0.1)
         pair_t_min = getattr(args, 'pair_t_min', 200)
         pair_t_max = getattr(args, 'pair_t_max', 400)
         
@@ -311,6 +314,7 @@ def run(num_domains):
             data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
             
             # Dual forward when use_style_shift (for Pair Loss); otherwise single forward
+            z_s = None
             if args.model == "res" and use_style_shift:
                 # Clean forward (no style shift): communicator=None
                 out_clean, z = model(data, communicator=None, return_feature=True)
@@ -407,6 +411,21 @@ def run(num_domains):
                 
                 if was_diffusion_training:
                     diffusion_model.train()
+
+            # Supervised Contrastive Loss: 需手動開 --use_supcon，且 use_style_shift、有 z/z_s、且至少一筆有風格偏移
+            loss_supcon = None
+            use_supcon = getattr(args, 'use_supcon', False)
+            if use_supcon and use_style_shift and z is not None and z_s is not None:
+                with torch.no_grad():
+                    diff_per_sample = (z - z_s).pow(2).sum(dim=1)
+                    supcon_shifted_mask = diff_per_sample > 1e-8
+                    n_supcon_shifted = supcon_shifted_mask.sum().item()
+                if n_supcon_shifted > 0:
+                    features_combined = torch.cat([z, z_s], dim=0)
+                    targets_combined = torch.cat([target, target], dim=0)
+                    loss_supcon = util.supervised_contrastive_loss(features_combined, targets_combined, temperature=supcon_temperature)
+                    if loss_supcon_meters is not None:
+                        loss_supcon_meters[domain].update(loss_supcon.item(), data.size(0))
             
             # SVD - 有效秩 (Effective Rank)：維度坍縮指標，能量集中於少數奇異值
             # 從一開始就監測 backbone 特徵的有效維度，而非僅在 Pair Loss 啟用後
@@ -427,6 +446,8 @@ def run(num_domains):
             loss_total = loss_cls
             if loss_pair is not None:
                 loss_total = loss_total + current_lambda_pair * loss_pair
+            if loss_supcon is not None:
+                loss_total = loss_total + lambda_supcon * loss_supcon
 
             # Record training loss and accuracy
             record_start = time.time()
@@ -540,81 +561,93 @@ def run(num_domains):
             # 在測試前清理 GPU 緩存，釋放未使用的記憶體
             torch.cuda.empty_cache()
             
-            # evaluate test accuracy for each domain
+            # evaluate test accuracy and class separation (test + train) per domain
             test_accs = {}
-            # 特徵類別分離度：紀錄每個 domain 在驗證集上的類內/類間距離
             class_sep_intra = {}
             class_sep_inter = {}
-            class_sep_ratio = {}
+            class_sep_intra_train = {}
+            class_sep_inter_train = {}
+            tsne_features_by_domain = {}
+            tsne_train_features_by_domain = {}
             for domain in domain_names:
-                _, test_loader = domain_loaders[domain]
+                train_loader, test_loader = domain_loaders[domain]
                 model_eval = models_dict[domain]
                 test_acc = util.test(model_eval, test_loader)
                 test_accs[domain] = test_acc
-                
-                # 只有支援 intermediate_forward 的模型才計算特徵類別分離度
-                if hasattr(model_eval, "intermediate_forward"):
-                    # 第一步：掃過整個 test_loader，估計每個類別的 centroid
-                    centroids = {}
-                    counts = {}
-                    with torch.no_grad():
-                        for data_val, target_val in test_loader:
-                            data_val = data_val.cuda(non_blocking=True)
-                            target_val = target_val.cuda(non_blocking=True)
-                            feats = model_eval.intermediate_forward(data_val).detach()
-                            feats = feats.view(feats.size(0), -1)
-                            for cls in target_val.unique():
-                                cls_int = int(cls.item())
-                                mask = (target_val == cls)
-                                z_cls = feats[mask]
-                                if z_cls.numel() == 0:
-                                    continue
-                                if cls_int not in centroids:
-                                    centroids[cls_int] = z_cls.sum(dim=0)
-                                    counts[cls_int] = z_cls.size(0)
-                                else:
-                                    centroids[cls_int] += z_cls.sum(dim=0)
-                                    counts[cls_int] += z_cls.size(0)
-                    if len(centroids) >= 2:
-                        for c in centroids:
-                            centroids[c] = centroids[c] / max(1, counts[c])
-                        
-                        # 第二步：重新掃一遍 test_loader，計算類內平均距離 D_intra
-                        intra_sum = 0.0
-                        total_samples = 0
-                        with torch.no_grad():
-                            for data_val, target_val in test_loader:
-                                data_val = data_val.cuda(non_blocking=True)
-                                target_val = target_val.cuda(non_blocking=True)
-                                feats = model_eval.intermediate_forward(data_val).detach()
-                                feats = feats.view(feats.size(0), -1)
-                                for c, mu_c in centroids.items():
-                                    mask = (target_val == c)
-                                    if mask.any():
-                                        z_c = feats[mask]
-                                        diff = z_c - mu_c.unsqueeze(0)
-                                        intra_sum += diff.norm(p=2, dim=1).sum().item()
-                                        total_samples += z_c.size(0)
-                        D_intra = intra_sum / max(1, total_samples)
-                        
-                        # 第三步：計算類間中心點平均距離 D_inter
-                        keys = sorted(centroids.keys())
-                        inter_sum = 0.0
-                        num_pairs = 0
-                        for i in range(len(keys)):
-                            for j in range(i + 1, len(keys)):
-                                ci, cj = keys[i], keys[j]
-                                inter_sum += (centroids[ci] - centroids[cj]).norm(p=2).item()
-                                num_pairs += 1
-                        D_inter = inter_sum / max(1, num_pairs)
-                        ratio = D_intra / (D_inter + 1e-8)
-                        
-                        class_sep_intra[domain] = D_intra
-                        class_sep_inter[domain] = D_inter
-                        class_sep_ratio[domain] = ratio
-            
-            # 測試後再次清理緩存，確保記憶體被釋放
+
+                if not hasattr(model_eval, "intermediate_forward"):
+                    continue
+
+                # Test: 一次掃取得 centroid + 特徵（供 t-SNE），再一次掃算 D_intra；D_inter 由 centroid 算
+                centroids, features_np, labels_np = util.get_centroids_and_features(model_eval, test_loader)
+                tsne_features_by_domain[domain] = (features_np, labels_np)
+                if centroids is not None:
+                    class_sep_intra[domain] = util.compute_intra_distance(model_eval, test_loader, centroids)
+                    class_sep_inter[domain] = util.compute_inter_distance(centroids)
+
+                # Train: 同上，並存下 train 特徵供疊加 t-SNE 重用（不再多掃 train）
+                centroids_tr, feat_train_np, lab_train_np = util.get_centroids_and_features(model_eval, train_loader)
+                tsne_train_features_by_domain[domain] = (feat_train_np, lab_train_np)
+                if centroids_tr is not None:
+                    class_sep_intra_train[domain] = util.compute_intra_distance(model_eval, train_loader, centroids_tr)
+                    class_sep_inter_train[domain] = util.compute_inter_distance(centroids_tr)
+
             torch.cuda.empty_cache()
+
+            # t-SNE：使用上面已收集的 tsne_features_by_domain，不再多掃 test_loader
+            tsne_every_epoch = getattr(args, 'tsne_every_epoch', 0)
+            tsne_overlay_every_epoch = getattr(args, 'tsne_overlay_every_epoch', 50)
+            if getattr(util, '_TSNE_AVAILABLE', False):
+                save_dir = args.savePath if args.savePath is not None else "./checkpoints"
+                tsne_dir = os.path.join(save_dir, "tsne")
+                tsne_n_samples = getattr(args, 'tsne_n_samples', 500)
+                # (1) 僅測試集的 t-SNE（原有）：依 tsne_every_epoch
+                if tsne_every_epoch > 0 and epoch % tsne_every_epoch == 0:
+                    for domain in domain_names:
+                        if domain not in tsne_features_by_domain:
+                            continue
+                        features_np, labels_np = tsne_features_by_domain[domain]
+                        save_path = os.path.join(tsne_dir, f"{args.description}_{domain}_epoch{epoch}.png")
+                        util.draw_tsne_feature_distribution(
+                            features_np, labels_np, save_path,
+                            title=f"{domain} epoch {epoch}",
+                            random_state=args.randomSeed,
+                        )
+                    print(f"[t-SNE] Saved feature distribution plots to {tsne_dir}")
+                # (2) 疊加圖：每 tsne_overlay_every_epoch（預設 50）畫一次
+                # 測試集雖是同一份（leave_out，如 cartoon），但特徵必須用「各自 domain 的模型」抽取，不可跨模型通用。
+                # 算 centroid 時已存：tsne_train_features_by_domain[d]=d 模型看 d 訓練；tsne_features_by_domain[d]=d 模型看 leave_out 測試。
+                if tsne_overlay_every_epoch > 0 and epoch % tsne_overlay_every_epoch == 0:
+                    leave_out = getattr(args, 'leave_out', None)  # 測試集 domain 名稱（如 cartoon）
+                    for source_domain in domain_names:
+                        if source_domain not in tsne_train_features_by_domain or source_domain not in tsne_features_by_domain:
+                            continue
+                        # 只用「該 domain 模型」的特徵：train 與 test 皆來自 source_domain 的模型，不混用他域模型
+                        feat_train_full, lab_train_full = tsne_train_features_by_domain[source_domain]
+                        feat_test_full, lab_test_full = tsne_features_by_domain[source_domain]
+                        feat_train, lab_train = util.subsample_stratified(
+                            feat_train_full, lab_train_full,
+                            tsne_n_samples, num_classes, random_state=args.randomSeed,
+                        )
+                        feat_test, lab_test = util.subsample_stratified(
+                            feat_test_full, lab_test_full,
+                            tsne_n_samples, num_classes, random_state=args.randomSeed,
+                        )
+                        if len(lab_train) == 0 or len(lab_test) == 0:
+                            continue
+                        test_domain_name = leave_out if leave_out else "test"
+                        overlay_path = os.path.join(tsne_dir, f"{args.description}_overlay_{source_domain}_train_vs_{test_domain_name}_test_epoch{epoch}.png")
+                        util.draw_tsne_train_test_overlay(
+                            feat_train, lab_train, feat_test, lab_test,
+                            overlay_path,
+                            title=f"Train ({source_domain}) vs Test ({test_domain_name}) epoch {epoch}",
+                            source_domain_name=source_domain,
+                            target_domain_name=test_domain_name,
+                            random_state=args.randomSeed,
+                        )
+                    print(f"[t-SNE] Saved overlay plots (every {tsne_overlay_every_epoch} epochs, stratified by class) to {tsne_dir}")
+            elif tsne_every_epoch > 0 and epoch % tsne_every_epoch == 0:
+                print("[t-SNE] Skipped (install matplotlib and scikit-learn to enable)")
 
             # Log results for each domain
             # Convert test_accs to float values before averaging
@@ -652,11 +685,13 @@ def run(num_domains):
                 log_dict[f"{domain}/loss"] = losses_dict[domain].avg.item() if hasattr(losses_dict[domain].avg, 'item') else float(losses_dict[domain].avg)
                 log_dict[f"{domain}/train_acc"] = top1_dict[domain].avg.item() if hasattr(top1_dict[domain].avg, 'item') else float(top1_dict[domain].avg)
                 log_dict[f"{domain}/test_acc"] = test_accs[domain].item() if hasattr(test_accs[domain], 'item') else float(test_accs[domain])
-                # 特徵類別分離度：類內/類間距離比，越小代表類別越分得開
-                if domain in class_sep_ratio:
+                # 特徵類別分離度：test / train 的類內、類間距離
+                if domain in class_sep_intra:
                     log_dict[f"{domain}/class_sep/D_intra"] = float(class_sep_intra[domain])
                     log_dict[f"{domain}/class_sep/D_inter"] = float(class_sep_inter[domain])
-                    log_dict[f"{domain}/class_sep/ratio_intra_over_inter"] = float(class_sep_ratio[domain])
+                if domain in class_sep_intra_train:
+                    log_dict[f"{domain}/class_sep/D_intra_train"] = float(class_sep_intra_train[domain])
+                    log_dict[f"{domain}/class_sep/D_inter_train"] = float(class_sep_inter_train[domain])
             
             # Add Pair Loss if Diffusion-guided Pair Loss is enabled
             if loss_pair_meters is not None:
@@ -664,6 +699,13 @@ def run(num_domains):
                     log_dict[f"{domain}/loss_pair"] = loss_pair_meters[domain].avg.item() if hasattr(loss_pair_meters[domain].avg, 'item') else float(loss_pair_meters[domain].avg)
                 avg_pair = sum(loss_pair_meters[d].avg for d in domain_names) / len(domain_names)
                 log_dict["loss_pair"] = avg_pair.item() if hasattr(avg_pair, 'item') else float(avg_pair)
+
+            # SupCon (Supervised Contrastive Loss) when use_style_shift
+            if loss_supcon_meters is not None:
+                for domain in domain_names:
+                    log_dict[f"{domain}/loss_supcon"] = loss_supcon_meters[domain].avg.item() if hasattr(loss_supcon_meters[domain].avg, 'item') else float(loss_supcon_meters[domain].avg)
+                avg_supcon = sum(loss_supcon_meters[d].avg for d in domain_names) / len(domain_names)
+                log_dict["loss_supcon"] = avg_supcon.item() if hasattr(avg_supcon, 'item') else float(avg_supcon)
             
             # 指標二：風格濾除力 / 語義還原度 (Style Removal Power)，僅在三個 domain 時計算
             # 判讀：MSE(z,z_s_0_hat) < MSE(z,z_s) 代表 Diffusion 老師成功還原語義（卸妝能力）
@@ -766,6 +808,8 @@ def run(num_domains):
                     loss_diff_meters[domain].reset()
                 if loss_pair_meters is not None:
                     loss_pair_meters[domain].reset()
+                if loss_supcon_meters is not None:
+                    loss_supcon_meters[domain].reset()
                 if style_removal_mse_z_zs is not None and style_removal_mse_z_zs0hat is not None:
                     style_removal_mse_z_zs[domain].reset()
                     style_removal_mse_z_zs0hat[domain].reset()
@@ -864,6 +908,14 @@ if __name__ == "__main__":
     parser.add_argument('--pretrained', action='store_true',
                         help='use pretrained ImageNet weights for ResNet (default: False). Only works with resnet_type=standard')
 
+    # ===== Cosine classifier head options =====
+    parser.add_argument('--use_cosine_classifier', action='store_true',
+                        help='use cosine classifier head (L2-normalized features and weights with scale s) instead of linear fc')
+    parser.add_argument('--cosine_scale', type=float, default=30.0,
+                        help='scale s for cosine classifier (default: 30.0)')
+    parser.add_argument('--cosine_learn_scale', action='store_true',
+                        help='make cosine classifier scale s a learnable parameter instead of fixed constant')
+
     # ===== OOD Detection (Diffusion) options =====
     parser.add_argument('--use_ood', action='store_true',
                         help='enable OOD detection with diffusion model')
@@ -887,6 +939,22 @@ if __name__ == "__main__":
                         help='Min timestep for Pair Loss sampling (default: 15)')
     parser.add_argument('--pair_t_max', type=int, default=100,
                         help='Max timestep for Pair Loss sampling (default: 100)')
+
+    # SupCon (Supervised Contrastive Loss) for representation alignment
+    parser.add_argument('--use_supcon', action='store_true',
+                        help='enable Supervised Contrastive Loss (requires --use_style_shift)')
+    parser.add_argument('--lambda_supcon', type=float, default=0.1,
+                        help='Weight for Supervised Contrastive Loss (default: 0.1)')
+    parser.add_argument('--supcon_temperature', type=float, default=0.1,
+                        help='Temperature tau for SupCon (default: 0.1)')
+
+    # t-SNE feature distribution visualization
+    parser.add_argument('--tsne_every_epoch', type=int, default=0,
+                        help='Draw t-SNE feature plot every N epochs (0=disabled, default: 0)')
+    parser.add_argument('--tsne_n_samples', type=int, default=500,
+                        help='Max samples per domain for t-SNE overlay (train vs test, default: 500)')
+    parser.add_argument('--tsne_overlay_every_epoch', type=int, default=50,
+                        help='Draw t-SNE overlay (train+test) every N epochs (default: 50)')
 
     args = parser.parse_args()
 

@@ -1,12 +1,47 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.init as init # 補上這行避免 conv_init 報錯
+import torch.nn.init as init  # 補上這行避免 conv_init 報錯
 from torch.autograd import Variable
 import sys
 import numpy as np
 from style_transforms import StyleShift, StyleExplore, MixStyle
 import random
+
+
+class CosineClassifier(nn.Module):
+    """
+    Cosine classifier head:
+    - Learnable weight matrix W in R^{num_classes x in_features}
+    - Both features and weights are L2-normalized
+    - Logits = s * cos(theta), where each row of W acts as a class prototype on the hypersphere.
+    """
+
+    def __init__(self, in_features: int, num_classes: int, scale: float = 30.0, learn_scale: bool = False):
+        super(CosineClassifier, self).__init__()
+        self.in_features = in_features
+        self.num_classes = num_classes
+
+        self.weight = nn.Parameter(torch.Tensor(num_classes, in_features))
+
+        if learn_scale:
+            self.s = nn.Parameter(torch.tensor(scale, dtype=torch.float))
+        else:
+            # buffer 確保與模型一起移動到正確裝置與儲存到 state_dict
+            self.register_buffer("s", torch.tensor(scale, dtype=torch.float))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, in_features]
+        x_norm = F.normalize(x, p=2, dim=1)
+        w_norm = F.normalize(self.weight, p=2, dim=1)
+        cosine = F.linear(x_norm, w_norm)  # [B, num_classes]
+        return self.s * cosine
+
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=True)
 
@@ -83,8 +118,20 @@ class Bottleneck(nn.Module):
         return out
 
 class ResNet(nn.Module):
-    def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5, 
-                 style_explore_alpha=3.0, style_explore_ratio=0.5, mixstyle_alpha=0.1):
+    def __init__(
+        self,
+        depth,
+        num_classes,
+        use_style_shift=False,
+        style_shift_prob=0.5,
+        style_shift_ratio=0.5,
+        style_explore_alpha=3.0,
+        style_explore_ratio=0.5,
+        mixstyle_alpha=0.1,
+        use_cosine_classifier: bool = False,
+        cosine_scale: float = 30.0,
+        cosine_learn_scale: bool = False,
+    ):
         super(ResNet, self).__init__()
         self.in_planes = 16
         self.style_shift_prob = style_shift_prob  # 保存为实例属性
@@ -94,6 +141,11 @@ class ResNet(nn.Module):
         self.style_explore_ratio = style_explore_ratio
         self.mixstyle_alpha = mixstyle_alpha
 
+        # Cosine classifier 相關設定
+        self.use_cosine_classifier = use_cosine_classifier
+        self.cosine_scale = cosine_scale
+        self.cosine_learn_scale = cosine_learn_scale
+
         block, num_blocks = cfg(depth)
 
         self.conv1 = conv3x3(3,16)
@@ -101,7 +153,17 @@ class ResNet(nn.Module):
         self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
         self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
-        self.linear = nn.Linear(64*block.expansion, num_classes)
+
+        feat_dim = 64 * block.expansion
+        if self.use_cosine_classifier:
+            self.linear = CosineClassifier(
+                feat_dim,
+                num_classes,
+                scale=self.cosine_scale,
+                learn_scale=self.cosine_learn_scale,
+            )
+        else:
+            self.linear = nn.Linear(feat_dim, num_classes)
         
         # Initialize StyleShift, StyleExplore, and MixStyle modules for each layer
         if self.use_style_shift:
@@ -229,8 +291,22 @@ class StandardResNetWrapper(nn.Module):
     Wrapper for torchvision ResNet with optional style shift and feature
     extraction utilities.
     """
-    def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5,
-                 style_explore_alpha=3.0, style_explore_ratio=0.5, mixstyle_alpha=0.1, pretrained=False):
+
+    def __init__(
+        self,
+        depth,
+        num_classes,
+        use_style_shift: bool = False,
+        style_shift_prob: float = 0.5,
+        style_shift_ratio: float = 0.5,
+        style_explore_alpha: float = 3.0,
+        style_explore_ratio: float = 0.5,
+        mixstyle_alpha: float = 0.1,
+        pretrained: bool = False,
+        use_cosine_classifier: bool = False,
+        cosine_scale: float = 30.0,
+        cosine_learn_scale: bool = False,
+    ):
         super(StandardResNetWrapper, self).__init__()
         from torchvision.models import resnet18, resnet34, resnet50, resnet101, resnet152
         self.style_shift_prob = style_shift_prob  # 保存为实例属性
@@ -239,6 +315,9 @@ class StandardResNetWrapper(nn.Module):
         self.style_explore_alpha = style_explore_alpha
         self.style_explore_ratio = style_explore_ratio
         self.mixstyle_alpha = mixstyle_alpha
+        self.use_cosine_classifier = use_cosine_classifier
+        self.cosine_scale = cosine_scale
+        self.cosine_learn_scale = cosine_learn_scale
         
         # 根據 depth 選擇對應的 ResNet
         resnet_dict = {
@@ -271,9 +350,18 @@ class StandardResNetWrapper(nn.Module):
         except (ImportError, AttributeError):
             # Fall back to old API (torchvision < 0.13)
             self.backbone = resnet_dict[depth](pretrained=pretrained)
-        
-        # 修改最後一層以匹配 num_classes
-        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
+
+        # 修改最後一層以匹配 num_classes，並可選擇使用 cosine classifier
+        feat_dim = self.backbone.fc.in_features
+        if self.use_cosine_classifier:
+            self.backbone.fc = CosineClassifier(
+                feat_dim,
+                num_classes,
+                scale=self.cosine_scale,
+                learn_scale=self.cosine_learn_scale,
+            )
+        else:
+            self.backbone.fc = nn.Linear(feat_dim, num_classes)
         
         # Initialize StyleShift, StyleExplore, and MixStyle modules for each layer
         if self.use_style_shift:

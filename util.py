@@ -30,6 +30,16 @@ import torchvision.models as models
 from models import *
 from pacs_dataset import PACSDataset
 
+# t-SNE feature visualization (optional deps)
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+    _TSNE_AVAILABLE = True
+except ImportError:
+    _TSNE_AVAILABLE = False
+
 # import GraphPreprocess 
 
 class Partition(object):
@@ -578,6 +588,10 @@ def select_model(num_class, args):
     mixstyle_alpha = getattr(args, 'mixstyle_alpha', 0.1)
     # Get pretrained parameter
     pretrained = getattr(args, 'pretrained', False)
+    # Cosine classifier parameters
+    use_cosine_classifier = getattr(args, 'use_cosine_classifier', False)
+    cosine_scale = getattr(args, 'cosine_scale', 30.0)
+    cosine_learn_scale = getattr(args, 'cosine_learn_scale', False)
     
     if args.model == 'VGG':
         model = vggnet.VGG(16, num_class)
@@ -595,7 +609,10 @@ def select_model(num_class, args):
                                              style_explore_alpha=style_explore_alpha,
                                              style_explore_ratio=style_explore_ratio,
                                              mixstyle_alpha=mixstyle_alpha,
-                                             pretrained=pretrained)
+                                             pretrained=pretrained,
+                                             use_cosine_classifier=use_cosine_classifier,
+                                             cosine_scale=cosine_scale,
+                                             cosine_learn_scale=cosine_learn_scale)
             else:
                 # model = large_resnet.ResNet18()
                 model = resnet.ResNet(18, num_class,
@@ -603,7 +620,11 @@ def select_model(num_class, args):
                                      style_shift_prob=style_shift_prob,
                                      style_shift_ratio=style_shift_ratio,
                                      style_explore_alpha=style_explore_alpha,
-                                     style_explore_ratio=style_explore_ratio)
+                                     style_explore_ratio=style_explore_ratio,
+                                     mixstyle_alpha=mixstyle_alpha,
+                                     use_cosine_classifier=use_cosine_classifier,
+                                     cosine_scale=cosine_scale,
+                                     cosine_learn_scale=cosine_learn_scale)
         elif args.dataset == 'pacs':
             if resnet_type == 'standard':
                 from models.resnet import StandardResNetWrapper
@@ -614,14 +635,21 @@ def select_model(num_class, args):
                                              style_explore_alpha=style_explore_alpha,
                                              style_explore_ratio=style_explore_ratio,
                                              mixstyle_alpha=mixstyle_alpha,
-                                             pretrained=pretrained)
+                                             pretrained=pretrained,
+                                             use_cosine_classifier=use_cosine_classifier,
+                                             cosine_scale=cosine_scale,
+                                             cosine_learn_scale=cosine_learn_scale)
             else:
                 model = resnet.ResNet(18, num_class,
                                      use_style_shift=use_style_shift,
                                      style_shift_prob=style_shift_prob,
                                      style_shift_ratio=style_shift_ratio,
                                      style_explore_alpha=style_explore_alpha,
-                                     style_explore_ratio=style_explore_ratio)
+                                     style_explore_ratio=style_explore_ratio,
+                                     mixstyle_alpha=mixstyle_alpha,
+                                     use_cosine_classifier=use_cosine_classifier,
+                                     cosine_scale=cosine_scale,
+                                     cosine_learn_scale=cosine_learn_scale)
         elif args.dataset == 'imagenet':
             # ImageNet 默認使用標準 ResNet
             model = models.resnet18()
@@ -784,7 +812,163 @@ def select_graph(graphid, num_nodes=None, radius=None, seed=None):
     if graphid < 0 or graphid >= len(Graphs):
         raise ValueError(f"無效的 graphid: {graphid}。有效範圍：0-{len(Graphs)-1}，或特殊 ID：-1 (3 節點全連接), 6 (RGG)")
             
-    return Graphs[graphid] 
+    return Graphs[graphid]
+
+
+def supervised_contrastive_loss(features, labels, temperature=0.1):
+    """
+    Supervised Contrastive Loss 與 FedAlign 一致：
+    - 正樣本含自己（same_label_matrix 對角線為 1）
+    - loss = mean(-positive_avg_sim + log(sum exp(sim)))，分母排除自己。
+    數值穩定：對 exp(sim) 做減 max 再還原。
+    """
+    device = features.device
+    features = F.normalize(features, p=2, dim=1)
+    sim = torch.matmul(features, features.T) / temperature
+
+    labels = labels.contiguous().view(-1, 1)
+    same_label_matrix = torch.eq(labels, labels.T).float().to(device)  # 含自己
+    same_label_sim = sim * same_label_matrix
+    same_label_num = same_label_matrix.sum(dim=1).clamp(min=1.0)
+    positive_sum = (same_label_sim.sum(dim=1) / same_label_num)
+
+    # negative_sum = log(sum_j exp(sim_ij) - exp(sim_ii))，用 log-sum-exp 穩定
+    max_sim, _ = torch.max(sim, dim=1, keepdim=True)
+    sim_stable = sim - max_sim.detach()
+    exp_sim = torch.exp(sim_stable)
+    neg_denom = (exp_sim.sum(dim=1) - exp_sim.diag()).clamp(min=1e-8)
+    negative_sum = torch.log(neg_denom) + max_sim.squeeze(1)
+
+    loss = (-positive_sum + negative_sum).mean()
+    return loss
+
+
+def draw_tsne_feature_distribution(features, labels, save_path, title=None, random_state=42):
+    """
+    Draw t-SNE visualization of features colored by class (reference: FedAlign draw_feature_distribution).
+    features: numpy array [N, dim] or tensor (CPU/GPU); labels: numpy array [N] or tensor (integer class indices).
+    save_path: path to save the figure (e.g. .png).
+    """
+    if not _TSNE_AVAILABLE:
+        raise ImportError("t-SNE requires matplotlib and sklearn. Install with: pip install matplotlib scikit-learn")
+    # 若為 GPU Tensor 先轉 CPU 再轉 numpy，避免 np.asarray(gpu_tensor) 報錯
+    if torch.is_tensor(features):
+        features = features.detach().cpu().numpy()
+    if torch.is_tensor(labels):
+        labels = labels.detach().cpu().numpy()
+    features = np.asarray(features, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64).ravel()
+    tsne = TSNE(n_components=2, random_state=random_state)
+    tsne_results = tsne.fit_transform(features)
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(
+        tsne_results[:, 0],
+        tsne_results[:, 1],
+        c=labels,
+        cmap="viridis",
+        alpha=0.5,
+    )
+    unique_labels = np.unique(labels)
+    for label in unique_labels:
+        plt.scatter([], [], color=scatter.cmap(scatter.norm(label)), label=int(label))
+    plt.legend(title="Class", loc="upper left", bbox_to_anchor=(1, 1), fontsize=12, title_fontsize=14)
+    plt.gca().set_xticks([])
+    plt.gca().set_yticks([])
+    if title:
+        plt.title(title)
+    parent = os.path.dirname(save_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    plt.savefig(save_path, bbox_inches="tight", pad_inches=0.1)
+    plt.close()
+
+
+def draw_tsne_train_test_overlay(
+    features_train, labels_train,
+    features_test, labels_test,
+    save_path,
+    title=None,
+    source_domain_name="train",
+    target_domain_name="test",
+    random_state=42,
+):
+    """
+    Draw t-SNE with training set (source domain) and test set (target domain) on the same plot.
+    - Color = class (dog, cat, ...).
+    - Marker: 'o' = source (training), 'x' = target (test).
+    Perfect domain generalization: same-class circles and x's overlap.
+    Domain gap: x's of a class form a shifted cluster next to circles of that class.
+    """
+    if not _TSNE_AVAILABLE:
+        raise ImportError("t-SNE requires matplotlib and sklearn. Install with: pip install matplotlib scikit-learn")
+    for arr in (features_train, features_test):
+        if torch.is_tensor(arr):
+            arr = arr.detach().cpu().numpy()
+    for arr in (labels_train, labels_test):
+        if torch.is_tensor(arr):
+            arr = arr.detach().cpu().numpy()
+    features_train = np.asarray(features_train, dtype=np.float64)
+    labels_train = np.asarray(labels_train, dtype=np.int64).ravel()
+    features_test = np.asarray(features_test, dtype=np.float64)
+    labels_test = np.asarray(labels_test, dtype=np.int64).ravel()
+
+    # Combine and run t-SNE once on all points
+    features_all = np.concatenate([features_train, features_test], axis=0)
+    labels_all = np.concatenate([labels_train, labels_test], axis=0)
+    n_train = len(labels_train)
+    n_test = len(labels_test)
+    domain_id = np.array([0] * n_train + [1] * n_test)  # 0 = source (train), 1 = target (test)
+
+    tsne = TSNE(n_components=2, random_state=random_state)
+    tsne_results = tsne.fit_transform(features_all)
+
+    train_xy = tsne_results[:n_train]
+    test_xy = tsne_results[n_train:]
+
+    # Use a discrete colormap for classes (e.g. 7 classes)
+    unique_labels = np.unique(labels_all)
+    n_classes = len(unique_labels)
+    cmap = plt.get_cmap("tab10") if n_classes <= 10 else plt.get_cmap("viridis")
+    colors = [cmap(i / max(1, n_classes - 1)) for i in range(n_classes)]
+
+    plt.figure(figsize=(12, 9))
+    # Plot: circles = source (train), x = target (test); color = class
+    for i, cls in enumerate(unique_labels):
+        c = colors[i]
+        mask_train = labels_train == cls
+        mask_test = labels_test == cls
+        if mask_train.any():
+            plt.scatter(
+                train_xy[mask_train, 0], train_xy[mask_train, 1],
+                c=[c], marker="o", s=40, alpha=0.6, edgecolors="k", linewidths=0.3,
+            )
+        if mask_test.any():
+            plt.scatter(
+                test_xy[mask_test, 0], test_xy[mask_test, 1],
+                c=[c], marker="x", s=60, alpha=0.8, linewidths=1.5,
+            )
+
+    from matplotlib.lines import Line2D
+    # Domain (marker) legend: o = source, x = target
+    domain_handles = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="gray", markersize=10, label=source_domain_name, linestyle=""),
+        Line2D([0], [0], marker="x", color="gray", markersize=10, label=target_domain_name, linestyle=""),
+    ]
+    plt.gca().legend(handles=domain_handles, title="Domain (marker)", loc="upper left", fontsize=10)
+    # Class (color) legend
+    class_handles = [Line2D([0], [0], marker="o", color="w", markerfacecolor=colors[i], markersize=8, label=f"Class {int(unique_labels[i])}", linestyle="") for i in range(n_classes)]
+    plt.gca().add_artist(plt.gca().legend(handles=class_handles, title="Class (color)", loc="lower left", fontsize=10))
+
+    plt.gca().set_xticks([])
+    plt.gca().set_yticks([])
+    if title:
+        plt.title(title)
+    parent = os.path.dirname(save_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    plt.savefig(save_path, bbox_inches="tight", pad_inches=0.1)
+    plt.close()
+
 
 def comp_accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
@@ -876,3 +1060,111 @@ def test(model, test_loader):
             # 每個 batch 後清理臨時變量，避免記憶體累積
             del inputs, targets, outputs
     return top1.avg
+
+
+def subsample_stratified(features, labels, max_samples, n_classes, random_state=None):
+    """
+    從已抽取的 (features, labels) 做每類平均子取樣，最多 max_samples 筆。
+    features: [N, D], labels: [N]。回傳 (feat_sub, lab_sub)。
+    """
+    features = np.asarray(features, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int64).ravel()
+    if random_state is not None:
+        rng = np.random.default_rng(random_state)
+    else:
+        rng = np.random
+    max_per_class = int(np.ceil(max_samples / max(1, n_classes)))
+    idx_list = []
+    for c in range(n_classes):
+        mask = labels == c
+        idx_c = np.where(mask)[0]
+        if len(idx_c) == 0:
+            continue
+        n_take = min(len(idx_c), max_per_class)
+        idx_list.append(rng.choice(idx_c, size=n_take, replace=False))
+    if not idx_list:
+        return features[:0], labels[:0]
+    idx = np.concatenate(idx_list)
+    if random_state is not None:
+        rng.shuffle(idx)
+    else:
+        np.random.shuffle(idx)
+    if len(idx) > max_samples:
+        idx = idx[:max_samples]
+    return features[idx], labels[idx]
+
+
+def get_centroids_and_features(model, loader):
+    """
+    掃一次 loader，用 intermediate_forward 取特徵，計算每類 centroid 並收集 (features_np, labels_np)。
+    model 需有 intermediate_forward。回傳 (centroids, features_np, labels_np)；
+    centroids 若不足 2 類則為 None，否則為 dict: class_id -> mean_vec (tensor)。
+    """
+    if not hasattr(model, "intermediate_forward"):
+        return None, np.zeros((0, 1), dtype=np.float64), np.zeros(0, dtype=np.int64)
+    model.eval()
+    centroids = {}
+    counts = {}
+    feats_list, labels_list = [], []
+    with torch.no_grad():
+        for data_val, target_val in loader:
+            data_val = data_val.cuda(non_blocking=True)
+            target_val = target_val.cuda(non_blocking=True)
+            feats = model.intermediate_forward(data_val).detach()
+            feats = feats.view(feats.size(0), -1)
+            feats_list.append(feats.cpu().numpy())
+            labels_list.append(target_val.cpu().numpy())
+            for cls in target_val.unique():
+                cls_int = int(cls.item())
+                mask = (target_val == cls)
+                z_cls = feats[mask]
+                if z_cls.numel() == 0:
+                    continue
+                if cls_int not in centroids:
+                    centroids[cls_int] = z_cls.sum(dim=0)
+                    counts[cls_int] = z_cls.size(0)
+                else:
+                    centroids[cls_int] += z_cls.sum(dim=0)
+                    counts[cls_int] += z_cls.size(0)
+    features_np = np.concatenate(feats_list, axis=0)
+    labels_np = np.concatenate(labels_list, axis=0)
+    if len(centroids) < 2:
+        return None, features_np, labels_np
+    for c in centroids:
+        centroids[c] = centroids[c] / max(1, counts[c])
+    return centroids, features_np, labels_np
+
+
+def compute_intra_distance(model, loader, centroids):
+    """依已算好的 centroids 再掃一次 loader，回傳類內平均距離 D_intra。"""
+    if not hasattr(model, "intermediate_forward"):
+        return 0.0
+    model.eval()
+    intra_sum = 0.0
+    total_samples = 0
+    with torch.no_grad():
+        for data_val, target_val in loader:
+            data_val = data_val.cuda(non_blocking=True)
+            target_val = target_val.cuda(non_blocking=True)
+            feats = model.intermediate_forward(data_val).detach().view(data_val.size(0), -1)
+            for c, mu_c in centroids.items():
+                mask = (target_val == c)
+                if mask.any():
+                    z_c = feats[mask]
+                    diff = z_c - mu_c.unsqueeze(0)
+                    intra_sum += diff.norm(p=2, dim=1).sum().item()
+                    total_samples += z_c.size(0)
+    return intra_sum / max(1, total_samples)
+
+
+def compute_inter_distance(centroids):
+    """由 centroids (dict class_id -> mean_vec) 計算類間中心平均距離 D_inter。"""
+    keys = sorted(centroids.keys())
+    if len(keys) < 2:
+        return 0.0
+    inter_sum = 0.0
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            inter_sum += (centroids[keys[i]] - centroids[keys[j]]).norm(p=2).item()
+    num_pairs = len(keys) * (len(keys) - 1) // 2
+    return inter_sum / max(1, num_pairs)
