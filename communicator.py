@@ -545,6 +545,10 @@ class SingleProcessCommunicator(object):
         self.local_style_vec = None
         self.neighbor_style_vecs = {}  # {domain_name: style_vec_tensor}
         self.neighbor_style_stats = {}  # {domain_name: {layer_name: {stat_name: tensor}}}
+        # Domain-scoped style caches to avoid cross-domain leakage in single-process mode
+        self.neighbor_style_vecs_by_domain = {}   # {domain_name: {neighbor_domain: style_vec_tensor}}
+        self.neighbor_style_stats_by_domain = {}  # {domain_name: {neighbor_domain: unflattened_stats}}
+        self.active_domain = None
         self.channels_per_layer = None
         
         # Build adjacency list for domains based on topology
@@ -596,6 +600,8 @@ class SingleProcessCommunicator(object):
         """
         self.neighbor_style_vecs.clear()
         self.neighbor_style_stats.clear()
+        self.neighbor_style_vecs_by_domain = {domain: {} for domain in self.domain_to_idx.keys()}
+        self.neighbor_style_stats_by_domain = {domain: {} for domain in self.domain_to_idx.keys()}
         
         # For each active subgraph, exchange style statistics
         for graph_id, flag in enumerate(active_flags):
@@ -615,7 +621,9 @@ class SingleProcessCommunicator(object):
                             
                             # Directly access neighbor's style vector (already in GPU)
                             if neighbor_domain in style_vecs_dict:
-                                self.neighbor_style_vecs[neighbor_domain] = style_vecs_dict[neighbor_domain].clone()
+                                self.neighbor_style_vecs_by_domain[domain_name][neighbor_domain] = (
+                                    style_vecs_dict[neighbor_domain].clone()
+                                )
                                 
                                 # Unflatten if channel info is available
                                 if self.channels_per_layer is not None:
@@ -626,9 +634,18 @@ class SingleProcessCommunicator(object):
                                             layer_order=layer_order,
                                             channels_per_layer=self.channels_per_layer
                                         )
-                                        self.neighbor_style_stats[neighbor_domain] = unflattened_stats
+                                        self.neighbor_style_stats_by_domain[domain_name][neighbor_domain] = unflattened_stats
                                     except Exception as e:
                                         pass
+
+    def set_active_domain(self, domain_name):
+        """
+        Expose domain-specific neighbor style stats for the next forward pass.
+        This mimics MPI semantics where each rank only sees its own neighbors.
+        """
+        self.active_domain = domain_name
+        self.neighbor_style_vecs = dict(self.neighbor_style_vecs_by_domain.get(domain_name, {}))
+        self.neighbor_style_stats = dict(self.neighbor_style_stats_by_domain.get(domain_name, {}))
     
     def _aggregate_models(self, models_dict, active_flags):
         """

@@ -220,10 +220,14 @@ def run(num_domains):
 
         # ========== 第一阶段：计算所有 domain 的风格统计量（不训练）==========
         style_vecs_dict = {}
+        # Cache one batch per domain so style stats and training share identical data
+        # (matching train_mpi.py behavior).
+        batch_cache = {}
         if (getattr(args, "use_style_stats", False) or getattr(args, "use_style_shift", False)) and args.model == "res":
             for domain in domain_names:
                 data, target = next(train_iters[domain])
                 data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
+                batch_cache[domain] = (data, target)
                 
                 with torch.no_grad():  # 不计算梯度，节省内存
                     model = models_dict[domain]
@@ -282,14 +286,18 @@ def run(num_domains):
                         if bn_states_dict[domain][name]['num_batches_tracked'] is not None:
                             module.num_batches_tracked.copy_(bn_states_dict[domain][name]['num_batches_tracked'])
             
-            # Get batch for this domain (reuse the same batch from style stats computation if available)
-            # For efficiency, we could reuse, but for correctness, we get a new batch
-            data, target = next(train_iters[domain])
-            data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
+            # Reuse phase-1 batch when style stats are enabled; otherwise fetch normally.
+            if domain in batch_cache:
+                data, target = batch_cache[domain]
+            else:
+                data, target = next(train_iters[domain])
+                data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
             
             # Forward pass with style shift if enabled
             # Note: communicator.neighbor_style_stats uses domain names as keys in single process mode
             if (use_style_stats or use_style_shift) and args.model == "res":
+                # Switch communicator view to current domain only
+                communicator.set_active_domain(domain)
                 # Style statistics are computed in the first phase, so we don't need return_blocks here
                 # Only need communicator for style shift application
                 output = model(data, return_blocks=False, communicator=communicator,
