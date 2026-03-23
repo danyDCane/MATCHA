@@ -4,6 +4,7 @@ import time
 import argparse
 import sys
 from copy import deepcopy
+import random
 
 from math import ceil
 from random import Random
@@ -42,6 +43,7 @@ def run(num_domains):
     # set random seed
     torch.manual_seed(args.randomSeed)
     np.random.seed(args.randomSeed)
+    random.seed(args.randomSeed)
 
     # initialize wandb (only once for single process)
     wandb.init(
@@ -577,6 +579,11 @@ if __name__ == "__main__":
     parser.add_argument('--momentum', default=0.0, type=float, help='momentum')
     parser.add_argument('--epoch', '-e', default=10, type=int, help='total epoch')
     parser.add_argument('--bs', default=64, type=int, help='batch size on each worker')
+    parser.add_argument('--sampler_type', type=str, default='random',
+                        choices=['random', 'random_class'],
+                        help='train sampler type: random (shuffle) or random_class (balanced classes per batch)')
+    parser.add_argument('--n_ins', type=int, default=16,
+                        help='for random_class sampler: number of instances per class in each batch')
     parser.add_argument('--warmup', action='store_true', help='use lr warmup or not')
     parser.add_argument('--nesterov', action='store_true', help='use nesterov momentum or not')
 

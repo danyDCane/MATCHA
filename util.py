@@ -2,6 +2,8 @@ import os
 import numpy as np
 import time
 import argparse
+import random
+from collections import defaultdict
 
 # MPI import is optional (only needed for partition_dataset, which is deprecated in single-process mode)
 try:
@@ -26,6 +28,7 @@ import torchvision
 from torchvision import datasets, transforms
 import torch.backends.cudnn as cudnn
 import torchvision.models as models
+from torch.utils.data.sampler import Sampler
 
 from models import *
 from pacs_dataset import PACSDataset
@@ -116,6 +119,90 @@ class DataPartitioner(object):
             rng.shuffle(partitions[partPointer])
             remainLabels = remainLabels[idxIncrement:]
         return partitions
+
+
+class RandomClassSampler(Sampler):
+    """
+    Randomly samples N classes each with K instances to form a minibatch.
+
+    This is a PyTorch-native equivalent of the idea behind Dassl's RandomClassSampler,
+    but it works with datasets that expose `targets` (list[int]) as ImageFolder/CIFAR do.
+    """
+
+    def __init__(self, dataset, batch_size: int, n_ins: int):
+        if batch_size % n_ins != 0:
+            raise ValueError(f"batch_size={batch_size} must be divisible by n_ins={n_ins}")
+
+        # `targets` is the common convention for torchvision-style datasets.
+        targets = getattr(dataset, "targets", None)
+        if targets is None:
+            raise ValueError("RandomClassSampler requires dataset to have attribute `targets`")
+
+        self.targets = targets
+        self.batch_size = batch_size
+        self.n_ins = n_ins
+        self.ncls_per_batch = batch_size // n_ins
+
+        self.index_dic = defaultdict(list)
+        for index, label in enumerate(self.targets):
+            self.index_dic[int(label)].append(index)
+
+        self.labels = list(self.index_dic.keys())
+        if len(self.labels) < self.ncls_per_batch:
+            raise ValueError(
+                f"Not enough classes for random_class sampler: "
+                f"num_classes={len(self.labels)} < ncls_per_batch={self.ncls_per_batch}"
+            )
+
+        # Deterministic estimate for number of batches per epoch:
+        # - For each class, we can form floor(len(idxs)/n_ins) batches.
+        # - If a class has fewer than n_ins samples, we still allow 1 batch by sampling with replacement.
+        n_batches_per_label = []
+        for label in self.labels:
+            cnt = len(self.index_dic[label])
+            if cnt <= 0:
+                continue
+            n_batches_per_label.append(max(1, cnt // self.n_ins))
+        total_batches_possible = int(sum(n_batches_per_label))
+        self.epoch_batches = max(1, total_batches_possible // self.ncls_per_batch)
+
+        # DataLoader expects sampler.__len__ to be number of indices.
+        self.length = self.epoch_batches * self.batch_size
+
+    def __iter__(self):
+        # Build per-label batch index lists (each list contains arrays of length n_ins)
+        batch_idxs_dict = defaultdict(list)
+        for label in self.labels:
+            idxs = list(self.index_dic[label])
+            if len(idxs) < self.n_ins:
+                # Sample with replacement to make one full (n_ins-sized) batch possible.
+                idxs = random.choices(idxs, k=self.n_ins)
+            random.shuffle(idxs)
+            cur = []
+            for idx in idxs:
+                cur.append(idx)
+                if len(cur) == self.n_ins:
+                    batch_idxs_dict[label].append(cur)
+                    cur = []
+
+        avai_labels = [l for l in self.labels if len(batch_idxs_dict[l]) > 0]
+        final_idxs = []
+
+        # Generate up to `epoch_batches` balanced batches
+        for _ in range(self.epoch_batches):
+            if len(avai_labels) < self.ncls_per_batch:
+                break
+            selected_labels = random.sample(avai_labels, self.ncls_per_batch)
+            for label in selected_labels:
+                batch_idxs = batch_idxs_dict[label].pop(0)
+                final_idxs.extend(batch_idxs)
+                if len(batch_idxs_dict[label]) == 0:
+                    avai_labels.remove(label)
+
+        return iter(final_idxs)
+
+    def __len__(self):
+        return self.length
 
 def partition_dataset(rank, size, args):
     """
@@ -446,12 +533,22 @@ def load_dataset_single_process(args):
                 transform=transform_train
             )
             
-            train_loader = torch.utils.data.DataLoader(
-                train_dataset, 
-                batch_size=args.bs, 
-                shuffle=True, 
-                pin_memory=True
-            )
+            if getattr(args, "sampler_type", "random") == "random_class":
+                train_sampler = RandomClassSampler(train_dataset, batch_size=args.bs, n_ins=args.n_ins)
+                train_loader = torch.utils.data.DataLoader(
+                    train_dataset,
+                    batch_size=args.bs,
+                    sampler=train_sampler,
+                    shuffle=False,
+                    pin_memory=True
+                )
+            else:
+                train_loader = torch.utils.data.DataLoader(
+                    train_dataset,
+                    batch_size=args.bs,
+                    shuffle=True,
+                    pin_memory=True
+                )
             
             print(f'[PACS Dataset] Domain "{domain}": {len(train_dataset)} training samples, {len(train_loader)} batches per epoch')
             
@@ -496,12 +593,22 @@ def load_dataset_single_process(args):
             download=True, 
             transform=transform_train
         )
-        train_loader = torch.utils.data.DataLoader(
-            trainset, 
-            batch_size=args.bs, 
-            shuffle=True, 
-            pin_memory=True
-        )
+        if getattr(args, "sampler_type", "random") == "random_class":
+            train_sampler = RandomClassSampler(trainset, batch_size=args.bs, n_ins=args.n_ins)
+            train_loader = torch.utils.data.DataLoader(
+                trainset,
+                batch_size=args.bs,
+                sampler=train_sampler,
+                shuffle=False,
+                pin_memory=True
+            )
+        else:
+            train_loader = torch.utils.data.DataLoader(
+                trainset,
+                batch_size=args.bs,
+                shuffle=True,
+                pin_memory=True
+            )
         
         print('==> load test data')
         transform_test = transforms.Compose([
@@ -536,12 +643,22 @@ def load_dataset_single_process(args):
             download=True, 
             transform=transform_train
         )
-        train_loader = torch.utils.data.DataLoader(
-            trainset, 
-            batch_size=args.bs, 
-            shuffle=True, 
-            pin_memory=True
-        )
+        if getattr(args, "sampler_type", "random") == "random_class":
+            train_sampler = RandomClassSampler(trainset, batch_size=args.bs, n_ins=args.n_ins)
+            train_loader = torch.utils.data.DataLoader(
+                trainset,
+                batch_size=args.bs,
+                sampler=train_sampler,
+                shuffle=False,
+                pin_memory=True
+            )
+        else:
+            train_loader = torch.utils.data.DataLoader(
+                trainset,
+                batch_size=args.bs,
+                shuffle=True,
+                pin_memory=True
+            )
         
         print('==> load test data')
         transform_test = transforms.Compose([
