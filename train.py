@@ -51,6 +51,7 @@ def run(num_domains):
         name=f"{args.name}_single",
         config={
             "num_domains": num_domains,
+            "num_nodes": args.num_nodes,
             "model": args.model,
             "lr": args.lr,
             "epoch": args.epoch,
@@ -66,8 +67,14 @@ def run(num_domains):
     )
 
     # load data for all domains
+    node_to_domain = {}
     if args.dataset == 'pacs':
-        domain_loaders = util.load_dataset_single_process(args)
+        loaded = util.load_dataset_single_process(args)
+        if isinstance(loaded, tuple) and len(loaded) == 2:
+            domain_loaders, node_to_domain = loaded
+        else:
+            domain_loaders = loaded
+            node_to_domain = {k: k for k in domain_loaders.keys()}
         domain_names = list(domain_loaders.keys())
         num_domains = len(domain_names)  # Update num_domains based on actual loaded domains
         print(f"[Single Process] Loaded {num_domains} domains: {domain_names}")
@@ -106,8 +113,9 @@ def run(num_domains):
     if args.graphid == -1:
         subGraphs = util.select_graph(-1)
     elif args.graphid == 6:
-        # RGG：9 個節點，半徑=0.8，使用 randomSeed 確保可重現性
-        subGraphs = util.select_graph(6, num_nodes=9, radius=0.8, seed=args.randomSeed)
+        # RGG: use virtual node count in single-process mode
+        rgg_nodes = args.num_nodes if args.num_nodes is not None else num_domains
+        subGraphs = util.select_graph(6, num_nodes=rgg_nodes, radius=0.8, seed=args.randomSeed)
     else:
         subGraphs = util.select_graph(args.graphid)
     
@@ -120,6 +128,18 @@ def run(num_domains):
         GP = MatchaProcessor(subGraphs, args.budget, dummy_rank, dummy_size, K, True, comm=None)
     else:
         GP = FixedProcessor(subGraphs, args.budget, dummy_rank, dummy_size, K, True, comm=None)
+
+    if getattr(args, "debug_topology", False):
+        print("\n====== TOPOLOGY CHECK (single-process) ======")
+        print(f"graphid={args.graphid}, num_nodes={num_domains}, subgraphs={len(GP.subGraphs)}")
+        print(f"neighbor_weight(alpha)={GP.neighbor_weight}")
+        for i, neighbors in enumerate(GP.neighbors_info):
+            print(f"subgraph[{i}] neighbors: {neighbors}")
+        if args.dataset == 'pacs' and node_to_domain:
+            print("node -> source domain mapping:")
+            for node_name in sorted(node_to_domain.keys(), key=lambda x: int(x.split('_')[-1]) if x.startswith('node_') else x):
+                print(f"  {node_name} -> {node_to_domain[node_name]}")
+        print("=============================================\n")
 
     # define single process communicator
     communicator = SingleProcessCommunicator(domain_names, GP)
@@ -427,6 +447,8 @@ def run(num_domains):
                 recorder = recorders[domain]
                 recorder.add_new(record_time, comp_time, comm_time, epoch_time,
                                top1_dict[domain].avg, losses_dict[domain].avg, test_accs[domain])
+                if getattr(args, "debug_per_node_metrics", False) and args.dataset == 'pacs' and domain in node_to_domain:
+                    print(f"  {domain} (source_domain={node_to_domain[domain]}): test_acc={float(test_accs[domain]):.2f}")
             
             # 简化的epoch总结打印（先换行清除\r的效果）
             print()  # 换行，清除之前使用\r的进度条
@@ -579,6 +601,16 @@ if __name__ == "__main__":
     parser.add_argument('--momentum', default=0.0, type=float, help='momentum')
     parser.add_argument('--epoch', '-e', default=10, type=int, help='total epoch')
     parser.add_argument('--bs', default=64, type=int, help='batch size on each worker')
+    parser.add_argument('--num_nodes', type=int, default=None,
+                        help='number of virtual nodes in single-process mode (default: train domains count)')
+    parser.add_argument('--node_split_mode', type=str, default=None,
+                        choices=['class_balanced', 'random_contiguous'],
+                        help='how to split one domain among multiple virtual nodes '
+                             '(auto: class_balanced for graphid=6, otherwise random_contiguous)')
+    parser.add_argument('--debug_topology', action='store_true',
+                        help='print topology neighbors and node-domain mapping at startup')
+    parser.add_argument('--debug_per_node_metrics', action='store_true',
+                        help='print per-domain/per-node test_acc each epoch (default: only avg_test_acc)')
     parser.add_argument('--sampler_type', type=str, default='random',
                         choices=['random', 'random_class'],
                         help='train sampler type: random (shuffle) or random_class (balanced classes per batch)')
@@ -636,6 +668,12 @@ if __name__ == "__main__":
                         help='Weight for diffusion loss (default: 1.0)')
 
     args = parser.parse_args()
+
+    # Auto split mode policy:
+    # - If user did not set --node_split_mode, use class_balanced for RGG (graphid=6)
+    # - Otherwise use random_contiguous as default fallback
+    if args.node_split_mode is None:
+        args.node_split_mode = 'class_balanced' if args.graphid == 6 else 'random_contiguous'
 
     if not args.description:
         print('No experiment description, exit!')

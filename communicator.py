@@ -173,6 +173,21 @@ class decenCommunicator(Communicator):
         self.send_buffer = flatten_tensors(self.tensor_list).cpu()
         self.recv_buffer = torch.zeros_like(self.send_buffer)
 
+    def _compute_mh_degrees(self, active_flags):
+        """
+        Compute node degrees on the active graph (union of active subgraphs).
+        Since each subgraph is a matching, degree increments by one per active incident edge.
+        """
+        degrees = [0 for _ in range(self.size)]
+        for graph_id, flag in enumerate(active_flags):
+            if flag == 0:
+                continue
+            neighbors = self.topology.neighbors_info[graph_id]
+            for node in range(self.size):
+                if neighbors[node] != -1:
+                    degrees[node] += 1
+        return degrees
+
 
     def averaging(self, active_flags):
         # 等待所有 worker 都準備好
@@ -212,34 +227,40 @@ class decenCommunicator(Communicator):
                                 pass
         else:
             # 只交換模型參數，不交換風格統計量
-            degree = 0 # record the degree of each node
+            degrees = self._compute_mh_degrees(active_flags)
+            degree = degrees[self.rank]
+            neighbor_weight_sum = 0.0
             for graph_id, flag in enumerate(active_flags):
                 if flag == 0:
                     continue
                 else:
                     # 如果我在這個子圖有鄰居
                     if self.topology.neighbors_info[graph_id][self.rank] != -1:
-                        degree += 1
                         # 查表：我在這個子圖的鄰居是誰？
                         neighbor_rank = self.topology.neighbors_info[graph_id][self.rank]
+                        # Metropolis-Hastings edge weight
+                        w_ij = 1.0 / (1.0 + max(degree, degrees[neighbor_rank]))
                         
                         # 發送我的 (send_buffer) 給他，並接收他的存入 (recv_tmp)
                         self.recv_tmp = self.comm.sendrecv(self.send_buffer, source=neighbor_rank, dest = neighbor_rank)
                         # 融合：把他的參數乘上權重，加到我的接收區
-                        # recv_buffer += alpha * neighbor_model
-                        self.recv_buffer.add_(self.recv_tmp, alpha=self.neighbor_weight)
+                        self.recv_buffer.add_(self.recv_tmp, alpha=w_ij)
+                        neighbor_weight_sum += w_ij
 
                         if self.iter % 100 == 0:  # 每100次打印一次
-                            print(f"Rank {self.rank} communicated with {neighbor_rank}, degree={degree}, alpha={self.neighbor_weight}")
+                            print(
+                                f"Rank {self.rank} communicated with {neighbor_rank}, "
+                                f"deg_i={degree}, deg_j={degrees[neighbor_rank]}, w_ij={w_ij:.6f}"
+                            )
             
-            # 檢查完子圖後，計算我的權重
-            selfweight = 1 - degree * self.neighbor_weight
+            # MH self weight: w_ii = 1 - sum_j w_ij
+            selfweight = 1.0 - neighbor_weight_sum
             if self.rank == 0 and self.iter % 62 == 0:
                 print(f"DEBUG: rank={self.rank}, send_buffer[0]={self.send_buffer[0]:.6f}, "
                     f"recv_buffer[0]={self.recv_buffer[0]:.6f}, "
-                    f"degree={degree}, alpha={self.neighbor_weight:.6f}, "
+                    f"degree={degree}, sum_w_ij={neighbor_weight_sum:.6f}, "
                     f"selfweight={selfweight:.6f}")
-            # compute weighted average: (1-d*alpha)x_i + alpha * sum_j x_j
+            # MH weighted average: w_ii x_i + sum_j w_ij x_j
             self.recv_buffer.add_(self.send_buffer, alpha=selfweight)
             # 在 communicator.py 第238行后添加（在加上自身权重之后）
             if self.iter % 62 == 0:
@@ -689,6 +710,17 @@ class SingleProcessCommunicator(object):
                         # so named_parameters() should only return denoiser parameters
                     }
             
+            # Precompute MH degrees on the active graph (node-level)
+            degrees = [0 for _ in range(self.num_domains)]
+            for graph_id, flag in enumerate(active_flags):
+                if flag == 0:
+                    continue
+                if graph_id < len(self.topology.neighbors_info):
+                    neighbors_info = self.topology.neighbors_info[graph_id]
+                    for node in range(min(self.num_domains, len(neighbors_info))):
+                        if neighbors_info[node] != -1 and neighbors_info[node] < self.num_domains:
+                            degrees[node] += 1
+
             # Now aggregate based on snapshots (all domains use the same snapshot)
             for domain_name in models_dict:
                 domain_idx = self.domain_to_idx[domain_name]
@@ -702,9 +734,10 @@ class SingleProcessCommunicator(object):
                 # Note: degree counts the number of active subgraphs with neighbors
                 # This matches decenCommunicator logic where degree increments for each active subgraph
                 # Backbone and diffusion share the same topology, so we compute degree once and accumulate both
-                degree = 0
+                degree = degrees[domain_idx]
                 neighbor_sum = {}  # Accumulate sum of neighbor backbone parameters
                 diffusion_neighbor_sum = {}  # Accumulate sum of neighbor diffusion parameters (if exists)
+                neighbor_weight_sum = 0.0
                 
                 # Check if this domain has diffusion model
                 has_diffusion = (hasattr(model, 'diffusion_model') and model.diffusion_model is not None and 
@@ -724,7 +757,8 @@ class SingleProcessCommunicator(object):
                                 neighbor_domain = self.idx_to_domain[neighbor_idx]
                                 
                                 if neighbor_domain in models_dict:
-                                    degree += 1
+                                    # MH edge weight for this active edge
+                                    w_ij = 1.0 / (1.0 + max(degree, degrees[neighbor_idx]))
                                     # Use snapshot instead of current model parameters
                                     neighbor_params = param_snapshots[neighbor_domain]
                                     
@@ -732,7 +766,7 @@ class SingleProcessCommunicator(object):
                                     for param_name in param_dict.keys():
                                         if param_name not in neighbor_sum:
                                             neighbor_sum[param_name] = torch.zeros_like(original_params[param_name])
-                                        neighbor_sum[param_name] += neighbor_params[param_name]
+                                        neighbor_sum[param_name] += w_ij * neighbor_params[param_name]
                                     
                                     # Accumulate neighbor diffusion parameters if both domains have diffusion models
                                     if has_diffusion and neighbor_domain in diffusion_param_snapshots:
@@ -740,31 +774,21 @@ class SingleProcessCommunicator(object):
                                         for param_name in diffusion_param_dict.keys():
                                             if param_name not in diffusion_neighbor_sum:
                                                 diffusion_neighbor_sum[param_name] = torch.zeros_like(original_diffusion_params[param_name])
-                                            diffusion_neighbor_sum[param_name] += neighbor_diffusion_params[param_name]
+                                            diffusion_neighbor_sum[param_name] += w_ij * neighbor_diffusion_params[param_name]
+
+                                    neighbor_weight_sum += w_ij
                 
-                # Apply decentralized averaging formula (same as decenCommunicator):
-                # x_i^{t+1} = (1 - d*alpha) * x_i^t + alpha * sum_{j in neighbors} x_j^t
-                # This matches: recv_buffer = (1 - d*alpha) * send_buffer + alpha * sum(neighbor_buffers)
-                # Multi-process logic:
-                #   1. recv_buffer = 0
-                #   2. For each neighbor: recv_buffer += alpha * neighbor_buffer
-                #   3. recv_buffer += (1 - d*alpha) * send_buffer
-                #   4. Result: (1 - d*alpha) * x_i + alpha * sum_j x_j
-                selfweight = 1 - degree * self.neighbor_weight
+                # MH self weight
+                selfweight = 1.0 - neighbor_weight_sum
                 
                 # Apply aggregation to backbone parameters only (matching multi-process behavior)
                 # Only update parameters, buffers (running_mean, running_var) remain unchanged
                 # Use original_params from snapshot, not current param.data
                 for param_name, param in param_dict.items():
                     if param_name in neighbor_sum:
-                        # Formula: (1 - d*alpha) * x_i + alpha * sum_j x_j
-                        # This matches decenCommunicator: 
-                        #   recv_buffer.add_(neighbor_buffer, alpha=neighbor_weight) for each neighbor
-                        #   recv_buffer.add_(send_buffer, alpha=selfweight)
-                        # Use original_params from snapshot to ensure consistency
                         param.data.copy_(
                             selfweight * original_params[param_name] +
-                            self.neighbor_weight * neighbor_sum[param_name]
+                            neighbor_sum[param_name]
                         )
                     # If no active neighbors, param remains unchanged (selfweight = 1, so no change)
                 
@@ -776,7 +800,7 @@ class SingleProcessCommunicator(object):
                         if param_name in diffusion_neighbor_sum:
                             param.data.copy_(
                                 selfweight * original_diffusion_params[param_name] +
-                                self.neighbor_weight * diffusion_neighbor_sum[param_name]
+                                diffusion_neighbor_sum[param_name]
                             )
     
     def averaging(self, active_flags=None):

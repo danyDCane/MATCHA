@@ -29,6 +29,7 @@ from torchvision import datasets, transforms
 import torch.backends.cudnn as cudnn
 import torchvision.models as models
 from torch.utils.data.sampler import Sampler
+from torch.utils.data import Subset
 
 from models import *
 from pacs_dataset import PACSDataset
@@ -135,6 +136,11 @@ class RandomClassSampler(Sampler):
 
         # `targets` is the common convention for torchvision-style datasets.
         targets = getattr(dataset, "targets", None)
+        # Support torch.utils.data.Subset by extracting labels from base dataset.
+        if targets is None and hasattr(dataset, "dataset") and hasattr(dataset, "indices"):
+            base_targets = getattr(dataset.dataset, "targets", None)
+            if base_targets is not None:
+                targets = [base_targets[i] for i in dataset.indices]
         if targets is None:
             raise ValueError("RandomClassSampler requires dataset to have attribute `targets`")
 
@@ -203,6 +209,107 @@ class RandomClassSampler(Sampler):
 
     def __len__(self):
         return self.length
+
+
+def assign_nodes_to_domains(available_domains, num_nodes):
+    """
+    Assign virtual nodes to domains as evenly as possible.
+
+    Returns:
+        node_to_domain: dict like {"node_0": "art_painting", ...}
+        domain_to_nodes: dict like {"art_painting": ["node_0", ...], ...}
+    """
+    if num_nodes <= 0:
+        raise ValueError(f"num_nodes must be positive, got {num_nodes}")
+
+    num_domains = len(available_domains)
+    if num_domains == 0:
+        raise ValueError("No available domains to assign nodes")
+
+    base = num_nodes // num_domains
+    extra = num_nodes % num_domains
+
+    node_to_domain = {}
+    domain_to_nodes = {d: [] for d in available_domains}
+
+    node_idx = 0
+    for i, domain in enumerate(available_domains):
+        n_for_domain = base + (1 if i < extra else 0)
+        for _ in range(n_for_domain):
+            node_name = f"node_{node_idx}"
+            node_to_domain[node_name] = domain
+            domain_to_nodes[domain].append(node_name)
+            node_idx += 1
+
+    return node_to_domain, domain_to_nodes
+
+
+def partition_domain_dataset_for_nodes(train_dataset, node_names, split_mode, seed):
+    """
+    Split one domain dataset into multiple subsets for assigned virtual nodes.
+
+    split_mode:
+      - random_contiguous: keep original order and slice contiguous chunks
+      - class_balanced: split each class bucket evenly across nodes
+    """
+    n_nodes = len(node_names)
+    if n_nodes <= 0:
+        raise ValueError("node_names must be non-empty")
+
+    total = len(train_dataset)
+    all_indices = list(range(total))
+
+    if n_nodes == 1:
+        return {node_names[0]: all_indices}
+
+    if split_mode == "random_contiguous":
+        # Contiguous slicing on original index order.
+        splits = np.array_split(np.array(all_indices), n_nodes)
+        return {node_names[i]: splits[i].tolist() for i in range(n_nodes)}
+
+    if split_mode != "class_balanced":
+        raise ValueError(f"Unknown node split mode: {split_mode}")
+
+    targets = getattr(train_dataset, "targets", None)
+    if targets is None:
+        # Fallback: no class labels available, use contiguous split.
+        splits = np.array_split(np.array(all_indices), n_nodes)
+        return {node_names[i]: splits[i].tolist() for i in range(n_nodes)}
+
+    # Group indices by class, then split each class bucket across nodes.
+    class_to_indices = defaultdict(list)
+    for idx, label in enumerate(targets):
+        class_to_indices[int(label)].append(idx)
+
+    rng = np.random.default_rng(seed)
+    node_to_indices = {node: [] for node in node_names}
+
+    for label in sorted(class_to_indices.keys()):
+        cls_indices = class_to_indices[label]
+        rng.shuffle(cls_indices)
+        cls_splits = np.array_split(np.array(cls_indices), n_nodes)
+        for i, node in enumerate(node_names):
+            node_to_indices[node].extend(cls_splits[i].tolist())
+
+    # Shuffle within each node for training randomness.
+    for i, node in enumerate(node_names):
+        local_rng = np.random.default_rng(seed + i + 1)
+        local_idxs = node_to_indices[node]
+        local_rng.shuffle(local_idxs)
+        node_to_indices[node] = list(local_idxs)
+
+    return node_to_indices
+
+
+def _compute_label_histogram_for_indices(dataset, indices):
+    """Return label histogram dict for a subset of indices."""
+    targets = getattr(dataset, "targets", None)
+    if targets is None:
+        return {}
+    hist = defaultdict(int)
+    for idx in indices:
+        hist[int(targets[idx])] += 1
+    return dict(sorted(hist.items(), key=lambda kv: kv[0]))
 
 def partition_dataset(rank, size, args):
     """
@@ -521,64 +628,150 @@ def load_dataset_single_process(args):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
         
-        # Load data for each training domain
-        domain_loaders = {}
+        # Load test data once (shared by all train domains/nodes)
+        print(f'[PACS Dataset] Loading test data from leave-out domain "{args.leave_out}"...')
+        test_dataset = PACSDataset(
+            root=args.datasetRoot,
+            dataset_name=args.leave_out,
+            transform=transform_test
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=64,
+            shuffle=False,
+            pin_memory=True
+        )
+        print(f'[PACS Dataset] Test samples: {len(test_dataset)}, Test batches: {len(test_loader)}')
+
+        # number of virtual nodes for single-process
+        num_nodes = getattr(args, "num_nodes", len(available_domains)) or len(available_domains)
+        split_mode = getattr(args, "node_split_mode", "class_balanced")
+        enable_virtual_node_split = (getattr(args, "graphid", None) == 6 and num_nodes > len(available_domains))
+
+        # Case A: original behavior (one loader per train domain)
+        # Keep this as default, and ONLY enable virtual-node split for graphid=6.
+        if not enable_virtual_node_split:
+            domain_loaders = {}
+            for domain in available_domains:
+                print(f'[PACS Dataset] Loading training data from domain "{domain}"...')
+                print(f'[PACS Dataset] Dataset root: {args.datasetRoot}')
+                
+                train_dataset = PACSDataset(
+                    root=args.datasetRoot, 
+                    dataset_name=domain, 
+                    transform=transform_train
+                )
+                
+                if getattr(args, "sampler_type", "random") == "random_class":
+                    train_sampler = RandomClassSampler(train_dataset, batch_size=args.bs, n_ins=args.n_ins)
+                    train_loader = torch.utils.data.DataLoader(
+                        train_dataset,
+                        batch_size=args.bs,
+                        sampler=train_sampler,
+                        shuffle=False,
+                        pin_memory=True
+                    )
+                else:
+                    train_loader = torch.utils.data.DataLoader(
+                        train_dataset,
+                        batch_size=args.bs,
+                        shuffle=True,
+                        pin_memory=True
+                    )
+                
+                print(f'[PACS Dataset] Domain "{domain}": {len(train_dataset)} training samples, {len(train_loader)} batches per epoch')
+                domain_loaders[domain] = (train_loader, test_loader)
+
+            node_to_domain = {domain: domain for domain in available_domains}
+            print('=' * 60)
+            print(f'[PACS Dataset] Single process dataset loading completed!')
+            print(f'[PACS Dataset] Loaded {len(available_domains)} training domains')
+            print('=' * 60)
+
+            if num_nodes > len(available_domains) and getattr(args, "graphid", None) != 6:
+                print(
+                    f'[PACS Dataset] Note: num_nodes={num_nodes} is ignored for graphid={getattr(args, "graphid", None)}. '
+                    f'Virtual-node split is only enabled when graphid=6.'
+                )
+            return domain_loaders, node_to_domain
+
+        # Case B: virtual-node mode (num_nodes > num_domains)
+        print(f'[PACS Dataset] Virtual-node mode: num_nodes={num_nodes}, split_mode={split_mode}')
+        node_to_domain, domain_to_nodes = assign_nodes_to_domains(available_domains, num_nodes)
+        print(f'[PACS Dataset] Node assignment: {node_to_domain}')
+
+        # Load full datasets once per domain
+        full_train_datasets = {}
         for domain in available_domains:
             print(f'[PACS Dataset] Loading training data from domain "{domain}"...')
             print(f'[PACS Dataset] Dataset root: {args.datasetRoot}')
             
-            train_dataset = PACSDataset(
+            full_train_datasets[domain] = PACSDataset(
                 root=args.datasetRoot, 
                 dataset_name=domain, 
                 transform=transform_train
             )
-            
-            if getattr(args, "sampler_type", "random") == "random_class":
-                train_sampler = RandomClassSampler(train_dataset, batch_size=args.bs, n_ins=args.n_ins)
-                train_loader = torch.utils.data.DataLoader(
-                    train_dataset,
-                    batch_size=args.bs,
-                    sampler=train_sampler,
-                    shuffle=False,
-                    pin_memory=True
+
+        # Build node-level loaders
+        node_loaders = {}
+        for domain in available_domains:
+            node_names = domain_to_nodes[domain]
+            split_seed = int(args.randomSeed) if args.randomSeed is not None else 1234
+            node_indices = partition_domain_dataset_for_nodes(
+                full_train_datasets[domain], node_names, split_mode=split_mode, seed=split_seed
+            )
+
+            if getattr(args, "debug_topology", False):
+                print(f'[PACS Dataset] Class histogram per node in domain "{domain}":')
+                # domain-level class counts for rough balance check target
+                domain_targets = getattr(full_train_datasets[domain], "targets", [])
+                domain_hist = defaultdict(int)
+                for y in domain_targets:
+                    domain_hist[int(y)] += 1
+                print(f'  domain_total_hist: {dict(sorted(domain_hist.items()))}')
+
+            for node_name in node_names:
+                subset = Subset(full_train_datasets[domain], node_indices[node_name])
+                if len(subset) == 0:
+                    raise ValueError(f"Empty subset for {node_name} in domain {domain}")
+
+                if getattr(args, "debug_topology", False):
+                    node_hist = _compute_label_histogram_for_indices(full_train_datasets[domain], node_indices[node_name])
+                    has_all_classes = (len(node_hist.keys()) == len(domain_hist.keys()))
+                    print(
+                        f'  {node_name}: n={len(subset)}, classes={len(node_hist)} '
+                        f'({"OK" if has_all_classes else "MISSING"}) hist={node_hist}'
+                    )
+
+                if getattr(args, "sampler_type", "random") == "random_class":
+                    train_sampler = RandomClassSampler(subset, batch_size=args.bs, n_ins=args.n_ins)
+                    train_loader = torch.utils.data.DataLoader(
+                        subset,
+                        batch_size=args.bs,
+                        sampler=train_sampler,
+                        shuffle=False,
+                        pin_memory=True
+                    )
+                else:
+                    train_loader = torch.utils.data.DataLoader(
+                        subset,
+                        batch_size=args.bs,
+                        shuffle=True,
+                        pin_memory=True
+                    )
+
+                node_loaders[node_name] = (train_loader, test_loader)
+                print(
+                    f'[PACS Dataset] {node_name} <- {domain}: '
+                    f'{len(subset)} samples, {len(train_loader)} batches/epoch'
                 )
-            else:
-                train_loader = torch.utils.data.DataLoader(
-                    train_dataset,
-                    batch_size=args.bs,
-                    shuffle=True,
-                    pin_memory=True
-                )
-            
-            print(f'[PACS Dataset] Domain "{domain}": {len(train_dataset)} training samples, {len(train_loader)} batches per epoch')
-            
-            # All domains use the same test set (leave_out domain)
-            if domain == available_domains[0]:  # Only load test set once
-                print(f'[PACS Dataset] Loading test data from leave-out domain "{args.leave_out}"...')
-                test_dataset = PACSDataset(
-                    root=args.datasetRoot, 
-                    dataset_name=args.leave_out, 
-                    transform=transform_test
-                )
-                test_loader = torch.utils.data.DataLoader(
-                    test_dataset, 
-                    batch_size=64, 
-                    shuffle=False, 
-                    pin_memory=True
-                )
-                print(f'[PACS Dataset] Test samples: {len(test_dataset)}, Test batches: {len(test_loader)}')
-            else:
-                # Reuse the same test_loader for all domains
-                test_loader = domain_loaders[available_domains[0]][1]
-            
-            domain_loaders[domain] = (train_loader, test_loader)
         
         print('=' * 60)
         print(f'[PACS Dataset] Single process dataset loading completed!')
-        print(f'[PACS Dataset] Loaded {len(available_domains)} training domains')
+        print(f'[PACS Dataset] Loaded {len(node_loaders)} training nodes')
         print('=' * 60)
         
-        return domain_loaders
+        return node_loaders, node_to_domain
     
     elif args.dataset == 'cifar10':
         transform_train = transforms.Compose([
