@@ -33,6 +33,7 @@ from torch.utils.data import Subset
 
 from models import *
 from pacs_dataset import PACSDataset
+from vlcs_dataset import VLCSFullTestDataset
 
 # import GraphPreprocess 
 
@@ -773,6 +774,196 @@ def load_dataset_single_process(args):
         
         return node_loaders, node_to_domain
     
+    elif args.dataset == 'vlcs':
+        print('=' * 60)
+        print(f'[VLCS Dataset] Initializing VLCS dataset loading...')
+        print('=' * 60)
+
+        # VLCS domains
+        all_domains = ['caltech', 'labelme', 'pascal', 'sun']
+        if not args.leave_out:
+            raise ValueError('--leave_out must be specified when using VLCS dataset.')
+
+        leave_out = str(args.leave_out).lower()
+        if leave_out not in all_domains:
+            raise ValueError(
+                f'Invalid leave_out domain: {args.leave_out}. Valid options: {all_domains}'
+            )
+
+        available_domains = [d for d in all_domains if d != leave_out]
+        print(f'[VLCS Dataset] Leave-out domain: {leave_out}')
+        print(f'[VLCS Dataset] Available training domains: {available_domains}')
+        print('-' * 60)
+
+        # Training transforms (use the same style as PACS)
+        transform_train = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomApply([
+                transforms.Compose([
+                    transforms.Resize((252, 252)),
+                    transforms.RandomCrop(224),
+                ])
+            ], p=0.5),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        # Test transforms
+        transform_test = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        # Target test set: leave-out domain full + test
+        test_dataset = VLCSFullTestDataset(
+            root=args.datasetRoot,
+            dataset_name=leave_out,
+            transform=transform_test,
+            full_dir_name='full',
+            test_dir_name='test',
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=64,
+            shuffle=False,
+            pin_memory=True,
+        )
+        print(f'[VLCS Dataset] Test samples: {len(test_dataset)}, Test batches: {len(test_loader)}')
+
+        # number of virtual nodes for single-process
+        num_nodes = getattr(args, "num_nodes", len(available_domains)) or len(available_domains)
+        split_mode = getattr(args, "node_split_mode", "class_balanced")
+        enable_virtual_node_split = (getattr(args, "graphid", None) == 6 and num_nodes > len(available_domains))
+
+        # Case A: original behavior (one loader per train domain)
+        if not enable_virtual_node_split:
+            domain_loaders = {}
+            for domain in available_domains:
+                print(f'[VLCS Dataset] Loading training data from domain "{domain}" (full + test)...')
+                print(f'[VLCS Dataset] Dataset root: {args.datasetRoot}')
+                train_dataset = VLCSFullTestDataset(
+                    root=args.datasetRoot,
+                    dataset_name=domain,
+                    transform=transform_train,
+                    full_dir_name='full',
+                    test_dir_name='test',
+                )
+
+                if getattr(args, "sampler_type", "random") == "random_class":
+                    train_sampler = RandomClassSampler(train_dataset, batch_size=args.bs, n_ins=args.n_ins)
+                    train_loader = torch.utils.data.DataLoader(
+                        train_dataset,
+                        batch_size=args.bs,
+                        sampler=train_sampler,
+                        shuffle=False,
+                        pin_memory=True
+                    )
+                else:
+                    train_loader = torch.utils.data.DataLoader(
+                        train_dataset,
+                        batch_size=args.bs,
+                        shuffle=True,
+                        pin_memory=True
+                    )
+
+                print(f'[VLCS Dataset] Domain "{domain}": {len(train_dataset)} samples, {len(train_loader)} batches/epoch')
+                domain_loaders[domain] = (train_loader, test_loader)
+
+            node_to_domain = {domain: domain for domain in available_domains}
+            print('=' * 60)
+            print(f'[VLCS Dataset] Single process dataset loading completed!')
+            print(f'[VLCS Dataset] Loaded {len(available_domains)} training domains')
+            print('=' * 60)
+
+            if num_nodes > len(available_domains) and getattr(args, "graphid", None) != 6:
+                print(
+                    f'[VLCS Dataset] Note: num_nodes={num_nodes} is ignored for graphid={getattr(args, "graphid", None)}. '
+                    f'Virtual-node split is only enabled when graphid=6.'
+                )
+
+            return domain_loaders, node_to_domain
+
+        # Case B: virtual-node mode (num_nodes > num_domains)
+        print(f'[VLCS Dataset] Virtual-node mode: num_nodes={num_nodes}, split_mode={split_mode}')
+        node_to_domain, domain_to_nodes = assign_nodes_to_domains(available_domains, num_nodes)
+        print(f'[VLCS Dataset] Node assignment: {node_to_domain}')
+
+        # Load full+test datasets once per domain
+        full_train_datasets = {}
+        for domain in available_domains:
+            print(f'[VLCS Dataset] Loading training data from domain "{domain}"...')
+            print(f'[VLCS Dataset] Dataset root: {args.datasetRoot}')
+            full_train_datasets[domain] = VLCSFullTestDataset(
+                root=args.datasetRoot,
+                dataset_name=domain,
+                transform=transform_train,
+                full_dir_name='full',
+                test_dir_name='test',
+            )
+
+        node_loaders = {}
+        for domain in available_domains:
+            node_names = domain_to_nodes[domain]
+            split_seed = int(args.randomSeed) if args.randomSeed is not None else 1234
+            node_indices = partition_domain_dataset_for_nodes(
+                full_train_datasets[domain],
+                node_names,
+                split_mode=split_mode,
+                seed=split_seed
+            )
+
+            if getattr(args, "debug_topology", False):
+                print(f'[VLCS Dataset] Class histogram per node in domain "{domain}":')
+                domain_hist = defaultdict(int)
+                for y in getattr(full_train_datasets[domain], "targets", []):
+                    domain_hist[int(y)] += 1
+                print(f'  domain_total_hist: {dict(sorted(domain_hist.items()))}')
+
+            for node_name in node_names:
+                subset = Subset(full_train_datasets[domain], node_indices[node_name])
+                if len(subset) == 0:
+                    raise ValueError(f"Empty subset for {node_name} in domain {domain}")
+
+                if getattr(args, "debug_topology", False):
+                    node_hist = _compute_label_histogram_for_indices(full_train_datasets[domain], node_indices[node_name])
+                    has_all_classes = (len(node_hist.keys()) == len(domain_hist.keys()))
+                    print(
+                        f'  {node_name}: n={len(subset)}, classes={len(node_hist)} '
+                        f'({"OK" if has_all_classes else "MISSING"}) hist={node_hist}'
+                    )
+
+                if getattr(args, "sampler_type", "random") == "random_class":
+                    train_sampler = RandomClassSampler(subset, batch_size=args.bs, n_ins=args.n_ins)
+                    train_loader = torch.utils.data.DataLoader(
+                        subset,
+                        batch_size=args.bs,
+                        sampler=train_sampler,
+                        shuffle=False,
+                        pin_memory=True
+                    )
+                else:
+                    train_loader = torch.utils.data.DataLoader(
+                        subset,
+                        batch_size=args.bs,
+                        shuffle=True,
+                        pin_memory=True
+                    )
+
+                node_loaders[node_name] = (train_loader, test_loader)
+                print(
+                    f'[VLCS Dataset] {node_name} <- {domain}: '
+                    f'{len(subset)} samples, {len(train_loader)} batches/epoch'
+                )
+
+        print('=' * 60)
+        print(f'[VLCS Dataset] Single process dataset loading completed!')
+        print(f'[VLCS Dataset] Loaded {len(node_loaders)} training nodes')
+        print('=' * 60)
+
+        return node_loaders, node_to_domain
+    
     elif args.dataset == 'cifar10':
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
@@ -914,7 +1105,7 @@ def select_model(num_class, args):
                                      style_shift_ratio=style_shift_ratio,
                                      style_explore_alpha=style_explore_alpha,
                                      style_explore_ratio=style_explore_ratio)
-        elif args.dataset == 'pacs':
+        elif args.dataset == 'pacs' or args.dataset == 'vlcs':
             if resnet_type == 'standard':
                 from models.resnet import StandardResNetWrapper
                 model = StandardResNetWrapper(18, num_class,

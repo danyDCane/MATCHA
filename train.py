@@ -66,9 +66,16 @@ def run(num_domains):
         reinit=True
     )
 
+    # ===== Checkpoint settings =====
+    # Save model weights periodically during training.
+    # Default: every 50 epochs (can be disabled with --save_every_epoch 0).
+    save_dir = args.savePath if args.savePath is not None else "./checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+    save_every_epoch = getattr(args, "save_every_epoch", 50)
+
     # load data for all domains
     node_to_domain = {}
-    if args.dataset == 'pacs':
+    if args.dataset in ['pacs', 'vlcs']:
         loaded = util.load_dataset_single_process(args)
         if isinstance(loaded, tuple) and len(loaded) == 2:
             domain_loaders, node_to_domain = loaded
@@ -135,7 +142,7 @@ def run(num_domains):
         print(f"neighbor_weight(alpha)={GP.neighbor_weight}")
         for i, neighbors in enumerate(GP.neighbors_info):
             print(f"subgraph[{i}] neighbors: {neighbors}")
-        if args.dataset == 'pacs' and node_to_domain:
+        if args.dataset in ['pacs', 'vlcs'] and node_to_domain:
             print("node -> source domain mapping:")
             for node_name in sorted(node_to_domain.keys(), key=lambda x: int(x.split('_')[-1]) if x.startswith('node_') else x):
                 print(f"  {node_name} -> {node_to_domain[node_name]}")
@@ -145,7 +152,12 @@ def run(num_domains):
     communicator = SingleProcessCommunicator(domain_names, GP)
 
     # select neural network model for each domain
-    num_classes = 7 if args.dataset == 'pacs' else 10
+    if args.dataset == 'pacs':
+        num_classes = 7
+    elif args.dataset == 'vlcs':
+        num_classes = 5
+    else:
+        num_classes = 10
     
     # Initialize models for each domain
     models_dict = {}
@@ -447,7 +459,7 @@ def run(num_domains):
                 recorder = recorders[domain]
                 recorder.add_new(record_time, comp_time, comm_time, epoch_time,
                                top1_dict[domain].avg, losses_dict[domain].avg, test_accs[domain])
-                if getattr(args, "debug_per_node_metrics", False) and args.dataset == 'pacs' and domain in node_to_domain:
+                if getattr(args, "debug_per_node_metrics", False) and args.dataset in ['pacs', 'vlcs'] and domain in node_to_domain:
                     print(f"  {domain} (source_domain={node_to_domain[domain]}): test_acc={float(test_accs[domain]):.2f}")
             
             # 简化的epoch总结打印（先换行清除\r的效果）
@@ -543,6 +555,28 @@ def run(num_domains):
             
             wandb.log(log_dict)
 
+            # ===== Periodic checkpoint saving =====
+            if save_every_epoch is not None and save_every_epoch > 0 and (epoch % save_every_epoch == 0):
+                for domain in domain_names:
+                    model = models_dict[domain]
+                    checkpoint = {
+                        "args": args,
+                        "domain": domain,
+                        "all_domains": domain_names,
+                        "dataset": args.dataset,
+                        "leave_out": getattr(args, "leave_out", None),
+                        # Full backbone model (feature extractor + classifier head)
+                        "backbone_state": model.state_dict(),
+                    }
+
+                    if hasattr(model, "diffusion_model") and model.diffusion_model is not None:
+                        checkpoint["diffusion_state"] = model.diffusion_model.state_dict()
+
+                    save_name = f"{args.description}_{domain}_epoch_{epoch}.pth"
+                    save_path = os.path.join(save_dir, save_name)
+                    torch.save(checkpoint, save_path)
+                    print(f"[Checkpoint] Saved checkpoint at epoch {epoch} for domain '{domain}' to: {save_path}")
+
             # reset recorders for next epoch
             comp_time, comm_time = 0, 0
             for domain in domain_names:
@@ -557,9 +591,6 @@ def run(num_domains):
     # - Backbone (feature extractor + classifier head) weights are preserved per domain
     # - Diffusion model (denoiser + diffusion process + FeatureNormalization buffers) are preserved per domain
     # - Domain-specific FeatureNormalization statistics (mean/std/shift/scale) are not lost
-    save_dir = args.savePath if args.savePath is not None else "./checkpoints"
-    os.makedirs(save_dir, exist_ok=True)
-
     for domain in domain_names:
         model = models_dict[domain]
         checkpoint = {
@@ -628,6 +659,8 @@ if __name__ == "__main__":
     parser.add_argument('--leave_out', type=str, default=None, help='leave out domain for PACS dataset (art_painting, cartoon, photo, sketch)')
     parser.add_argument('--p', '-p', action='store_true', help='partition the dataset or not')
     parser.add_argument('--savePath' ,type=str, help='save path')
+    parser.add_argument('--save_every_epoch', type=int, default=50,
+                        help='save checkpoints every N epochs during training (0 to disable)')
     
     parser.add_argument('--compress', action='store_true', help='use chocoSGD or not')    
     parser.add_argument('--consensus_lr', default=0.1, type=float, help='consensus_lr')
@@ -679,7 +712,7 @@ if __name__ == "__main__":
         print('No experiment description, exit!')
         exit()
 
-    # Validate PACS requirements
+    # Validate dataset requirements
     if args.dataset == 'pacs':
         if not args.leave_out:
             print('Error: --leave_out must be specified when using PACS dataset.')
@@ -691,6 +724,20 @@ if __name__ == "__main__":
             print(f'Valid options: {valid_domains}')
             exit(1)
         # For PACS, we have 3 training domains
+        num_domains = 3
+    elif args.dataset == 'vlcs':
+        if not args.leave_out:
+            print('Error: --leave_out must be specified when using VLCS dataset.')
+            print('Valid options: caltech, labelme, pascal, sun')
+            exit(1)
+        valid_domains = ['caltech', 'labelme', 'pascal', 'sun']
+        leave_out = str(args.leave_out).lower()
+        if leave_out not in valid_domains:
+            print(f'Error: Invalid leave_out domain: {args.leave_out}')
+            print(f'Valid options: {valid_domains}')
+            exit(1)
+        args.leave_out = leave_out
+        # For VLCS, we have 3 training domains
         num_domains = 3
     else:
         # For other datasets, single domain
