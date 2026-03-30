@@ -324,8 +324,14 @@ def run(rank, size):
         # Compute diffusion loss if OOD detection is enabled
         loss_diff = None
         if getattr(args, 'use_ood', False) and diffusion_model is not None:
-            # Extract intermediate features for diffusion model
-            latents = model.intermediate_forward(data)
+            # Extra forward for diffusion: eval + no_grad so BN running stats are not
+            # updated twice per step (classification forward already updated them).
+            was_training = model.training
+            model.eval()
+            with torch.no_grad():
+                latents = model.intermediate_forward(data)
+            if was_training:
+                model.train()
             
             # Normalize features and compute diffusion loss
             # Detach latents to avoid affecting backbone gradients

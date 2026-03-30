@@ -3,7 +3,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torchvision import datasets, transforms
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -12,6 +12,47 @@ from sklearn.metrics import roc_auc_score, roc_curve
 import util
 from pacs_dataset import PACSDataset
 from dood.utils.diffusion import get_diffusion_model, get_diffusion_scores
+
+PACS_ALL_DOMAINS = ['art_painting', 'cartoon', 'photo', 'sketch']
+
+
+def _infer_train_domains_from_checkpoints(checkpoint_dir: str, description: str, candidate_domains):
+    """
+    Infer which train domains were actually trained by checking which *_final.pth exist.
+    Expected filename: {description}_{train_domain}_final.pth
+    """
+    train_domains = []
+    for d in candidate_domains:
+        ckpt = os.path.join(checkpoint_dir, f'{description}_{d}_final.pth')
+        if os.path.exists(ckpt):
+            train_domains.append(d)
+    return train_domains
+
+
+def _infer_leave_out_from_any_checkpoint(checkpoint_dir: str, description: str, candidate_domains, device):
+    """
+    Try to infer leave_out domain from checkpoint metadata.
+    We look for:
+      - checkpoint['leave_out']
+      - checkpoint['args'].leave_out
+    """
+    for d in candidate_domains:
+        ckpt = os.path.join(checkpoint_dir, f'{description}_{d}_final.pth')
+        if not os.path.exists(ckpt):
+            continue
+        try:
+            checkpoint = torch.load(ckpt, map_location=device, weights_only=False)
+        except Exception:
+            continue
+        leave_out = checkpoint.get('leave_out', None)
+        if leave_out:
+            return leave_out
+        ckpt_args = checkpoint.get('args', None)
+        if ckpt_args is not None and hasattr(ckpt_args, 'leave_out'):
+            val = getattr(ckpt_args, 'leave_out')
+            if val:
+                return val
+    return None
 
 
 def parse_args():
@@ -49,14 +90,42 @@ def parse_args():
     # 其他
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda/cpu)')
     parser.add_argument('--output_dir', type=str, default='./results', help='Directory to save results')
+    parser.add_argument(
+        '--leave_out',
+        type=str,
+        default=None,
+        help='Optional leave-out domain name (e.g., cartoon). If not set, try to infer from checkpoints.',
+    )
     
-    # 噪声OOD评估相关
-    parser.add_argument('--use_noise_ood', action='store_true', 
-                       help='Use noise as OOD dataset for evaluation')
+    # 額外 OOD 評估（ID = 該 train_domain 的 PACS test；OOD = noise 或 SVHN）
+    parser.add_argument(
+        '--external_ood',
+        type=str,
+        default='none',
+        choices=['none', 'noise', 'svhn', 'textures'],
+        help="Extra OOD vs train-domain ID: 'noise'/'svhn'/'textures' (default: none)",
+    )
+    parser.add_argument('--use_noise_ood', action='store_true',
+                       help='Deprecated: same as --external_ood noise')
     parser.add_argument('--noise_samples', type=int, default=10000, 
-                       help='Number of noise samples to generate for OOD evaluation')
-    
-    return parser.parse_args()
+                       help='Number of noise samples when external_ood=noise')
+    parser.add_argument(
+        '--svhn_root',
+        type=str,
+        default=None,
+        help='Folder containing test_32x32.mat for SVHN (default: <datasets>/SVHN next to PACS root)',
+    )
+    parser.add_argument(
+        '--textures_root',
+        type=str,
+        default=None,
+        help="Root for DTD textures. Can be <datasets>/dtd or <datasets>/dtd/images (default: <datasets>/dtd next to PACS root)",
+    )
+
+    args = parser.parse_args()
+    if args.use_noise_ood:
+        args.external_ood = 'noise'
+    return args
 
 
 def compute_auroc(id_scores, ood_scores):
@@ -310,6 +379,110 @@ def get_noise_loader(num_samples, batch_size, num_workers, image_size=(224, 224)
     return loader
 
 
+def resolve_svhn_mat_root(dataset_root, svhn_root_explicit):
+    """Directory that contains test_32x32.mat for torchvision.datasets.SVHN."""
+    if svhn_root_explicit:
+        root = os.path.abspath(svhn_root_explicit)
+        if not os.path.isfile(os.path.join(root, 'test_32x32.mat')):
+            raise FileNotFoundError(
+                f'SVHN test_32x32.mat not found under --svhn_root={root}'
+            )
+        return root
+    root = dataset_root
+    if root.endswith('/PACS') or root.endswith('\\PACS'):
+        root = os.path.dirname(root)
+    for c in (os.path.join(root, 'SVHN'), root):
+        if os.path.isfile(os.path.join(c, 'test_32x32.mat')):
+            return c
+    raise FileNotFoundError(
+        'SVHN test_32x32.mat not found. Expected e.g. <datasets>/SVHN/test_32x32.mat '
+        'or set --svhn_root to the folder containing test_32x32.mat'
+    )
+
+
+def load_svhn_ood_loader(dataset_root, svhn_root_explicit, batch_size, num_workers):
+    """SVHN test；與 PACS ID 相同之 224×224 + ImageNet normalize。"""
+    mat_root = resolve_svhn_mat_root(dataset_root, svhn_root_explicit)
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    test_mat = os.path.join(mat_root, 'test_32x32.mat')
+    svhn_ds = datasets.SVHN(
+        root=mat_root,
+        split='test',
+        download=not os.path.isfile(test_mat),
+        transform=transform,
+    )
+    loader = DataLoader(
+        svhn_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    print(
+        f'  Loaded SVHN (test) from {mat_root}: {len(svhn_ds)} samples '
+        f'(224×224, ImageNet norm, same as PACS ID)'
+    )
+    return loader, len(svhn_ds)
+
+
+def resolve_textures_root(dataset_root, textures_root_explicit):
+    """
+    Resolve DTD textures path.
+    Accepts either:
+      - <datasets>/dtd (contains images/, labels/, imdb/)
+      - <datasets>/dtd/images (ImageFolder root)
+    """
+    if textures_root_explicit:
+        root = os.path.abspath(textures_root_explicit)
+        if os.path.isdir(root) and os.path.isdir(os.path.join(root, 'images')):
+            return os.path.join(root, 'images')
+        if os.path.isdir(root) and os.path.isdir(os.path.join(root, '..')):  # allow direct images/ root
+            # If user passed .../dtd/images, keep as-is.
+            if os.path.basename(root) == 'images':
+                return root
+        raise FileNotFoundError(
+            f'DTD textures not found under --textures_root={root}. Expected a folder containing images/ or the images/ folder itself.'
+        )
+
+    root = dataset_root
+    if root.endswith('/PACS') or root.endswith('\\PACS'):
+        root = os.path.dirname(root)
+
+    dtd_dir = os.path.join(root, 'dtd')
+    images_dir = os.path.join(dtd_dir, 'images')
+    if os.path.isdir(images_dir):
+        return images_dir
+
+    raise FileNotFoundError(
+        'DTD textures not found. Expected e.g. <datasets>/dtd/images (you already downloaded DTD as dtd-r1.0.1). '
+        'Set --textures_root to <datasets>/dtd or <datasets>/dtd/images.'
+    )
+
+
+def load_textures_ood_loader(dataset_root, textures_root_explicit, batch_size, num_workers):
+    """DTD(Textures)；用 ImageFolder 讀取 dtd/images/*，並套用與 PACS 相同前處理。"""
+    images_root = resolve_textures_root(dataset_root, textures_root_explicit)
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    dtd_ds = datasets.ImageFolder(root=images_root, transform=transform)
+    loader = DataLoader(
+        dtd_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    print(f'  Loaded DTD textures from {images_root}: {len(dtd_ds)} samples (224×224, ImageNet norm)')
+    return loader, len(dtd_ds)
+
+
 def load_pacs_test_data(dataset_root, domain_name, batch_size, num_workers):
     """加载PACS指定domain的测试数据"""
     # Test transforms (与util.py中的一致)
@@ -381,8 +554,29 @@ def evaluate_domain_ood_scores(args):
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
-    # PACS的3个domain
-    domains = ['art_painting', 'photo', 'sketch']
+    # Domains:
+    # - For PACS, infer train domains from checkpoint filenames under checkpoint_dir,
+    #   but evaluate test domains over the full PACS set (including leave-out).
+    if args.dataset == 'pacs':
+        test_domains = list(PACS_ALL_DOMAINS)
+        train_domains = _infer_train_domains_from_checkpoints(
+            args.checkpoint_dir, args.description, PACS_ALL_DOMAINS
+        )
+        inferred_leave_out = args.leave_out or _infer_leave_out_from_any_checkpoint(
+            args.checkpoint_dir, args.description, PACS_ALL_DOMAINS, device
+        )
+        if not train_domains:
+            if inferred_leave_out in PACS_ALL_DOMAINS:
+                train_domains = [d for d in PACS_ALL_DOMAINS if d != inferred_leave_out]
+            else:
+                train_domains = list(PACS_ALL_DOMAINS)
+        if inferred_leave_out:
+            print(f'  Inferred leave_out: {inferred_leave_out}')
+        print(f'  Train domains (from checkpoints): {train_domains}')
+        print(f'  Test domains: {test_domains}')
+    else:
+        train_domains = ['default']
+        test_domains = ['default']
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
@@ -408,7 +602,7 @@ def evaluate_domain_ood_scores(args):
     else:
         # 如果沒有明確指定，嘗試從 checkpoint 讀取
         first_checkpoint_path = None
-        for train_domain in domains:
+        for train_domain in train_domains:
             checkpoint_filename = f'{args.description}_{train_domain}_final.pth'
             checkpoint_path = os.path.join(args.checkpoint_dir, checkpoint_filename)
             if not os.path.isabs(args.checkpoint_dir):
@@ -440,7 +634,7 @@ def evaluate_domain_ood_scores(args):
     ).to(device)
     
     # 9次测试循环：每个train_domain × 每个test_domain
-    for train_domain in domains:
+    for train_domain in train_domains:
         print(f'\n{"="*80}')
         print(f'Train Domain: {train_domain}')
         print(f'{"="*80}')
@@ -470,11 +664,13 @@ def evaluate_domain_ood_scores(args):
         checkpoint_domain = checkpoint.get('domain', train_domain)
         print(f'Loaded checkpoint for domain: {checkpoint_domain}')
         
-        # 如果启用噪声OOD评估，先计算ID和噪声OOD分数
-        if args.use_noise_ood:
-            print(f'\n  Evaluating Noise OOD Detection for train_domain={train_domain}')
-            
-            # 加载ID数据（使用train_domain的测试数据）
+        # 額外 OOD（noise / SVHN / textures）：ID = 該 train_domain 的 PACS test
+        if args.external_ood in ('noise', 'svhn', 'textures'):
+            print(
+                f'\n  Evaluating {args.external_ood.upper()} OOD vs ID '
+                f'(train_domain={train_domain})'
+            )
+
             id_loader, id_num_samples = load_pacs_test_data(
                 args.datasetRoot,
                 train_domain,
@@ -482,9 +678,8 @@ def evaluate_domain_ood_scores(args):
                 args.num_workers
             )
             print(f'  Loaded {id_num_samples} ID samples from {train_domain}')
-            
-            # 计算ID分数
-            print(f'  Computing ID scores...')
+
+            print('  Computing ID scores...')
             id_scores = compute_ood_scores(
                 backbone,
                 diffusion_model,
@@ -493,66 +688,88 @@ def evaluate_domain_ood_scores(args):
                 args.ood_eval_scores_type,
                 device
             )
-            
-            # 加载噪声OOD数据
-            print(f'  Loading {args.noise_samples} noise samples as OOD...')
-            noise_loader = get_noise_loader(
-                args.noise_samples,
-                args.batch_size,
-                args.num_workers,
-                image_size=(224, 224)
-            )
-            
-            # 计算噪声OOD分数
-            print(f'  Computing noise OOD scores...')
-            noise_ood_scores = compute_ood_scores(
+
+            if args.external_ood == 'noise':
+                print(f'  Loading {args.noise_samples} noise samples as OOD...')
+                ood_loader = get_noise_loader(
+                    args.noise_samples,
+                    args.batch_size,
+                    args.num_workers,
+                    image_size=(224, 224)
+                )
+                ood_name = 'noise'
+                ood_num_samples = args.noise_samples
+                ood_label, id_extra_label = 'Noise_OOD', 'ID_for_noise_ood'
+            elif args.external_ood == 'svhn':
+                ood_loader, ood_num_samples = load_svhn_ood_loader(
+                    args.datasetRoot,
+                    args.svhn_root,
+                    args.batch_size,
+                    args.num_workers,
+                )
+                ood_name = 'svhn'
+                ood_label, id_extra_label = 'SVHN_OOD', 'ID_for_svhn_ood'
+            else:
+                ood_loader, ood_num_samples = load_textures_ood_loader(
+                    args.datasetRoot,
+                    args.textures_root,
+                    args.batch_size,
+                    args.num_workers,
+                )
+                ood_name = 'textures'
+                ood_label, id_extra_label = 'Textures_OOD', 'ID_for_textures_ood'
+
+            print(f'  Computing {ood_name} OOD scores...')
+            ext_ood_scores = compute_ood_scores(
                 backbone,
                 diffusion_model,
-                noise_loader,
+                ood_loader,
                 diffusion_steps,
                 args.ood_eval_scores_type,
                 device
             )
-            
-            # 计算AUROC和FPR95
-            print(f'  Computing metrics...')
-            
-            # 如果ID分数更高，需要反转（确保OOD分数更高）
-            if np.mean(id_scores) > np.mean(noise_ood_scores):
-                print('  Warning: ID scores are higher than noise OOD scores. Inverting scores.')
+
+            print('  Computing metrics...')
+            if np.mean(id_scores) > np.mean(ext_ood_scores):
+                print(
+                    f'  Warning: ID scores are higher than {ood_name} OOD scores. Inverting scores.'
+                )
                 id_scores_for_metric = -id_scores
-                noise_ood_scores_for_metric = -noise_ood_scores
+                ext_ood_for_metric = -ext_ood_scores
             else:
                 id_scores_for_metric = id_scores
-                noise_ood_scores_for_metric = noise_ood_scores
-            
-            auroc = compute_auroc(id_scores_for_metric, noise_ood_scores_for_metric)
-            fpr95 = compute_fpr_at_tpr(id_scores_for_metric, noise_ood_scores_for_metric, tpr=0.95)
-            
-            print(f'\n  Noise OOD Detection Results:')
-            print(f'    ID scores: mean={np.mean(id_scores):.4f}, std={np.std(id_scores):.4f}')
-            print(f'    Noise OOD scores: mean={np.mean(noise_ood_scores):.4f}, std={np.std(noise_ood_scores):.4f}')
+                ext_ood_for_metric = ext_ood_scores
+
+            auroc = compute_auroc(id_scores_for_metric, ext_ood_for_metric)
+            fpr95 = compute_fpr_at_tpr(id_scores_for_metric, ext_ood_for_metric, tpr=0.95)
+
+            print(f'\n  {args.external_ood.upper()} OOD Detection Results:')
+            print(
+                f'    ID scores: mean={np.mean(id_scores):.4f}, std={np.std(id_scores):.4f}'
+            )
+            print(
+                f'    OOD scores: mean={np.mean(ext_ood_scores):.4f}, '
+                f'std={np.std(ext_ood_scores):.4f}'
+            )
             print(f'    AUROC: {auroc:.4f}')
             print(f'    FPR@95%TPR: {fpr95:.4f}')
-            
-            # 保存噪声OOD评估结果
+
             results.append({
                 'train_domain': train_domain,
-                'test_domain': 'noise',
-                'scores': noise_ood_scores,
-                'mean_score': np.mean(noise_ood_scores),
-                'std_score': np.std(noise_ood_scores),
-                'min_score': np.min(noise_ood_scores),
-                'max_score': np.max(noise_ood_scores),
-                'num_samples': args.noise_samples,
+                'test_domain': ood_name,
+                'scores': ext_ood_scores,
+                'mean_score': np.mean(ext_ood_scores),
+                'std_score': np.std(ext_ood_scores),
+                'min_score': np.min(ext_ood_scores),
+                'max_score': np.max(ext_ood_scores),
+                'num_samples': ood_num_samples,
                 'score_type': args.ood_eval_scores_type,
                 'is_id': False,
-                'label': 'Noise_OOD',
+                'label': ood_label,
                 'auroc': auroc,
                 'fpr95': fpr95
             })
-            
-            # 也保存ID结果（用于噪声OOD评估的ID部分）
+
             results.append({
                 'train_domain': train_domain,
                 'test_domain': train_domain,
@@ -564,13 +781,13 @@ def evaluate_domain_ood_scores(args):
                 'num_samples': id_num_samples,
                 'score_type': args.ood_eval_scores_type,
                 'is_id': True,
-                'label': 'ID_for_noise_ood',
-                'auroc': auroc,  # 同一个评估的AUROC
-                'fpr95': fpr95  # 同一个评估的FPR95
+                'label': id_extra_label,
+                'auroc': auroc,
+                'fpr95': fpr95
             })
         
         # 对每个test_domain进行测试
-        for test_domain in domains:
+        for test_domain in test_domains:
             print(f'\n  Test Domain: {test_domain}')
             
             # 加载测试数据
@@ -622,10 +839,9 @@ def evaluate_domain_ood_scores(args):
                 'is_id': is_id,
                 'label': label
             }
-            # 如果不是噪声OOD评估，AUROC和FPR95为None
-            if not args.use_noise_ood or test_domain != 'noise':
-                result_dict['auroc'] = None
-                result_dict['fpr95'] = None
+            # PACS domain 交叉結果本身不帶 AUROC/FPR（僅 external_ood 區塊另存）
+            result_dict['auroc'] = None
+            result_dict['fpr95'] = None
             results.append(result_dict)
     
     # 保存结果到CSV（不包含scores数组，只保存统计量）
@@ -663,7 +879,7 @@ def evaluate_domain_ood_scores(args):
     
     # 打印结果表格
     print('\nResults Summary:')
-    if args.use_noise_ood:
+    if args.external_ood != 'none':
         print('-' * 150)
         print(f'{"Train Domain":<20} {"Test Domain":<20} {"Mean Score":<15} {"Std":<15} {"Min":<15} {"Max":<15} {"Label":<15} {"AUROC":<10} {"FPR95":<10}')
         print('-' * 150)
@@ -685,7 +901,7 @@ def evaluate_domain_ood_scores(args):
                   f'{result["mean_score"]:<15.6f} {result["std_score"]:<15.6f} '
                   f'{result["min_score"]:<15.6f} {result["max_score"]:<15.6f} {result["label"]:<10}')
     
-    print('-' * (150 if args.use_noise_ood else 120))
+    print('-' * (150 if args.external_ood != 'none' else 120))
     
     return results
 

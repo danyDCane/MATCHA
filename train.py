@@ -346,12 +346,30 @@ def run(num_domains):
                 diffusion_model = diffusion_models_dict[domain]
                 optimizer_diffusion = optimizers_diffusion_dict[domain]
                 
-                # Extract intermediate features for diffusion model
-                latents = model.intermediate_forward(data)
+                # Extract intermediate features for diffusion model.
+                # Run this extra forward in eval + no_grad so BatchNorm running stats are NOT
+                # updated a second time (the classification forward above already updated them).
+                was_training = model.training
+                # IMPORTANT: only switch the backbone to eval() for feature extraction,
+                # so BN uses running stats (matching test-time backbone.eval()), while keeping
+                # diffusion_model in train() to keep FeatureNormalization buffers updating.
+                backbone = getattr(model, "backbone", None)
+                if backbone is not None:
+                    backbone.eval()
+                else:
+                    model.eval()
+                with torch.no_grad():
+                    latents = model.intermediate_forward(data)
+                if was_training:
+                    if backbone is not None:
+                        backbone.train()
+                    else:
+                        model.train()
                 
                 # Normalize features and compute diffusion loss
                 # Detach latents to avoid affecting backbone gradients
                 latents_for_diff = latents.detach().requires_grad_(True)
+                diffusion_model.train()
                 latents_normalized = diffusion_model.normalize(latents_for_diff)
                 
                 loss_diff = diffusion_model.get_loss_iter(latents_normalized)

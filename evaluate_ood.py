@@ -152,11 +152,19 @@ def get_svhn_loader(data_root, batch_size, num_workers):
         transforms.ToTensor(),
         transforms.Normalize((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970)),
     ])
-    
+    # torchvision.SVHN 要求 test_32x32.mat 位於 root 目錄下（非子資料夾再一層）。
+    # 常見配置為 data_root/SVHN/test_32x32.mat，需把 root 指到該資料夾。
+    svhn_root = data_root
+    nested = os.path.join(data_root, 'SVHN')
+    if os.path.isfile(os.path.join(nested, 'test_32x32.mat')):
+        svhn_root = nested
+    test_mat = os.path.join(svhn_root, 'test_32x32.mat')
+    need_download = not os.path.isfile(test_mat)
+
     dataset = datasets.SVHN(
-        root=data_root,
+        root=svhn_root,
         split='test',
-        download=True,
+        download=need_download,
         transform=transform
     )
     
@@ -167,7 +175,8 @@ def get_svhn_loader(data_root, batch_size, num_workers):
         num_workers=num_workers,
         pin_memory=True
     )
-    
+
+    print(f'Loaded SVHN (test) from {svhn_root} with {len(dataset)} images')
     return loader
 
 
@@ -213,7 +222,7 @@ def get_ood_loader(args):
     """根据参数获取OOD数据集loader"""
     if args.ood_dataset == 'cifar100':
         return get_cifar100_loader(args.data_root, args.batch_size, args.num_workers)
-    elif args.ood_dataset == 'svhn':
+    elif args.ood_dataset == 'SVHN':
         return get_svhn_loader(args.data_root, args.batch_size, args.num_workers)
     elif args.ood_dataset == 'LSUN':
         return get_lsun_loader(args.data_root, args.batch_size, args.num_workers)
