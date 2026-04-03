@@ -241,6 +241,18 @@ def run(num_domains):
     recorders = {domain: util.Recorder(args, domain_names.index(domain)) for domain in domain_names}
     losses_dict = {domain: util.AverageMeter() for domain in domain_names}
     top1_dict = {domain: util.AverageMeter() for domain in domain_names}
+    style_aug_flag_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Meters for z_style / z_hard training (enabled by --use_hard_style_adv)
+    task_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
+    style_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
+    adv_ood_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
+    adv_cls_inner_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Monitor statistics and gradients for mu/sigma in inner loop
+    mu_orig_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    sigma_orig_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_mu_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_sigma_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
     loss_diff_meters = {domain: util.AverageMeter() for domain in domain_names} if getattr(args, 'use_ood', False) else None
     tic = time.time()
 
@@ -327,19 +339,198 @@ def run(num_domains):
                 data, target = next(train_iters[domain])
                 data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
             
-            # Forward pass with style shift if enabled
-            # Note: communicator.neighbor_style_stats uses domain names as keys in single process mode
-            if (use_style_stats or use_style_shift) and args.model == "res":
-                # Switch communicator view to current domain only
+            # Forward + loss
+            # Note: communicator.neighbor_style_stats uses domain names as keys in single process mode.
+            use_hard_style_adv = getattr(args, "use_hard_style_adv", False)
+            adv_only_when_style_aug = not bool(getattr(args, "hard_adv_always", False))
+            adv_steps = int(getattr(args, "hard_adv_steps", 1))
+            adv_eta = float(getattr(args, "hard_adv_eta", 0.01))
+            adv_lambda = float(getattr(args, "hard_adv_lambda", 1.0))
+            adv_eps = float(getattr(args, "hard_adv_eps", 1e-6))
+            adv_ood_timestep = int(getattr(args, "hard_adv_ood_timestep", 250))
+
+            if use_hard_style_adv:
+                # Require diffusion model for OOD guidance.
+                if not (getattr(args, 'use_ood', False) and domain in diffusion_models_dict):
+                    raise RuntimeError("--use_hard_style_adv requires --use_ood and an initialized diffusion model.")
+                diffusion_model = diffusion_models_dict[domain]
+
+                if args.model != "res":
+                    raise RuntimeError("--use_hard_style_adv currently supports only --model res.")
+
+                if not hasattr(model, "forward_to_layer3_style") or not hasattr(model, "forward_from_layer3"):
+                    raise RuntimeError("Model must implement forward_to_layer3_style/forward_from_layer3 for hard style adv.")
+                # This method assumes a ResNet with layer4 producing a 512-d pooled vector (standard ResNet wrapper).
+                expected_ft = int(getattr(diffusion_model.denoiser, "in_channels", 512))
+                if not hasattr(model, "backbone") or not hasattr(getattr(model, "backbone"), "layer4"):
+                    raise RuntimeError(
+                        "--use_hard_style_adv requires a backbone with layer4 (set --resnet_type standard)."
+                    )
+
+                # Switch communicator view to current domain only (for style shift).
                 communicator.set_active_domain(domain)
-                # Style statistics are computed in the first phase, so we don't need return_blocks here
-                # Only need communicator for style shift application
-                output = model(data, return_blocks=False, communicator=communicator,
-                              debug_style_shift=debug_style_shift, iter_num=k+1, rank=domain_names.index(domain))
+
+                # 1) Get z_style at layer3 (may or may not be style-augmented).
+                z_style = model.forward_to_layer3_style(
+                    data,
+                    communicator=communicator if (use_style_stats or use_style_shift) else None,
+                    debug_style_shift=debug_style_shift,
+                    iter_num=k+1,
+                    rank=domain_names.index(domain),
+                )
+
+                # Conservative batch-level flag.
+                style_aug_activated = bool(getattr(model, "last_style_aug_activated", False))
+                style_aug_flag_meters[domain].update(1.0 if style_aug_activated else 0.0, data.size(0))
+
+                # 2) Optionally skip inner loop if no style aug happened.
+                run_adv = (not adv_only_when_style_aug) or style_aug_activated
+
+                logits_style, vec_style = model.forward_from_layer3(z_style)
+                if vec_style.ndim != 2 or vec_style.size(1) != expected_ft:
+                    raise RuntimeError(
+                        f"Diffusion expects ft_size={expected_ft}, but got vec_style shape={tuple(vec_style.shape)}. "
+                        "Ensure you are using --resnet_type standard and ft_size matches the pooled feature dim."
+                    )
+
+                # Inner loop: generate z_hard (one or few steps), only updating mu/sigma.
+                if run_adv:
+                    with torch.no_grad():
+                        mu_orig = z_style.detach().mean(dim=(2, 3), keepdim=True)
+                        var_orig = z_style.detach().var(dim=(2, 3), unbiased=False, keepdim=True)
+                        sigma_orig = torch.sqrt(var_orig + adv_eps)
+                        # 監控 mu_orig / sigma_orig 的 L2 範數（batch-level）
+                        mu_orig_norm = mu_orig.norm().item()
+                        sigma_orig_norm = sigma_orig.norm().item()
+                        mu_orig_norm_meters[domain].update(mu_orig_norm, data.size(0))
+                        sigma_orig_norm_meters[domain].update(sigma_orig_norm, data.size(0))
+
+                    # z_hat uses detached z_style (inner loop should not affect backbone).
+                    z_norm_detached = (z_style.detach() - mu_orig) / (sigma_orig + adv_eps)
+
+                    mu_adv = mu_orig.clone().requires_grad_(True)
+                    sigma_adv = sigma_orig.clone().requires_grad_(True)
+
+                    # Freeze params & stop BN/normalization updates during inner loop.
+                    backbone = getattr(model, "backbone", None)
+                    prev_backbone_training = None
+                    if backbone is not None:
+                        prev_backbone_training = backbone.training
+                        backbone.eval()
+                    prev_model_training = model.training
+                    model.eval()
+                    prev_diff_training = diffusion_model.training
+                    diffusion_model.eval()
+
+                    # Freeze parameter grads (we only need grads for mu_adv/sigma_adv).
+                    for p in model.parameters():
+                        p.requires_grad_(False)
+                    for p in diffusion_model.parameters():
+                        p.requires_grad_(False)
+
+                    # Multi-step (default 1)
+                    mu_cur, sigma_cur = mu_adv, sigma_adv
+                    for _ in range(max(1, adv_steps)):
+                        z_hat = z_norm_detached * sigma_cur + mu_cur
+                        logits_hat, vec_hat = model.forward_from_layer3(z_hat)
+                        if vec_hat.ndim != 2 or vec_hat.size(1) != expected_ft:
+                            raise RuntimeError(
+                                f"Expected vec_hat shape (B,{expected_ft}), got {tuple(vec_hat.shape)}."
+                            )
+
+                        vec_hat_norm = diffusion_model.normalize(vec_hat)
+                        L_ood = diffusion_model.get_loss_at_timestep(vec_hat_norm, adv_ood_timestep)
+                        L_cls_inner = criterion(logits_hat, target)
+                        L_adv = -L_ood + adv_lambda * L_cls_inner
+
+                        grad_mu, grad_sigma = torch.autograd.grad(L_adv, [mu_cur, sigma_cur], create_graph=False)
+                        # 監控梯度範數（取最後一步為代表）
+                        grad_mu_norm = grad_mu.norm().item()
+                        grad_sigma_norm = grad_sigma.norm().item()
+                        grad_mu_norm_meters[domain].update(grad_mu_norm, data.size(0))
+                        grad_sigma_norm_meters[domain].update(grad_sigma_norm, data.size(0))
+                        mu_next = mu_cur - adv_eta * grad_mu
+                        sigma_next = (sigma_cur - adv_eta * grad_sigma).clamp_min(adv_eps)
+                        mu_cur, sigma_cur = mu_next, sigma_next
+
+                    mu_hard = mu_cur.detach()
+                    sigma_hard = sigma_cur.detach()
+                    if not torch.isfinite(mu_hard).all() or not torch.isfinite(sigma_hard).all():
+                        raise FloatingPointError("Non-finite mu_hard/sigma_hard detected during inner loop.")
+
+                    # Restore training modes and requires_grad for outer loop.
+                    if prev_backbone_training is not None:
+                        backbone.train(prev_backbone_training)
+                    model.train(prev_model_training)
+                    diffusion_model.train(prev_diff_training)
+                    for p in model.parameters():
+                        p.requires_grad_(True)
+                    for p in diffusion_model.parameters():
+                        p.requires_grad_(True)
+
+                    # Outer loop: z_hard re-composed from LIVE z_style (gradient flows to layer1/2/3).
+                    z_norm_live = (z_style - mu_orig) / (sigma_orig + adv_eps)
+                    z_hard = z_norm_live * sigma_hard + mu_hard
+                    if not torch.isfinite(z_hard).all():
+                        raise FloatingPointError("Non-finite z_hard detected before outer loop.")
+                    # z_style分支保留 train() 让 layer4 BN running stats 更新一次；
+                    # z_hard 分支暂时把 layer4 设为 eval()，避免 layer4 BN running stats 再更新一次，
+                    # 但不影响 autograd 梯度回传。
+                    backbone = getattr(model, "backbone", None)
+                    prev_layer4_training = None
+                    if backbone is not None and hasattr(backbone, "layer4"):
+                        prev_layer4_training = backbone.layer4.training
+                        backbone.layer4.eval()
+                    try:
+                        logits_hard, _vec_hard = model.forward_from_layer3(z_hard)
+                    finally:
+                        if backbone is not None and hasattr(backbone, "layer4") and prev_layer4_training is not None:
+                            backbone.layer4.train(prev_layer4_training)
+
+                    loss_style_ce = criterion(logits_style, target)
+                    loss_hard_ce = criterion(logits_hard, target)
+
+                    # 線性 warmup：從 epoch 0 到 60，z_hard 權重從 0 → 0.5
+                    # 之後維持 0.5；z_style 權重始終為 1 - w_hard。
+                    warmup_epochs = 60.0
+                    # 以當前 iteration 推出「目前是第幾個 epoch」（浮點數）
+                    current_epoch = (k + 1) / float(STEPS_PER_EPOCH) if STEPS_PER_EPOCH > 0 else 0.0
+                    hard_weight = 0.5 * min(max(current_epoch / warmup_epochs, 0.0), 1.0)
+                    style_weight = 1.0 - hard_weight
+
+                    loss = style_weight * loss_style_ce + hard_weight * loss_hard_ce
+
+                    # Record adv meters (batch-level; treat scalar as per-sample weight).
+                    task_loss_meters[domain].update(float(loss.item()), data.size(0))
+                    style_ce_meters[domain].update(float(loss_style_ce.item()), data.size(0))
+                    hard_ce_meters[domain].update(float(loss_hard_ce.item()), data.size(0))
+                    adv_ood_loss_meters[domain].update(float(L_ood.item()), data.size(0))
+                    adv_cls_inner_meters[domain].update(float(L_cls_inner.item()), data.size(0))
+                else:
+                    # No adv: just use z_style branch.
+                    loss = criterion(logits_style, target)
+                    task_loss_meters[domain].update(float(loss.item()), data.size(0))
+
+                output = logits_style
             else:
-                output = model(data)
-            
-            loss = criterion(output, target)
+                # Original training path (logits only)
+                if (use_style_stats or use_style_shift) and args.model == "res":
+                    communicator.set_active_domain(domain)
+                    output = model(
+                        data,
+                        return_blocks=False,
+                        communicator=communicator,
+                        debug_style_shift=debug_style_shift,
+                        iter_num=k+1,
+                        rank=domain_names.index(domain),
+                    )
+                else:
+                    output = model(data)
+
+                style_aug_activated = bool(getattr(model, "last_style_aug_activated", False))
+                style_aug_flag_meters[domain].update(1.0 if style_aug_activated else 0.0, data.size(0))
+
+                loss = criterion(output, target)
             
             # Compute diffusion loss if OOD detection is enabled
             if getattr(args, 'use_ood', False) and domain in diffusion_models_dict:
@@ -391,11 +582,9 @@ def run(num_domains):
             record_end = time.time()
 
             # backward pass for classification
-            loss.backward()
-
-            # gradient step
-            optimizer.step()
             optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
             # update cosine annealing scheduler (purely step-based)
             schedulers_dict[domain].step()
@@ -505,6 +694,17 @@ def run(num_domains):
                 log_dict[f"{domain}/loss"] = losses_dict[domain].avg.item() if hasattr(losses_dict[domain].avg, 'item') else float(losses_dict[domain].avg)
                 log_dict[f"{domain}/train_acc"] = top1_dict[domain].avg.item() if hasattr(top1_dict[domain].avg, 'item') else float(top1_dict[domain].avg)
                 log_dict[f"{domain}/test_acc"] = test_accs[domain].item() if hasattr(test_accs[domain], 'item') else float(test_accs[domain])
+                log_dict[f"{domain}/style_aug_activated_rate"] = float(style_aug_flag_meters[domain].avg)
+                # Hard-style-adv metrics (only meaningful when --use_hard_style_adv)
+                log_dict[f"{domain}/task_loss"] = float(task_loss_meters[domain].avg)
+                log_dict[f"{domain}/style_ce"] = float(style_ce_meters[domain].avg)
+                log_dict[f"{domain}/hard_ce"] = float(hard_ce_meters[domain].avg)
+                log_dict[f"{domain}/adv_ood_loss"] = float(adv_ood_loss_meters[domain].avg)
+                log_dict[f"{domain}/adv_cls_inner"] = float(adv_cls_inner_meters[domain].avg)
+                log_dict[f"{domain}/mu_orig_norm"] = float(mu_orig_norm_meters[domain].avg)
+                log_dict[f"{domain}/sigma_orig_norm"] = float(sigma_orig_norm_meters[domain].avg)
+                log_dict[f"{domain}/grad_mu_norm"] = float(grad_mu_norm_meters[domain].avg)
+                log_dict[f"{domain}/grad_sigma_norm"] = float(grad_sigma_norm_meters[domain].avg)
             
             # Add diffusion loss if OOD detection is enabled
             if getattr(args, 'use_ood', False) and loss_diff_meters is not None:
@@ -600,6 +800,16 @@ def run(num_domains):
             for domain in domain_names:
                 losses_dict[domain].reset()
                 top1_dict[domain].reset()
+                style_aug_flag_meters[domain].reset()
+                task_loss_meters[domain].reset()
+                style_ce_meters[domain].reset()
+                hard_ce_meters[domain].reset()
+                adv_ood_loss_meters[domain].reset()
+                adv_cls_inner_meters[domain].reset()
+                mu_orig_norm_meters[domain].reset()
+                sigma_orig_norm_meters[domain].reset()
+                grad_mu_norm_meters[domain].reset()
+                grad_sigma_norm_meters[domain].reset()
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].reset()
             tic = time.time()
@@ -705,6 +915,22 @@ if __name__ == "__main__":
                         help='ratio of samples in batch to be explored (default: 0.5)')
     parser.add_argument('--pretrained', action='store_true',
                         help='use pretrained ImageNet weights for ResNet (default: False). Only works with resnet_type=standard')
+
+    # ===== Hard-style adversarial feature augmentation (z_style -> z_hard) =====
+    parser.add_argument('--use_hard_style_adv', action='store_true',
+                        help='enable inner-loop mu/sigma adversarial update at layer3 to generate z_hard (requires --use_ood and resnet_type=standard)')
+    parser.add_argument('--hard_adv_always', action='store_true',
+                        help='run inner loop for every batch (default: off; when off, run only if style modules activated)')
+    parser.add_argument('--hard_adv_steps', type=int, default=1,
+                        help='number of inner-loop gradient steps (default: 1)')
+    parser.add_argument('--hard_adv_eta', type=float, default=0.01,
+                        help='inner-loop step size eta for mu/sigma update (default: 0.01)')
+    parser.add_argument('--hard_adv_lambda', type=float, default=1.0,
+                        help='weight for inner-loop classification term lambda (default: 1.0)')
+    parser.add_argument('--hard_adv_eps', type=float, default=1e-6,
+                        help='epsilon for numerical stability and sigma clamp_min (default: 1e-6)')
+    parser.add_argument('--hard_adv_ood_timestep', type=int, default=250,
+                        help='fixed diffusion timestep t for L_ood in inner loop (0 .. num_timesteps-1; default: 250)')
 
     # ===== OOD Detection (Diffusion) options =====
     parser.add_argument('--use_ood', action='store_true',

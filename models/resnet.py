@@ -151,6 +151,64 @@ class ResNet(nn.Module):
         }
         return features
 
+    def forward_to_layer3_style(self, x, communicator=None, debug_style_shift=False, iter_num=-1, rank=-1):
+        """
+        Forward input up to (and including) layer3, applying style modules if enabled.
+
+        Returns:
+            z_style: layer3 feature map [B, C, H, W]
+        """
+        # Flag for "any layer activated style augmentation" in this forward.
+        self.last_style_aug_activated = False
+
+        out = F.relu(self.bn1(self.conv1(x)))
+
+        out1 = self.layer1(out)
+        if self.use_style_shift and communicator is not None:
+            if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
+                out1 = self.style_shift1(out1, "layer1", communicator, self.training,
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out1 = self.style_explore1(out1, "layer1", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out1 = self.mixstyle1(out1, "layer1", self.training,
+                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+
+        out2 = self.layer2(out1)
+        if self.use_style_shift and communicator is not None:
+            if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
+                out2 = self.style_shift2(out2, "layer2", communicator, self.training,
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out2 = self.style_explore2(out2, "layer2", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out2 = self.mixstyle2(out2, "layer2", self.training,
+                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+
+        out3 = self.layer3(out2)
+        if self.use_style_shift and communicator is not None:
+            if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
+                out3 = self.style_shift3(out3, "layer3", communicator, self.training,
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out3 = self.style_explore3(out3, "layer3", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out3 = self.mixstyle3(out3, "layer3", self.training,
+                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+
+        return out3
+
+    def forward_from_layer3(self, z3):
+        """
+        Compute logits from a layer3 feature map (simplified ResNet has no layer4).
+        Returns:
+            logits: [B, num_classes]
+            vec: pooled feature vector [B, C]
+        """
+        vec = F.adaptive_avg_pool2d(z3, 1).flatten(1)
+        logits = self.linear(vec)
+        return logits, vec
+
     def forward(self, x, return_blocks: bool = False, communicator=None, debug_style_shift=False, iter_num=-1, rank=-1):
         """
         Forward pass.
@@ -173,12 +231,17 @@ class ResNet(nn.Module):
                 features: dict with keys 'layer1', 'layer2', 'layer3',
                           each of shape [B, C, H, W].
         """
+        # Flag for "any layer activated style augmentation" in this forward.
+        # If True, you can conservatively treat the whole batch as possibly style-shifted.
+        self.last_style_aug_activated = False
+
         out = F.relu(self.bn1(self.conv1(x)))
 
         # First three convolutional blocks with optional style shift
         out1 = self.layer1(out)
         if self.use_style_shift and communicator is not None:
             if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
                 out1 = self.style_shift1(out1, "layer1", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
@@ -191,6 +254,7 @@ class ResNet(nn.Module):
         out2 = self.layer2(out1)
         if self.use_style_shift and communicator is not None:
             if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
                 out2 = self.style_shift2(out2, "layer2", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
@@ -203,6 +267,7 @@ class ResNet(nn.Module):
         out3 = self.layer3(out2)
         if self.use_style_shift and communicator is not None:
             if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
                 out3 = self.style_shift3(out3, "layer3", communicator, self.training,
                                         verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
@@ -345,6 +410,69 @@ class StandardResNetWrapper(nn.Module):
             "layer3": out3,
         }
         return features
+
+    def forward_to_layer3_style(self, x, communicator=None, debug_style_shift=False, iter_num=-1, rank=-1):
+        """
+        Forward input up to (and including) layer3, applying style modules if enabled.
+
+        Returns:
+            z_style: layer3 feature map [B, C, H, W]
+        """
+        # Flag for "any layer activated style augmentation" in this forward.
+        self.last_style_aug_activated = False
+
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+
+        out1 = self.backbone.layer1(x)
+        if self.use_style_shift and communicator is not None:
+            if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
+                out1 = self.style_shift1(out1, "layer1", communicator, self.training,
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out1 = self.style_explore1(out1, "layer1", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out1 = self.mixstyle1(out1, "layer1", self.training,
+                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+
+        out2 = self.backbone.layer2(out1)
+        if self.use_style_shift and communicator is not None:
+            if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
+                out2 = self.style_shift2(out2, "layer2", communicator, self.training,
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out2 = self.style_explore2(out2, "layer2", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out2 = self.mixstyle2(out2, "layer2", self.training,
+                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+
+        out3 = self.backbone.layer3(out2)
+        if self.use_style_shift and communicator is not None:
+            if self.training and random.random() <= self.style_shift_prob:
+                self.last_style_aug_activated = True
+                out3 = self.style_shift3(out3, "layer3", communicator, self.training,
+                                        verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out3 = self.style_explore3(out3, "layer3", self.training,
+                                          verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+                out3 = self.mixstyle3(out3, "layer3", self.training,
+                                     verbose=debug_style_shift, iter_num=iter_num, rank=rank)
+
+        return out3
+
+    def forward_from_layer3(self, z3):
+        """
+        Compute logits (and pooled 512-d vector) starting from a layer3 feature map.
+
+        Returns:
+            logits: [B, num_classes]
+            vec512: [B, 512]
+        """
+        out4 = self.backbone.layer4(z3)
+        vec = self.backbone.avgpool(out4).flatten(1)
+        logits = self.backbone.fc(vec)
+        return logits, vec
     
     def forward(self, x, return_blocks: bool = False, communicator=None, debug_style_shift=False, iter_num=-1, rank=-1):
         """
@@ -366,6 +494,9 @@ class StandardResNetWrapper(nn.Module):
                 logits: [B, num_classes]
                 features: dict with keys 'layer1', 'layer2', 'layer3'
         """
+        # Flag for "any layer activated style augmentation" in this forward.
+        self.last_style_aug_activated = False
+
         x = self.backbone.conv1(x)
         x = self.backbone.bn1(x)
         x = self.backbone.relu(x)
@@ -376,6 +507,7 @@ class StandardResNetWrapper(nn.Module):
             out1 = self.backbone.layer1(x)
             if self.use_style_shift and communicator is not None:
                 if self.training and random.random() <= self.style_shift_prob:
+                    self.last_style_aug_activated = True
                     out1 = self.style_shift1(out1, "layer1", communicator, self.training, 
                                             verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                     # StyleExplore unconditionally follows StyleShift
@@ -392,6 +524,7 @@ class StandardResNetWrapper(nn.Module):
             out2 = self.backbone.layer2(out1)
             if self.use_style_shift and communicator is not None:
                 if self.training and random.random() <= self.style_shift_prob:
+                    self.last_style_aug_activated = True
                     out2 = self.style_shift2(out2, "layer2", communicator, self.training,
                                             verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                     # StyleExplore unconditionally follows StyleShift
@@ -408,6 +541,7 @@ class StandardResNetWrapper(nn.Module):
             out3 = self.backbone.layer3(out2)
             if self.use_style_shift and communicator is not None:
                 if self.training and random.random() <= self.style_shift_prob:
+                    self.last_style_aug_activated = True
                     out3 = self.style_shift3(out3, "layer3", communicator, self.training,
                                             verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                     # StyleExplore unconditionally follows StyleShift
@@ -437,6 +571,7 @@ class StandardResNetWrapper(nn.Module):
         else:
             x = self.backbone.layer1(x)
             if self.use_style_shift and communicator is not None:
+                self.last_style_aug_activated = True
                 x = self.style_shift1(x, "layer1", communicator, self.training,
                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
@@ -448,6 +583,7 @@ class StandardResNetWrapper(nn.Module):
             
             x = self.backbone.layer2(x)
             if self.use_style_shift and communicator is not None:
+                self.last_style_aug_activated = True
                 x = self.style_shift2(x, "layer2", communicator, self.training,
                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift
@@ -459,6 +595,7 @@ class StandardResNetWrapper(nn.Module):
             
             x = self.backbone.layer3(x)
             if self.use_style_shift and communicator is not None:
+                self.last_style_aug_activated = True
                 x = self.style_shift3(x, "layer3", communicator, self.training,
                                      verbose=debug_style_shift, iter_num=iter_num, rank=rank)
                 # StyleExplore unconditionally follows StyleShift

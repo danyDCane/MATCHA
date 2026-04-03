@@ -212,7 +212,21 @@ class DiffusionModel(nn.Module):
         loss = self.diffusion_process.p_losses(denoise_fn=self.denoiser, x_start=x_start, t=t, reduce=False)
         loss = (loss * weights).mean()
         return loss
-    
+
+    def get_loss_at_timestep(self, x_start, t_scalar: int):
+        """
+        Same objective as get_loss_iter, but with a fixed diffusion timestep for all samples.
+        t_scalar is clamped to [0, num_timesteps - 1].
+        """
+        N, _ = x_start.shape
+        T = int(self.diffusion_process.num_timesteps)
+        t_scalar = int(max(0, min(t_scalar, T - 1)))
+        t = torch.full((N,), t_scalar, device=x_start.device, dtype=torch.long)
+        loss = self.diffusion_process.p_losses(
+            denoise_fn=self.denoiser, x_start=x_start, t=t, reduce=True
+        )
+        return loss
+
     def normalize(self, x):
         return self.normalization(x)
 
