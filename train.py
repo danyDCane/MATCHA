@@ -253,6 +253,16 @@ def run(num_domains):
     sigma_orig_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
     grad_mu_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
     grad_sigma_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Monitor relative update size (adv_eta * grad) vs parameter scale.
+    # Useful when grad norms shrink due to normalization/reduction in diffusion loss.
+    rel_mu_step_meters = {domain: util.AverageMeter() for domain in domain_names}
+    rel_sigma_step_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Optional: decompose inner-loop gradients into OOD vs CLS parts.
+    grad_ood_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_cls_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_ood_cls_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Compare vec_hat (z_hat pooled) vs vec_hard (z_hard pooled)
+    vec_hat_vs_hard_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
     loss_diff_meters = {domain: util.AverageMeter() for domain in domain_names} if getattr(args, 'use_ood', False) else None
     tic = time.time()
 
@@ -441,14 +451,49 @@ def run(num_domains):
                         vec_hat_norm = diffusion_model.normalize(vec_hat)
                         L_ood = diffusion_model.get_loss_at_timestep(vec_hat_norm, adv_ood_timestep)
                         L_cls_inner = criterion(logits_hat, target)
+                        
                         L_adv = -L_ood + adv_lambda * L_cls_inner
 
-                        grad_mu, grad_sigma = torch.autograd.grad(L_adv, [mu_cur, sigma_cur], create_graph=False)
+                        log_grad_parts = bool(getattr(args, "hard_adv_log_grad_parts", False))
+                        if log_grad_parts:
+                            # Compute parts first, then sum to get total grad.
+                            # This avoids "backward through graph a second time" errors.
+                            grad_mu_ood, grad_sigma_ood = torch.autograd.grad(
+                                -L_ood, [mu_cur, sigma_cur], create_graph=False, retain_graph=True
+                            )
+                            grad_mu_cls, grad_sigma_cls = torch.autograd.grad(
+                                adv_lambda * L_cls_inner, [mu_cur, sigma_cur], create_graph=False, retain_graph=False
+                            )
+                            grad_mu = grad_mu_ood + grad_mu_cls
+                            grad_sigma = grad_sigma_ood + grad_sigma_cls
+
+                            g_ood = torch.cat([grad_mu_ood.reshape(-1), grad_sigma_ood.reshape(-1)])
+                            g_cls = torch.cat([grad_mu_cls.reshape(-1), grad_sigma_cls.reshape(-1)])
+                            g_ood_norm = float(g_ood.norm().item())
+                            g_cls_norm = float(g_cls.norm().item())
+                            denom = (g_ood_norm * g_cls_norm) + 1e-12
+                            g_cos = float((g_ood @ g_cls).item() / denom) if denom > 0 else 0.0
+                            grad_ood_norm_meters[domain].update(g_ood_norm, data.size(0))
+                            grad_cls_norm_meters[domain].update(g_cls_norm, data.size(0))
+                            grad_ood_cls_cos_meters[domain].update(g_cos, data.size(0))
+                        else:
+                            grad_mu, grad_sigma = torch.autograd.grad(
+                                L_adv, [mu_cur, sigma_cur], create_graph=False
+                            )
+
                         # 監控梯度範數（取最後一步為代表）
                         grad_mu_norm = grad_mu.norm().item()
                         grad_sigma_norm = grad_sigma.norm().item()
                         grad_mu_norm_meters[domain].update(grad_mu_norm, data.size(0))
                         grad_sigma_norm_meters[domain].update(grad_sigma_norm, data.size(0))
+                        # Relative step size: ||eta * grad|| / ||param|| (batch-level).
+                        # Helps interpret "small gradients" in the context of current mu/sigma scale.
+                        step_mu_norm = (adv_eta * grad_mu).norm().item()
+                        step_sigma_norm = (adv_eta * grad_sigma).norm().item()
+                        mu_scale = mu_cur.detach().norm().item() + 1e-12
+                        sigma_scale = sigma_cur.detach().norm().item() + 1e-12
+                        rel_mu_step_meters[domain].update(step_mu_norm / mu_scale, data.size(0))
+                        rel_sigma_step_meters[domain].update(step_sigma_norm / sigma_scale, data.size(0))
                         mu_next = mu_cur - adv_eta * grad_mu
                         sigma_next = (sigma_cur - adv_eta * grad_sigma).clamp_min(adv_eps)
                         mu_cur, sigma_cur = mu_next, sigma_next
@@ -486,6 +531,12 @@ def run(num_domains):
                     finally:
                         if backbone is not None and hasattr(backbone, "layer4") and prev_layer4_training is not None:
                             backbone.layer4.train(prev_layer4_training)
+
+                    # 監控：z_hat 的 pooled 向量(vec_hat) vs z_hard 的 pooled 向量(_vec_hard)
+                    # 若兩者差距很小，代表「avgpool 後的表徵」幾乎沒被 hard feature 推動。
+                    with torch.no_grad():
+                        vec_delta = (_vec_hard - vec_hat.detach()).norm().item()
+                    vec_hat_vs_hard_delta_meters[domain].update(vec_delta, data.size(0))
 
                     loss_style_ce = criterion(logits_style, target)
                     loss_hard_ce = criterion(logits_hard, target)
@@ -694,7 +745,6 @@ def run(num_domains):
                 log_dict[f"{domain}/loss"] = losses_dict[domain].avg.item() if hasattr(losses_dict[domain].avg, 'item') else float(losses_dict[domain].avg)
                 log_dict[f"{domain}/train_acc"] = top1_dict[domain].avg.item() if hasattr(top1_dict[domain].avg, 'item') else float(top1_dict[domain].avg)
                 log_dict[f"{domain}/test_acc"] = test_accs[domain].item() if hasattr(test_accs[domain], 'item') else float(test_accs[domain])
-                log_dict[f"{domain}/style_aug_activated_rate"] = float(style_aug_flag_meters[domain].avg)
                 # Hard-style-adv metrics (only meaningful when --use_hard_style_adv)
                 log_dict[f"{domain}/task_loss"] = float(task_loss_meters[domain].avg)
                 log_dict[f"{domain}/style_ce"] = float(style_ce_meters[domain].avg)
@@ -705,6 +755,13 @@ def run(num_domains):
                 log_dict[f"{domain}/sigma_orig_norm"] = float(sigma_orig_norm_meters[domain].avg)
                 log_dict[f"{domain}/grad_mu_norm"] = float(grad_mu_norm_meters[domain].avg)
                 log_dict[f"{domain}/grad_sigma_norm"] = float(grad_sigma_norm_meters[domain].avg)
+                log_dict[f"{domain}/rel_mu_step"] = float(rel_mu_step_meters[domain].avg)
+                log_dict[f"{domain}/rel_sigma_step"] = float(rel_sigma_step_meters[domain].avg)
+                if bool(getattr(args, "hard_adv_log_grad_parts", False)):
+                    log_dict[f"{domain}/grad_ood_norm"] = float(grad_ood_norm_meters[domain].avg)
+                    log_dict[f"{domain}/grad_cls_norm"] = float(grad_cls_norm_meters[domain].avg)
+                    log_dict[f"{domain}/grad_ood_cls_cos"] = float(grad_ood_cls_cos_meters[domain].avg)
+                log_dict[f"{domain}/vec_hat_vs_hard_delta"] = float(vec_hat_vs_hard_delta_meters[domain].avg)
             
             # Add diffusion loss if OOD detection is enabled
             if getattr(args, 'use_ood', False) and loss_diff_meters is not None:
@@ -810,6 +867,12 @@ def run(num_domains):
                 sigma_orig_norm_meters[domain].reset()
                 grad_mu_norm_meters[domain].reset()
                 grad_sigma_norm_meters[domain].reset()
+                rel_mu_step_meters[domain].reset()
+                rel_sigma_step_meters[domain].reset()
+                grad_ood_norm_meters[domain].reset()
+                grad_cls_norm_meters[domain].reset()
+                grad_ood_cls_cos_meters[domain].reset()
+                vec_hat_vs_hard_delta_meters[domain].reset()
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].reset()
             tic = time.time()
@@ -931,6 +994,12 @@ if __name__ == "__main__":
                         help='epsilon for numerical stability and sigma clamp_min (default: 1e-6)')
     parser.add_argument('--hard_adv_ood_timestep', type=int, default=250,
                         help='fixed diffusion timestep t for L_ood in inner loop (0 .. num_timesteps-1; default: 250)')
+    parser.add_argument('--hard_adv_pool_delta_probe', action='store_true',
+                        help='inner loop: measure ||z512_after-z512_before|| after one FGSM-style sign step on mu/sigma (extra 2 forwards)')
+    parser.add_argument('--hard_adv_pool_delta_print', action='store_true',
+                        help='print pool_delta_probe on first iter of each pseudo-epoch (domain 0 only)')
+    parser.add_argument('--hard_adv_log_grad_parts', action='store_true',
+                        help='log inner-loop gradient parts: ||∇(-L_ood)||, ||∇(lambda*L_cls)|| and their cosine similarity (extra autograd.grad calls)')
 
     # ===== OOD Detection (Diffusion) options =====
     parser.add_argument('--use_ood', action='store_true',
