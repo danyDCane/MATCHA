@@ -261,9 +261,14 @@ def run(num_domains):
     grad_ood_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
     grad_cls_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
     grad_ood_cls_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
-    # Compare vec_hat (z_hat pooled) vs vec_hard (z_hard pooled)
-    vec_hat_vs_hard_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # grad_mu_cls sparsity: mean over batch of (sum_c |g_c|) / max_c |g_c|  (in [1, C]; lower => peakier / fewer large channels)
+    grad_mu_cls_l1_max_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Pooled feature shift: vec_hard vs vec_style (same forward path intent as style branch baseline).
+    vec_hard_vs_style_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
     loss_diff_meters = {domain: util.AverageMeter() for domain in domain_names} if getattr(args, 'use_ood', False) else None
+    # Accumulate batch-mean |grad_mu_cls| per channel for optional epoch dump (only when log_grad_parts batches run).
+    grad_mu_cls_abs_ch_sum = {domain: None for domain in domain_names}
+    grad_mu_cls_abs_ch_count = {domain: 0 for domain in domain_names}
     tic = time.time()
 
     # ===== start training with fixed total steps K (Algorithm 1) =====
@@ -358,6 +363,15 @@ def run(num_domains):
             adv_lambda = float(getattr(args, "hard_adv_lambda", 1.0))
             adv_eps = float(getattr(args, "hard_adv_eps", 1e-6))
             adv_ood_timestep = int(getattr(args, "hard_adv_ood_timestep", 250))
+            adv_update_mode = str(getattr(args, "hard_adv_update_mode", "gd")).lower()
+            adv_max_rel_margin = float(getattr(args, "hard_adv_max_rel_margin", 0.1))
+            adv_grad_norm_eps = float(getattr(args, "hard_adv_grad_norm_eps", 1e-8))
+            adv_grad_gate_tau = float(getattr(args, "hard_adv_grad_gate_tau", 0.0))
+            log_grad_parts_every = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
+            # Use step index to estimate the current (integer) epoch.
+            # Note: wandb logging uses 1-based epoch = (k+1)//STEPS_PER_EPOCH.
+            # Keep inner-loop logging aligned with that convention.
+            epoch_i_1based = int(k // STEPS_PER_EPOCH) + 1 if STEPS_PER_EPOCH > 0 else 1
 
             if use_hard_style_adv:
                 # Require diffusion model for OOD guidance.
@@ -454,7 +468,9 @@ def run(num_domains):
                         
                         L_adv = -L_ood + adv_lambda * L_cls_inner
 
-                        log_grad_parts = bool(getattr(args, "hard_adv_log_grad_parts", False))
+                        log_grad_parts = bool(getattr(args, "hard_adv_log_grad_parts", False)) and (
+                            log_grad_parts_every > 0 and (epoch_i_1based % log_grad_parts_every == 0)
+                        )
                         if log_grad_parts:
                             # Compute parts first, then sum to get total grad.
                             # This avoids "backward through graph a second time" errors.
@@ -476,6 +492,20 @@ def run(num_domains):
                             grad_ood_norm_meters[domain].update(g_ood_norm, data.size(0))
                             grad_cls_norm_meters[domain].update(g_cls_norm, data.size(0))
                             grad_ood_cls_cos_meters[domain].update(g_cos, data.size(0))
+
+                            # grad_mu_cls: L1/max per sample (batch mean) + accumulate epoch-mean |g| per channel.
+                            g_flat = grad_mu_cls.abs().squeeze(-1).squeeze(-1)
+                            l1_per = g_flat.sum(dim=1)
+                            max_per = g_flat.max(dim=1).values.clamp_min(1e-12)
+                            ratio = (l1_per / max_per).mean().item()
+                            grad_mu_cls_l1_max_ratio_meters[domain].update(ratio, data.size(0))
+                            ch_mean = grad_mu_cls.abs().mean(dim=(0, 2, 3)).detach()
+                            bs = int(data.size(0))
+                            if grad_mu_cls_abs_ch_sum[domain] is None:
+                                grad_mu_cls_abs_ch_sum[domain] = ch_mean * bs
+                            else:
+                                grad_mu_cls_abs_ch_sum[domain] = grad_mu_cls_abs_ch_sum[domain] + ch_mean * bs
+                            grad_mu_cls_abs_ch_count[domain] += bs
                         else:
                             grad_mu, grad_sigma = torch.autograd.grad(
                                 L_adv, [mu_cur, sigma_cur], create_graph=False
@@ -486,16 +516,48 @@ def run(num_domains):
                         grad_sigma_norm = grad_sigma.norm().item()
                         grad_mu_norm_meters[domain].update(grad_mu_norm, data.size(0))
                         grad_sigma_norm_meters[domain].update(grad_sigma_norm, data.size(0))
-                        # Relative step size: ||eta * grad|| / ||param|| (batch-level).
-                        # Helps interpret "small gradients" in the context of current mu/sigma scale.
-                        step_mu_norm = (adv_eta * grad_mu).norm().item()
-                        step_sigma_norm = (adv_eta * grad_sigma).norm().item()
+
+                        # Update mu/sigma (either plain GD or Projected Normalized GD).
+                        if adv_update_mode == "pngd":
+                            # 1) Normalize gradient direction per-sample (across channels).
+                            # Shapes: (B,C,1,1) -> norms: (B,1,1,1)
+                            gmu_norm = grad_mu.norm(dim=1, keepdim=True)
+                            gsig_norm = grad_sigma.norm(dim=1, keepdim=True)
+
+                            # 2) Optional gate: if gradient is too small, fall back to plain GD step.
+                            # This avoids amplifying numerical noise when grads ~ 0.
+                            use_fallback_mu = gmu_norm < adv_grad_gate_tau
+                            use_fallback_sigma = gsig_norm < adv_grad_gate_tau
+
+                            normed_grad_mu = grad_mu / (gmu_norm + adv_grad_norm_eps)
+                            normed_grad_sigma = grad_sigma / (gsig_norm + adv_grad_norm_eps)
+
+                            mu_step = mu_cur - adv_eta * normed_grad_mu
+                            sigma_step = sigma_cur - adv_eta * normed_grad_sigma
+
+                            if adv_grad_gate_tau > 0.0:
+                                mu_step = torch.where(use_fallback_mu, mu_cur - adv_eta * grad_mu, mu_step)
+                                sigma_step = torch.where(use_fallback_sigma, sigma_cur - adv_eta * grad_sigma, sigma_step)
+
+                            # 3) Project to a relative box around (mu_orig, sigma_orig).
+                            margin_mu = adv_max_rel_margin * mu_orig.abs().clamp_min(1e-3)
+                            margin_sigma = adv_max_rel_margin * sigma_orig
+                            mu_next = torch.max(torch.min(mu_step, mu_orig + margin_mu), mu_orig - margin_mu)
+                            sigma_next = torch.max(torch.min(sigma_step, sigma_orig + margin_sigma), sigma_orig - margin_sigma)
+                            sigma_next = sigma_next.clamp_min(adv_eps)
+                        else:
+                            # Plain GD step (original behavior).
+                            mu_next = mu_cur - adv_eta * grad_mu
+                            sigma_next = (sigma_cur - adv_eta * grad_sigma).clamp_min(adv_eps)
+
+                        # Relative step size based on *actual* update after projection/clamp.
+                        step_mu_norm = (mu_next.detach() - mu_cur.detach()).norm().item()
+                        step_sigma_norm = (sigma_next.detach() - sigma_cur.detach()).norm().item()
                         mu_scale = mu_cur.detach().norm().item() + 1e-12
                         sigma_scale = sigma_cur.detach().norm().item() + 1e-12
                         rel_mu_step_meters[domain].update(step_mu_norm / mu_scale, data.size(0))
                         rel_sigma_step_meters[domain].update(step_sigma_norm / sigma_scale, data.size(0))
-                        mu_next = mu_cur - adv_eta * grad_mu
-                        sigma_next = (sigma_cur - adv_eta * grad_sigma).clamp_min(adv_eps)
+
                         mu_cur, sigma_cur = mu_next, sigma_next
 
                     mu_hard = mu_cur.detach()
@@ -532,11 +594,11 @@ def run(num_domains):
                         if backbone is not None and hasattr(backbone, "layer4") and prev_layer4_training is not None:
                             backbone.layer4.train(prev_layer4_training)
 
-                    # 監控：z_hat 的 pooled 向量(vec_hat) vs z_hard 的 pooled 向量(_vec_hard)
-                    # 若兩者差距很小，代表「avgpool 後的表徵」幾乎沒被 hard feature 推動。
+                    # 監控：style 分支 pooled 向量(vec_style) vs z_hard 的 pooled 向量(_vec_hard)
+                    # 代表 hard 相對於原本 z_style 在 avgpool 後表徵上的改動量。
                     with torch.no_grad():
-                        vec_delta = (_vec_hard - vec_hat.detach()).norm().item()
-                    vec_hat_vs_hard_delta_meters[domain].update(vec_delta, data.size(0))
+                        vec_delta = (_vec_hard - vec_style.detach()).norm().item()
+                    vec_hard_vs_style_delta_meters[domain].update(vec_delta, data.size(0))
 
                     loss_style_ce = criterion(logits_style, target)
                     loss_hard_ce = criterion(logits_hard, target)
@@ -726,6 +788,16 @@ def run(num_domains):
             avg_train_acc_val = avg_train_acc.item() if hasattr(avg_train_acc, 'item') else float(avg_train_acc)
             avg_test_acc_val = avg_test_acc.item() if hasattr(avg_test_acc, 'item') else float(avg_test_acc)
             print(f"Epoch {epoch}: avg_loss={avg_train_loss_val:.3f}, avg_train_acc={avg_train_acc_val:.2f}%, avg_test_acc={avg_test_acc_val:.2f}%")
+
+            # Epoch-mean |grad_mu_cls| per channel (only from batches where log_grad_parts ran this epoch).
+            grad_mu_cls_ch_avg_epoch = {}
+            for _d in domain_names:
+                if grad_mu_cls_abs_ch_count[_d] > 0 and grad_mu_cls_abs_ch_sum[_d] is not None:
+                    grad_mu_cls_ch_avg_epoch[_d] = (
+                        grad_mu_cls_abs_ch_sum[_d] / float(grad_mu_cls_abs_ch_count[_d])
+                    ).detach().cpu()
+                grad_mu_cls_abs_ch_sum[_d] = None
+                grad_mu_cls_abs_ch_count[_d] = 0
             
             # log to wandb (average across domains)
             log_dict = {
@@ -757,11 +829,42 @@ def run(num_domains):
                 log_dict[f"{domain}/grad_sigma_norm"] = float(grad_sigma_norm_meters[domain].avg)
                 log_dict[f"{domain}/rel_mu_step"] = float(rel_mu_step_meters[domain].avg)
                 log_dict[f"{domain}/rel_sigma_step"] = float(rel_sigma_step_meters[domain].avg)
-                if bool(getattr(args, "hard_adv_log_grad_parts", False)):
+                log_grad_parts_every = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
+                do_log_grad_parts = bool(getattr(args, "hard_adv_log_grad_parts", False)) and (
+                    log_grad_parts_every > 0 and (epoch % log_grad_parts_every == 0)
+                )
+                if do_log_grad_parts:
                     log_dict[f"{domain}/grad_ood_norm"] = float(grad_ood_norm_meters[domain].avg)
                     log_dict[f"{domain}/grad_cls_norm"] = float(grad_cls_norm_meters[domain].avg)
                     log_dict[f"{domain}/grad_ood_cls_cos"] = float(grad_ood_cls_cos_meters[domain].avg)
-                log_dict[f"{domain}/vec_hat_vs_hard_delta"] = float(vec_hat_vs_hard_delta_meters[domain].avg)
+                    log_dict[f"{domain}/grad_mu_cls_l1_max_ratio"] = float(
+                        grad_mu_cls_l1_max_ratio_meters[domain].avg
+                    )
+                    if domain in grad_mu_cls_ch_avg_epoch:
+                        _v = grad_mu_cls_ch_avg_epoch[domain].numpy()
+                        log_dict[f"{domain}/grad_mu_cls_abs_per_channel_hist"] = wandb.Histogram(_v)
+                log_dict[f"{domain}/vec_hard_vs_style_delta"] = float(vec_hard_vs_style_delta_meters[domain].avg)
+
+            log_grad_parts_every_ep = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
+            do_log_grad_parts_ep = bool(getattr(args, "hard_adv_log_grad_parts", False)) and (
+                log_grad_parts_every_ep > 0 and (epoch % log_grad_parts_every_ep == 0)
+            )
+            if do_log_grad_parts_ep:
+                _topk = 15
+                for _d in domain_names:
+                    if _d not in grad_mu_cls_ch_avg_epoch:
+                        continue
+                    v = grad_mu_cls_ch_avg_epoch[_d]
+                    tk = min(_topk, int(v.numel()))
+                    vals, idx = torch.topk(v, k=tk)
+                    pairs = ", ".join(
+                        f"ch{int(i)}={float(x):.5f}" for i, x in zip(idx.tolist(), vals.tolist())
+                    )
+                    print(
+                        f"[grad_mu_cls |.|] epoch={epoch} domain={_d} "
+                        f"L1/max={float(grad_mu_cls_l1_max_ratio_meters[_d].avg):.4f}  "
+                        f"top{tk}: {pairs}"
+                    )
             
             # Add diffusion loss if OOD detection is enabled
             if getattr(args, 'use_ood', False) and loss_diff_meters is not None:
@@ -872,7 +975,8 @@ def run(num_domains):
                 grad_ood_norm_meters[domain].reset()
                 grad_cls_norm_meters[domain].reset()
                 grad_ood_cls_cos_meters[domain].reset()
-                vec_hat_vs_hard_delta_meters[domain].reset()
+                grad_mu_cls_l1_max_ratio_meters[domain].reset()
+                vec_hard_vs_style_delta_meters[domain].reset()
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].reset()
             tic = time.time()
@@ -990,6 +1094,14 @@ if __name__ == "__main__":
                         help='inner-loop step size eta for mu/sigma update (default: 0.01)')
     parser.add_argument('--hard_adv_lambda', type=float, default=1.0,
                         help='weight for inner-loop classification term lambda (default: 1.0)')
+    parser.add_argument('--hard_adv_update_mode', type=str, default='gd', choices=['gd', 'pngd'],
+                        help='inner-loop update mode for mu/sigma: gd (mu-=eta*grad) or pngd (normalized step + projection) (default: gd)')
+    parser.add_argument('--hard_adv_max_rel_margin', type=float, default=0.1,
+                        help='pngd: relative projection margin ratio around mu_orig/sigma_orig (default: 0.1)')
+    parser.add_argument('--hard_adv_grad_norm_eps', type=float, default=1e-8,
+                        help='pngd: epsilon added to grad norm during normalization (default: 1e-8)')
+    parser.add_argument('--hard_adv_grad_gate_tau', type=float, default=0.0,
+                        help='pngd: if per-sample grad norm < tau, fall back to plain GD step (0 disables) (default: 0.0)')
     parser.add_argument('--hard_adv_eps', type=float, default=1e-6,
                         help='epsilon for numerical stability and sigma clamp_min (default: 1e-6)')
     parser.add_argument('--hard_adv_ood_timestep', type=int, default=250,
@@ -999,7 +1111,10 @@ if __name__ == "__main__":
     parser.add_argument('--hard_adv_pool_delta_print', action='store_true',
                         help='print pool_delta_probe on first iter of each pseudo-epoch (domain 0 only)')
     parser.add_argument('--hard_adv_log_grad_parts', action='store_true',
-                        help='log inner-loop gradient parts: ||∇(-L_ood)||, ||∇(lambda*L_cls)|| and their cosine similarity (extra autograd.grad calls)')
+                        help='log inner-loop grad parts: OOD/CLS norms+cos; grad_mu_cls L1/max ratio; '
+                             'wandb histogram of epoch-mean |grad_mu_cls| per channel; print top-15 channels (extra autograd.grad)')
+    parser.add_argument('--hard_adv_log_grad_parts_every', type=int, default=10,
+                        help='only compute/log hard_adv_log_grad_parts every N epochs (0 disables). Default: 10')
 
     # ===== OOD Detection (Diffusion) options =====
     parser.add_argument('--use_ood', action='store_true',
