@@ -1366,7 +1366,8 @@ def test(model, test_loader):
     # correct = 0
     # total = 0
     with torch.no_grad():  # 確保不建立計算圖，節省顯存
-        for batch_idx, (inputs, targets) in enumerate(test_loader):
+        for batch_idx, batch in enumerate(test_loader):
+            inputs, targets, _ = unpack_batch(batch)
             inputs, targets = inputs.cuda(non_blocking=True), targets.cuda(non_blocking=True)
             outputs = model(inputs)
             acc1 = comp_accuracy(outputs, targets)
@@ -1374,3 +1375,18 @@ def test(model, test_loader):
             # 每個 batch 後清理臨時變量，避免記憶體累積
             del inputs, targets, outputs
     return top1.avg
+
+
+def unpack_batch(batch):
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Expected batch to be list/tuple, got {type(batch)}")
+
+    if len(batch) == 2:
+        inputs, targets = batch
+        meta = None
+    elif len(batch) >= 3:
+        inputs, targets, meta = batch[0], batch[1], batch[2]
+    else:
+        raise ValueError("Batch must have at least 2 elements: inputs and targets")
+
+    return inputs, targets, meta

@@ -522,7 +522,8 @@ def compute_ood_scores(backbone, diffusion_model, test_loader, diffusion_steps,
     scores_list = []
     
     with torch.no_grad():
-        for data, _ in tqdm(test_loader, desc=f'Computing scores ({ood_eval_scores_type})'):
+        for batch in tqdm(test_loader, desc=f'Computing scores ({ood_eval_scores_type})'):
+            data, _, _ = util.unpack_batch(batch)
             data = data.to(device)
             # 特征提取
             latents = backbone.intermediate_forward(data)

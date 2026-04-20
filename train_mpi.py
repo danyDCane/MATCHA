@@ -216,7 +216,7 @@ def run(rank, size):
         start_time = time.time()
 
         # sample mini-batch (infinite iterator, cycles through local data)
-        data, target = next(train_iter)
+        data, target, _ = util.unpack_batch(next(train_iter))
         data, target = data.cuda(non_blocking = True), target.cuda(non_blocking = True)
         
         # ========== 第一阶段：计算风格统计量（不训练）==========

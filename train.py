@@ -5,6 +5,7 @@ import argparse
 import sys
 from copy import deepcopy
 import random
+import re
 
 from math import ceil
 from random import Random
@@ -31,6 +32,59 @@ cudnn.benchmark = True
 import util
 from graph_manager import FixedProcessor, MatchaProcessor
 from communicator import SingleProcessCommunicator
+
+
+def _sanitize_filename(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+
+
+def _to_string_list(value, batch_size: int):
+    if value is None:
+        return [""] * batch_size
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    return [str(value)] * batch_size
+
+
+def save_spatial_feature_dump(
+    save_root,
+    epoch,
+    step,
+    domain,
+    data,
+    target,
+    meta,
+    z_clean,
+    z_style,
+    z_hard,
+    style_aug_activated,
+    max_samples,
+):
+    os.makedirs(save_root, exist_ok=True)
+    sample_count = min(int(max_samples), int(data.size(0)))
+    meta = meta or {}
+    paths = _to_string_list(meta.get("path") if isinstance(meta, dict) else None, sample_count)
+    domains = _to_string_list(meta.get("domain") if isinstance(meta, dict) else domain, sample_count)
+
+    payload = {
+        "epoch": int(epoch),
+        "step": int(step),
+        "domain": domain,
+        "style_aug_activated": bool(style_aug_activated),
+        "input": data[:sample_count].detach().cpu(),
+        "target": target[:sample_count].detach().cpu(),
+        "image_paths": paths[:sample_count],
+        "image_domains": domains[:sample_count],
+        "z_clean": z_clean[:sample_count].detach().cpu(),
+        "z_style": z_style[:sample_count].detach().cpu(),
+        "z_hard": None if z_hard is None else z_hard[:sample_count].detach().cpu(),
+        "imagenet_mean": [0.485, 0.456, 0.406],
+        "imagenet_std": [0.229, 0.224, 0.225],
+    }
+    filename = f"epoch_{int(epoch):04d}_step_{int(step):06d}_{_sanitize_filename(domain)}.pt"
+    save_path = os.path.join(save_root, filename)
+    torch.save(payload, save_path)
+    print(f"[SpatialDump] Saved {sample_count} samples for domain '{domain}' to: {save_path}")
 
 def run(num_domains):
     """
@@ -72,6 +126,12 @@ def run(num_domains):
     save_dir = args.savePath if args.savePath is not None else "./checkpoints"
     os.makedirs(save_dir, exist_ok=True)
     save_every_epoch = getattr(args, "save_every_epoch", 50)
+    spatial_dump_dir = os.path.join(save_dir, "spatial_feature_dumps")
+    spatial_dump_enabled = bool(getattr(args, "save_spatial_debug_tensors", False))
+    spatial_dump_domain = str(getattr(args, "spatial_debug_domain", "sketch"))
+    spatial_dump_every = max(1, int(getattr(args, "spatial_debug_every", 1)))
+    spatial_dump_max_samples = max(1, int(getattr(args, "spatial_debug_max_samples", 8)))
+    spatial_dump_saved_epochs = set()
 
     # load data for all domains
     node_to_domain = {}
@@ -284,16 +344,20 @@ def run(num_domains):
         # Cache one batch per domain so style stats and training share identical data
         # (matching train_mpi.py behavior).
         batch_cache = {}
+        clean_layer3_cache = {}
         if (getattr(args, "use_style_stats", False) or getattr(args, "use_style_shift", False)) and args.model == "res":
             for domain in domain_names:
-                data, target = next(train_iters[domain])
+                batch = next(train_iters[domain])
+                data, target, meta = util.unpack_batch(batch)
                 data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
-                batch_cache[domain] = (data, target)
+                batch_cache[domain] = (data, target, meta)
                 
                 with torch.no_grad():  # 不计算梯度，节省内存
                     model = models_dict[domain]
                     # 只提取特征到 layer3，不应用 style shift
                     feats = model.extract_features_to_layer3(data)
+                    if spatial_dump_enabled and domain == spatial_dump_domain:
+                        clean_layer3_cache[domain] = feats["layer3"].detach()
                     
                     # Compute STYLEDDG-style statistics (batch-level, per channel)
                     style_stats = compute_multi_layer_style_stats(
@@ -349,9 +413,10 @@ def run(num_domains):
             
             # Reuse phase-1 batch when style stats are enabled; otherwise fetch normally.
             if domain in batch_cache:
-                data, target = batch_cache[domain]
+                data, target, batch_meta = batch_cache[domain]
             else:
-                data, target = next(train_iters[domain])
+                batch = next(train_iters[domain])
+                data, target, batch_meta = util.unpack_batch(batch)
                 data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
             
             # Forward + loss
@@ -394,6 +459,11 @@ def run(num_domains):
                 # Switch communicator view to current domain only (for style shift).
                 communicator.set_active_domain(domain)
 
+                z_clean = clean_layer3_cache.get(domain)
+                if z_clean is None:
+                    with torch.no_grad():
+                        z_clean = model.extract_features_to_layer3(data)["layer3"].detach()
+
                 # 1) Get z_style at layer3 (may or may not be style-augmented).
                 z_style = model.forward_to_layer3_style(
                     data,
@@ -409,6 +479,7 @@ def run(num_domains):
 
                 # 2) Optionally skip inner loop if no style aug happened.
                 run_adv = (not adv_only_when_style_aug) or style_aug_activated
+                z_hard = None
 
                 logits_style, vec_style = model.forward_from_layer3(z_style)
                 if vec_style.ndim != 2 or vec_style.size(1) != expected_ft:
@@ -623,6 +694,31 @@ def run(num_domains):
                     # No adv: just use z_style branch.
                     loss = criterion(logits_style, target)
                     task_loss_meters[domain].update(float(loss.item()), data.size(0))
+
+                should_save_spatial_dump = (
+                    spatial_dump_enabled
+                    and domain == spatial_dump_domain
+                    and STEPS_PER_EPOCH > 0
+                    and (epoch_i_1based % spatial_dump_every == 0)
+                    and ((k % STEPS_PER_EPOCH) == 0)
+                    and (epoch_i_1based not in spatial_dump_saved_epochs)
+                )
+                if should_save_spatial_dump:
+                    save_spatial_feature_dump(
+                        save_root=spatial_dump_dir,
+                        epoch=epoch_i_1based,
+                        step=k + 1,
+                        domain=domain,
+                        data=data,
+                        target=target,
+                        meta=batch_meta,
+                        z_clean=z_clean,
+                        z_style=z_style,
+                        z_hard=z_hard,
+                        style_aug_activated=style_aug_activated,
+                        max_samples=spatial_dump_max_samples,
+                    )
+                    spatial_dump_saved_epochs.add(epoch_i_1based)
 
                 output = logits_style
             else:
@@ -889,7 +985,7 @@ def run(num_domains):
                         try:
                             with torch.no_grad():
                                 # 获取真实特征（ID）
-                                sample_data, _ = next(iter(domain_loaders[domain][1]))  # test_loader
+                                sample_data, _, _ = util.unpack_batch(next(iter(domain_loaders[domain][1])))  # test_loader
                                 sample_data = sample_data.cuda()
                                 sample_latents = models_dict[domain].intermediate_forward(sample_data)
                                 sample_latents_normalized = diffusion_model.normalize(sample_latents.detach())
@@ -1115,6 +1211,14 @@ if __name__ == "__main__":
                              'wandb histogram of epoch-mean |grad_mu_cls| per channel; print top-15 channels (extra autograd.grad)')
     parser.add_argument('--hard_adv_log_grad_parts_every', type=int, default=10,
                         help='only compute/log hard_adv_log_grad_parts every N epochs (0 disables). Default: 10')
+    parser.add_argument('--save_spatial_debug_tensors', action='store_true',
+                        help='save layer3 spatial debug tensors (input, z_clean, z_style, z_hard) for one batch per selected epoch')
+    parser.add_argument('--spatial_debug_domain', type=str, default='sketch',
+                        help='which training domain to dump spatial debug tensors for (default: sketch)')
+    parser.add_argument('--spatial_debug_every', type=int, default=10,
+                        help='save one spatial debug dump every N epochs (default: 10)')
+    parser.add_argument('--spatial_debug_max_samples', type=int, default=8,
+                        help='maximum number of samples to save in each spatial debug dump (default: 8)')
 
     # ===== OOD Detection (Diffusion) options =====
     parser.add_argument('--use_ood', action='store_true',

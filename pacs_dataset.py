@@ -28,11 +28,17 @@ class PACSDataset(Dataset):
 
     def __getitem__(self, index):
         img, target = self.dataset[index]
+        path, _ = self.dataset.samples[index]
 
         if self.transform:
             img = self.transform(img)
 
-        return img, target
+        meta = {
+            "path": path,
+            "index": index,
+            "domain": self.dataset_name,
+        }
+        return img, target, meta
 
     def __len__(self):
         return len(self.dataset)

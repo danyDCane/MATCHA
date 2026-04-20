@@ -124,13 +124,20 @@ class VLCSFullTestDataset(Dataset):
     def __len__(self) -> int:
         return self._full_total + self._test_total
 
-    def _getitem_full(self, idx: int) -> Tuple[torch.Tensor, int]:
+    def _getitem_full(self, idx: int) -> Tuple[torch.Tensor, int, dict]:
         # idx is in [0, full_total)
         for ds_idx, ds in enumerate(self._full_sources):
             L = self._full_lengths[ds_idx]
             if idx < L:
                 x, y = ds[idx]
-                return x, _remap_label_from_imagefolder(ds, int(y))
+                path, _ = ds.samples[idx]
+                meta = {
+                    "path": path,
+                    "index": idx,
+                    "domain": self.dataset_name,
+                    "split": "full",
+                }
+                return x, _remap_label_from_imagefolder(ds, int(y)), meta
             idx -= L
         raise IndexError("Index out of range in full sources")
 
@@ -138,5 +145,12 @@ class VLCSFullTestDataset(Dataset):
         if index < self._full_total:
             return self._getitem_full(index)
         x, y = self._test_source[index - self._full_total]
-        return x, _remap_label_from_imagefolder(self._test_source, int(y))
+        path, _ = self._test_source.samples[index - self._full_total]
+        meta = {
+            "path": path,
+            "index": index,
+            "domain": self.dataset_name,
+            "split": "test",
+        }
+        return x, _remap_label_from_imagefolder(self._test_source, int(y)), meta
 

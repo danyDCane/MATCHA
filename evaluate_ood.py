@@ -294,7 +294,8 @@ def evaluate_ood_detection(args):
     print(f'Evaluating on ID dataset (CIFAR-10 test set)...')
     id_scores = []
     with torch.no_grad():
-        for data, _ in tqdm(id_loader, desc='ID samples'):
+        for batch in tqdm(id_loader, desc='ID samples'):
+            data, _, _ = util.unpack_batch(batch)
             data = data.to(device)
             latents = backbone.intermediate_forward(data)
             
@@ -318,7 +319,8 @@ def evaluate_ood_detection(args):
     print(f'Evaluating on OOD dataset ({args.ood_dataset})...')
     ood_scores = []
     with torch.no_grad():
-        for data, _ in tqdm(ood_loader, desc='OOD samples'):
+        for batch in tqdm(ood_loader, desc='OOD samples'):
+            data, _, _ = util.unpack_batch(batch)
             data = data.to(device)
             latents = backbone.intermediate_forward(data)
             
