@@ -75,7 +75,7 @@ def save_spatial_feature_dump(
         "target": target[:sample_count].detach().cpu(),
         "image_paths": paths[:sample_count],
         "image_domains": domains[:sample_count],
-        "z_clean": z_clean[:sample_count].detach().cpu(),
+        "z_clean": None if z_clean is None else z_clean[:sample_count].detach().cpu(),
         "z_style": z_style[:sample_count].detach().cpu(),
         "z_hard": None if z_hard is None else z_hard[:sample_count].detach().cpu(),
         "imagenet_mean": [0.485, 0.456, 0.406],
@@ -85,6 +85,26 @@ def save_spatial_feature_dump(
     save_path = os.path.join(save_root, filename)
     torch.save(payload, save_path)
     print(f"[SpatialDump] Saved {sample_count} samples for domain '{domain}' to: {save_path}")
+
+
+def compute_loader_avg_confidence(model, data_loader):
+    was_training = model.training
+    model.eval()
+    total_conf = 0.0
+    total_count = 0
+    with torch.no_grad():
+        for batch in data_loader:
+            data, _, _ = util.unpack_batch(batch)
+            data = data.cuda(non_blocking=True)
+            logits = model(data)
+            probs = F.softmax(logits, dim=1)
+            conf = probs.max(dim=1).values
+            total_conf += float(conf.sum().item())
+            total_count += int(conf.numel())
+    if was_training:
+        model.train()
+    return (total_conf / max(1, total_count))
+
 
 def run(num_domains):
     """
@@ -304,8 +324,16 @@ def run(num_domains):
     style_aug_flag_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Meters for z_style / z_hard training (enabled by --use_hard_style_adv)
     task_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
+    clean_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
+    clean_conf_meters = {domain: util.AverageMeter() for domain in domain_names}
+    style_conf_meters = {domain: util.AverageMeter() for domain in domain_names}
+    clean_style_ce_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
+    clean_style_sym_kl_meters = {domain: util.AverageMeter() for domain in domain_names}
     style_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
     hard_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_ce_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_ce_harder_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_ood_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
     adv_ood_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
     adv_cls_inner_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Monitor statistics and gradients for mu/sigma in inner loop
@@ -439,6 +467,8 @@ def run(num_domains):
             adv_grad_gate_tau = float(getattr(args, "hard_adv_grad_gate_tau", 0.0))
             adv_cls_only = bool(getattr(args, "hard_adv_cls_only", False))
             adv_equal_ce_weight = bool(getattr(args, "hard_adv_equal_ce_weight", False))
+            hard_adv_z_base = str(getattr(args, "hard_adv_z_base", "clean")).lower()
+            hard_adv_clean_loss_weight = float(getattr(args, "hard_adv_clean_loss_weight", 0.0))
             hard_adv_monitor_sparsity = bool(getattr(args, "hard_adv_monitor_sparsity", False))
             log_grad_parts_every = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
             # Use step index to estimate the current (integer) epoch.
@@ -476,23 +506,28 @@ def run(num_domains):
                     and (epoch_i_1based not in spatial_dump_saved_epochs)
                 )
 
-                # Get z_clean with gradient graph while preventing an extra BN running-stats update.
-                # We temporarily switch backbone/model to eval() for this forward only.
-                backbone_for_clean = getattr(model, "backbone", None)
-                prev_backbone_training_for_clean = None
-                prev_model_training_for_clean = model.training
-                if backbone_for_clean is not None:
-                    prev_backbone_training_for_clean = backbone_for_clean.training
-                    backbone_for_clean.eval()
-                else:
-                    model.eval()
-                try:
-                    z_clean = model.extract_features_to_layer3(data)["layer3"]
-                finally:
-                    if backbone_for_clean is not None and prev_backbone_training_for_clean is not None:
-                        backbone_for_clean.train(prev_backbone_training_for_clean)
+                z_clean = None
+                need_clean_for_adv = (hard_adv_z_base == "clean")
+                need_clean_for_dump = should_save_spatial_dump and (clean_layer3_cache.get(domain) is None)
+                need_clean_for_monitor = hard_adv_monitor_sparsity and (hard_adv_z_base == "clean")
+                if need_clean_for_adv or need_clean_for_dump or need_clean_for_monitor:
+                    # Get z_clean with gradient graph while preventing an extra BN running-stats update.
+                    # We temporarily switch backbone/model to eval() for this forward only.
+                    backbone_for_clean = getattr(model, "backbone", None)
+                    prev_backbone_training_for_clean = None
+                    prev_model_training_for_clean = model.training
+                    if backbone_for_clean is not None:
+                        prev_backbone_training_for_clean = backbone_for_clean.training
+                        backbone_for_clean.eval()
                     else:
-                        model.train(prev_model_training_for_clean)
+                        model.eval()
+                    try:
+                        z_clean = model.extract_features_to_layer3(data)["layer3"]
+                    finally:
+                        if backbone_for_clean is not None and prev_backbone_training_for_clean is not None:
+                            backbone_for_clean.train(prev_backbone_training_for_clean)
+                        else:
+                            model.train(prev_model_training_for_clean)
 
                 # 1) Get z_style at layer3 (may or may not be style-augmented).
                 z_style = model.forward_to_layer3_style(
@@ -510,6 +545,7 @@ def run(num_domains):
                 # 2) Optionally skip inner loop if no style aug happened.
                 run_adv = (not adv_only_when_style_aug) or style_aug_activated
                 z_hard = None
+                z_base = z_clean if hard_adv_z_base == "clean" else z_style
 
                 logits_style, vec_style = model.forward_from_layer3(z_style)
                 if vec_style.ndim != 2 or vec_style.size(1) != expected_ft:
@@ -521,9 +557,9 @@ def run(num_domains):
                 # Inner loop: generate z_hard (one or few steps), only updating mu/sigma.
                 if run_adv:
                     with torch.no_grad():
-                        mu_clean = z_clean.detach().mean(dim=(2, 3), keepdim=True)
-                        var_clean = z_clean.detach().var(dim=(2, 3), unbiased=False, keepdim=True)
-                        sigma_clean = torch.sqrt(var_clean + adv_eps)
+                        mu_base = z_base.detach().mean(dim=(2, 3), keepdim=True)
+                        var_base = z_base.detach().var(dim=(2, 3), unbiased=False, keepdim=True)
+                        sigma_base = torch.sqrt(var_base + adv_eps)
                         mu_orig = z_style.detach().mean(dim=(2, 3), keepdim=True)
                         var_orig = z_style.detach().var(dim=(2, 3), unbiased=False, keepdim=True)
                         sigma_orig = torch.sqrt(var_orig + adv_eps)
@@ -533,8 +569,8 @@ def run(num_domains):
                         mu_orig_norm_meters[domain].update(mu_orig_norm, data.size(0))
                         sigma_orig_norm_meters[domain].update(sigma_orig_norm, data.size(0))
 
-                    # z_hat uses detached z_clean-normalized content (inner loop should not affect backbone).
-                    z_norm_detached = (z_clean.detach() - mu_clean) / (sigma_clean + adv_eps)
+                    # z_hat uses detached z_base-normalized content (inner loop should not affect backbone).
+                    z_norm_detached = (z_base.detach() - mu_base) / (sigma_base + adv_eps)
 
                     mu_adv = mu_orig.clone().requires_grad_(True)
                     sigma_adv = sigma_orig.clone().requires_grad_(True)
@@ -558,6 +594,7 @@ def run(num_domains):
 
                     # Multi-step (default 1)
                     mu_cur, sigma_cur = mu_adv, sigma_adv
+                    L_cls_inner_vec = None
                     for _ in range(max(1, adv_steps)):
                         z_hat = z_norm_detached * sigma_cur + mu_cur
                         logits_hat, vec_hat = model.forward_from_layer3(z_hat)
@@ -568,7 +605,8 @@ def run(num_domains):
 
                         vec_hat_norm = diffusion_model.normalize(vec_hat)
                         L_ood = diffusion_model.get_loss_at_timestep(vec_hat_norm, adv_ood_timestep)
-                        L_cls_inner = criterion(logits_hat, target)
+                        L_cls_inner_vec = F.cross_entropy(logits_hat, target, reduction='none')
+                        L_cls_inner = L_cls_inner_vec.mean()
 
                         if adv_cls_only:
                             L_adv = adv_lambda * L_cls_inner
@@ -691,9 +729,9 @@ def run(num_domains):
                     for p in diffusion_model.parameters():
                         p.requires_grad_(True)
 
-                    # Outer loop: z_hard re-composed from LIVE z_clean-normalized content
+                    # Outer loop: z_hard re-composed from LIVE z_base-normalized content
                     # while using style-derived (mu/sigma) adversarial updates.
-                    z_norm_live = (z_clean - mu_clean) / (sigma_clean + adv_eps)
+                    z_norm_live = (z_base - mu_base) / (sigma_base + adv_eps)
                     z_hard = z_norm_live * sigma_hard + mu_hard
                     if not torch.isfinite(z_hard).all():
                         raise FloatingPointError("Non-finite z_hard detected before outer loop.")
@@ -707,8 +745,17 @@ def run(num_domains):
                         backbone.layer4.eval()
                     try:
                         logits_hard, _vec_hard = model.forward_from_layer3(z_hard)
-                        # Monitoring-only reference: run z_clean through layer4+pool once.
-                        if hard_adv_monitor_sparsity:
+                        # Monitor z_hard OOD loss with diffusion in eval mode (no state update).
+                        with torch.no_grad():
+                            prev_diff_training_for_monitor = diffusion_model.training
+                            diffusion_model.eval()
+                            try:
+                                vec_hard_norm = diffusion_model.normalize(_vec_hard.detach())
+                                hard_ood_loss = diffusion_model.get_loss_at_timestep(vec_hard_norm, adv_ood_timestep)
+                            finally:
+                                diffusion_model.train(prev_diff_training_for_monitor)
+                        # Monitoring-only reference: run z_clean through layer4+pool once when available.
+                        if hard_adv_monitor_sparsity and z_clean is not None:
                             with torch.no_grad():
                                 _logits_clean_l4, _vec_clean_l4 = model.forward_from_layer3(z_clean.detach())
                     finally:
@@ -724,15 +771,22 @@ def run(num_domains):
                         with torch.no_grad():
                             z_hard_sparsity = (z_hard == 0).float().mean().item()
                             vec_hard_sparsity = (_vec_hard == 0).float().mean().item()
-                            vec_clean_l4_sparsity = (_vec_clean_l4 == 0).float().mean().item()
-                            vec_hard_vs_clean_l4_delta = (_vec_hard - _vec_clean_l4).norm().item()
+                            if z_clean is not None:
+                                vec_clean_l4_sparsity = (_vec_clean_l4 == 0).float().mean().item()
+                                vec_hard_vs_clean_l4_delta = (_vec_hard - _vec_clean_l4).norm().item()
                         z_hard_sparsity_meters[domain].update(z_hard_sparsity, data.size(0))
                         vec_hard_sparsity_meters[domain].update(vec_hard_sparsity, data.size(0))
-                        vec_clean_l4_sparsity_meters[domain].update(vec_clean_l4_sparsity, data.size(0))
-                        vec_hard_vs_clean_l4_delta_meters[domain].update(vec_hard_vs_clean_l4_delta, data.size(0))
+                        if z_clean is not None:
+                            vec_clean_l4_sparsity_meters[domain].update(vec_clean_l4_sparsity, data.size(0))
+                            vec_hard_vs_clean_l4_delta_meters[domain].update(vec_hard_vs_clean_l4_delta, data.size(0))
 
                     loss_style_ce = criterion(logits_style, target)
-                    loss_hard_ce = criterion(logits_hard, target)
+                    hard_ce_vec = F.cross_entropy(logits_hard, target, reduction='none')
+                    loss_hard_ce = hard_ce_vec.mean()
+                    with torch.no_grad():
+                        hard_ce_delta_vec = hard_ce_vec - L_cls_inner_vec.detach()
+                        hard_ce_delta = float(hard_ce_delta_vec.mean().item())
+                        hard_ce_harder_ratio = float((hard_ce_delta_vec > 0).float().mean().item())
 
                     # 線性 warmup：從 epoch 0 到 60，z_hard 權重從 0 → 0.5
                     # 之後維持 0.5；z_style 權重始終為 1 - w_hard。
@@ -751,6 +805,9 @@ def run(num_domains):
                     task_loss_meters[domain].update(float(loss.item()), data.size(0))
                     style_ce_meters[domain].update(float(loss_style_ce.item()), data.size(0))
                     hard_ce_meters[domain].update(float(loss_hard_ce.item()), data.size(0))
+                    hard_ce_delta_meters[domain].update(hard_ce_delta, data.size(0))
+                    hard_ce_harder_ratio_meters[domain].update(hard_ce_harder_ratio, data.size(0))
+                    hard_ood_loss_meters[domain].update(float(hard_ood_loss.item()), data.size(0))
                     adv_ood_loss_meters[domain].update(float(L_ood.item()), data.size(0))
                     adv_cls_inner_meters[domain].update(float(L_cls_inner.item()), data.size(0))
                 else:
@@ -761,11 +818,17 @@ def run(num_domains):
                 if should_save_spatial_dump:
                     z_clean_to_save = clean_layer3_cache.get(domain)
                     if z_clean_to_save is None:
-                        print(
-                            f"[SpatialDump][WARN] Cache miss for z_clean at epoch={epoch_i_1based}, "
-                            f"iter={k+1}, domain={domain}; using current-graph z_clean.detach() for dump."
-                        )
-                        z_clean_to_save = z_clean.detach()
+                        if z_clean is None:
+                            print(
+                                f"[SpatialDump][WARN] Cache miss for z_clean at epoch={epoch_i_1based}, "
+                                f"iter={k+1}, domain={domain}; z_clean is unavailable under hard_adv_z_base={hard_adv_z_base}, saving z_clean=None."
+                            )
+                        else:
+                            print(
+                                f"[SpatialDump][WARN] Cache miss for z_clean at epoch={epoch_i_1based}, "
+                                f"iter={k+1}, domain={domain}; using current-graph z_clean.detach() for dump."
+                            )
+                            z_clean_to_save = z_clean.detach()
 
                     save_spatial_feature_dump(
                         save_root=spatial_dump_dir,
@@ -786,6 +849,33 @@ def run(num_domains):
                 output = logits_style
             else:
                 # Original training path (logits only)
+                # Isolate BN updates for clean branch:
+                # use eval() so BN running stats are not updated, while keeping autograd enabled.
+                backbone_for_clean = getattr(model, "backbone", None)
+                prev_backbone_training_for_clean = None
+                prev_model_training_for_clean = model.training
+                if backbone_for_clean is not None:
+                    prev_backbone_training_for_clean = backbone_for_clean.training
+                    backbone_for_clean.eval()
+                else:
+                    model.eval()
+                try:
+                    logits_clean = model(
+                        data,
+                        return_blocks=False,
+                        communicator=None,
+                        debug_style_shift=False,
+                        iter_num=k+1,
+                        rank=domain_names.index(domain),
+                    )
+                finally:
+                    if backbone_for_clean is not None and prev_backbone_training_for_clean is not None:
+                        backbone_for_clean.train(prev_backbone_training_for_clean)
+                    else:
+                        model.train(prev_model_training_for_clean)
+                loss_clean_ce = criterion(logits_clean, target)
+                clean_ce_meters[domain].update(float(loss_clean_ce.item()), data.size(0))
+
                 if (use_style_stats or use_style_shift) and args.model == "res":
                     communicator.set_active_domain(domain)
                     output = model(
@@ -803,6 +893,42 @@ def run(num_domains):
                 style_aug_flag_meters[domain].update(1.0 if style_aug_activated else 0.0, data.size(0))
 
                 loss = criterion(output, target)
+                if hard_adv_clean_loss_weight > 0.0:
+                    loss = loss + hard_adv_clean_loss_weight * loss_clean_ce
+
+                with torch.no_grad():
+                    probs_clean = F.softmax(logits_clean, dim=1)
+                    probs_style = F.softmax(output, dim=1)
+                    clean_conf = probs_clean.max(dim=1).values.mean().item()
+                    style_conf = probs_style.max(dim=1).values.mean().item()
+                    clean_conf_meters[domain].update(clean_conf, data.size(0))
+                    style_conf_meters[domain].update(style_conf, data.size(0))
+
+                    # Cosine between per-sample CE vectors to detect opposite trend.
+                    loss_clean_vec = F.cross_entropy(logits_clean, target, reduction='none')
+                    loss_style_vec = F.cross_entropy(output, target, reduction='none')
+                    ce_cos = F.cosine_similarity(
+                        loss_clean_vec.unsqueeze(0),
+                        loss_style_vec.unsqueeze(0),
+                        dim=1,
+                        eps=1e-8,
+                    ).item()
+                    clean_style_ce_cos_meters[domain].update(float(ce_cos), data.size(0))
+
+                    # Symmetric KL between clean/style prediction distributions.
+                    eps_kl = 1e-8
+                    kl_clean_to_style = F.kl_div(
+                        torch.log(probs_clean.clamp_min(eps_kl)),
+                        probs_style,
+                        reduction='batchmean',
+                    )
+                    kl_style_to_clean = F.kl_div(
+                        torch.log(probs_style.clamp_min(eps_kl)),
+                        probs_clean,
+                        reduction='batchmean',
+                    )
+                    sym_kl = 0.5 * (kl_clean_to_style + kl_style_to_clean)
+                    clean_style_sym_kl_meters[domain].update(float(sym_kl.item()), data.size(0))
             
             # Compute diffusion loss if OOD detection is enabled
             if getattr(args, 'use_ood', False) and domain in diffusion_models_dict:
@@ -919,10 +1045,12 @@ def run(num_domains):
             
             # evaluate test accuracy for each domain
             test_accs = {}
+            test_confidences = {}
             for domain in domain_names:
                 _, test_loader = domain_loaders[domain]
                 test_acc = util.test(models_dict[domain], test_loader)
                 test_accs[domain] = test_acc
+                test_confidences[domain] = compute_loader_avg_confidence(models_dict[domain], test_loader)
             
             # 測試後再次清理緩存，確保記憶體被釋放
             torch.cuda.empty_cache()
@@ -947,6 +1075,22 @@ def run(num_domains):
             avg_train_acc_val = avg_train_acc.item() if hasattr(avg_train_acc, 'item') else float(avg_train_acc)
             avg_test_acc_val = avg_test_acc.item() if hasattr(avg_test_acc, 'item') else float(avg_test_acc)
             print(f"Epoch {epoch}: avg_loss={avg_train_loss_val:.3f}, avg_train_acc={avg_train_acc_val:.2f}%, avg_test_acc={avg_test_acc_val:.2f}%")
+            for _d in domain_names:
+                print(
+                    f"[confidence] epoch={epoch} domain={_d} "
+                    f"clean_train={float(clean_conf_meters[_d].avg):.4f} "
+                    f"style_train={float(style_conf_meters[_d].avg):.4f} "
+                    f"test={float(test_confidences[_d]):.4f} "
+                    f"ce_cos={float(clean_style_ce_cos_meters[_d].avg):.4f} "
+                    f"sym_kl={float(clean_style_sym_kl_meters[_d].avg):.6f}"
+                )
+            if getattr(args, "use_hard_style_adv", False):
+                for _d in domain_names:
+                    print(
+                        f"[hard_ood] epoch={epoch} domain={_d} "
+                        f"hard_ood_loss={float(hard_ood_loss_meters[_d].avg):.6f} "
+                        f"inner_ood_loss={float(adv_ood_loss_meters[_d].avg):.6f}"
+                    )
             if getattr(args, "use_hard_style_adv", False) and bool(getattr(args, "hard_adv_monitor_sparsity", False)):
                 for _d in domain_names:
                     print(
@@ -987,8 +1131,12 @@ def run(num_domains):
                 log_dict[f"{domain}/test_acc"] = test_accs[domain].item() if hasattr(test_accs[domain], 'item') else float(test_accs[domain])
                 # Hard-style-adv metrics (only meaningful when --use_hard_style_adv)
                 log_dict[f"{domain}/task_loss"] = float(task_loss_meters[domain].avg)
+                log_dict[f"{domain}/clean_ce"] = float(clean_ce_meters[domain].avg)
                 log_dict[f"{domain}/style_ce"] = float(style_ce_meters[domain].avg)
                 log_dict[f"{domain}/hard_ce"] = float(hard_ce_meters[domain].avg)
+                log_dict[f"{domain}/hard_ce_delta"] = float(hard_ce_delta_meters[domain].avg)
+                log_dict[f"{domain}/hard_ce_harder_ratio"] = float(hard_ce_harder_ratio_meters[domain].avg)
+                log_dict[f"{domain}/hard_ood_loss"] = float(hard_ood_loss_meters[domain].avg)
                 log_dict[f"{domain}/adv_ood_loss"] = float(adv_ood_loss_meters[domain].avg)
                 log_dict[f"{domain}/adv_cls_inner"] = float(adv_cls_inner_meters[domain].avg)
                 log_dict[f"{domain}/mu_orig_norm"] = float(mu_orig_norm_meters[domain].avg)
@@ -1130,8 +1278,16 @@ def run(num_domains):
                 top1_dict[domain].reset()
                 style_aug_flag_meters[domain].reset()
                 task_loss_meters[domain].reset()
+                clean_ce_meters[domain].reset()
+                clean_conf_meters[domain].reset()
+                style_conf_meters[domain].reset()
+                clean_style_ce_cos_meters[domain].reset()
+                clean_style_sym_kl_meters[domain].reset()
                 style_ce_meters[domain].reset()
                 hard_ce_meters[domain].reset()
+                hard_ce_delta_meters[domain].reset()
+                hard_ce_harder_ratio_meters[domain].reset()
+                hard_ood_loss_meters[domain].reset()
                 adv_ood_loss_meters[domain].reset()
                 adv_cls_inner_meters[domain].reset()
                 mu_orig_norm_meters[domain].reset()
@@ -1294,6 +1450,10 @@ if __name__ == "__main__":
                         help='only compute/log hard_adv_log_grad_parts every N epochs (0 disables). Default: 10')
     parser.add_argument('--hard_adv_monitor_sparsity', action='store_true',
                         help='extra hard-adv monitor: print epoch-level sparsity for z_hard/_vec_hard/vec_clean_l4 in terminal (adds one extra forward_from_layer3 per batch)')
+    parser.add_argument('--hard_adv_z_base', type=str, default='clean', choices=['clean', 'style'],
+                        help='base feature map used to compose z_hard content: clean (default) or style')
+    parser.add_argument('--hard_adv_clean_loss_weight', type=float, default=0.0,
+                        help='extra CE weight on clean logits from model(data, communicator=None); 0 disables (default: 0.0)')
     parser.add_argument('--save_spatial_debug_tensors', action='store_true',
                         help='save layer3 spatial debug tensors (input, z_clean, z_style, z_hard) for one batch per selected epoch')
     parser.add_argument('--spatial_debug_domain', type=str, default='sketch',
