@@ -333,7 +333,20 @@ def run(num_domains):
     hard_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
     hard_ce_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
     hard_ce_harder_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Terminal-only: accumulate per-sample hard CE deltas for epoch-level distribution stats.
+    hard_ce_delta_samples = {domain: [] for domain in domain_names}
     hard_ood_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Terminal-only hard-adv classification behavior monitors.
+    hard_style_conf_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_hard_conf_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_style_target_max_gap_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_hard_target_max_gap_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_flip_all_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_flip_on_style_correct_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_mu_hit_lower_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_mu_hit_upper_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_sigma_hit_lower_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    hard_sigma_hit_upper_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
     adv_ood_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
     adv_cls_inner_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Monitor statistics and gradients for mu/sigma in inner loop
@@ -718,6 +731,23 @@ def run(num_domains):
                     sigma_hard = sigma_cur.detach()
                     if not torch.isfinite(mu_hard).all() or not torch.isfinite(sigma_hard).all():
                         raise FloatingPointError("Non-finite mu_hard/sigma_hard detected during inner loop.")
+                    with torch.no_grad():
+                        bound_tol = 1e-7
+                        if adv_update_mode == "pngd":
+                            mu_lower = mu_orig - margin_mu
+                            mu_upper = mu_orig + margin_mu
+                            sigma_lower = sigma_orig - margin_sigma
+                            sigma_upper = sigma_orig + margin_sigma
+                            mu_hit_lower_ratio = float((mu_hard <= (mu_lower + bound_tol)).float().mean().item())
+                            mu_hit_upper_ratio = float((mu_hard >= (mu_upper - bound_tol)).float().mean().item())
+                            sigma_hit_lower_ratio = float((sigma_hard <= (sigma_lower + bound_tol)).float().mean().item())
+                            sigma_hit_upper_ratio = float((sigma_hard >= (sigma_upper - bound_tol)).float().mean().item())
+                        else:
+                            # No explicit box projection in plain GD; keep zero ratios.
+                            mu_hit_lower_ratio = 0.0
+                            mu_hit_upper_ratio = 0.0
+                            sigma_hit_lower_ratio = 0.0
+                            sigma_hit_upper_ratio = 0.0
 
                     # Restore training modes and requires_grad for outer loop.
                     if prev_backbone_training is not None:
@@ -787,13 +817,40 @@ def run(num_domains):
                         hard_ce_delta_vec = hard_ce_vec - L_cls_inner_vec.detach()
                         hard_ce_delta = float(hard_ce_delta_vec.mean().item())
                         hard_ce_harder_ratio = float((hard_ce_delta_vec > 0).float().mean().item())
+                        probs_style = F.softmax(logits_style, dim=1)
+                        probs_hard = F.softmax(logits_hard, dim=1)
+                        style_conf = float(probs_style.max(dim=1).values.mean().item())
+                        hard_conf = float(probs_hard.max(dim=1).values.mean().item())
+
+                        style_target_logit = logits_style.gather(1, target.view(-1, 1)).squeeze(1)
+                        hard_target_logit = logits_hard.gather(1, target.view(-1, 1)).squeeze(1)
+                        style_max_logit = logits_style.max(dim=1).values
+                        hard_max_logit = logits_hard.max(dim=1).values
+                        style_target_max_gap = float((style_max_logit - style_target_logit).mean().item())
+                        hard_target_max_gap = float((hard_max_logit - hard_target_logit).mean().item())
+
+                        style_pred = logits_style.argmax(dim=1)
+                        hard_pred = logits_hard.argmax(dim=1)
+                        style_correct = (style_pred == target)
+                        hard_wrong = (hard_pred != target)
+                        flip_mask = style_correct & hard_wrong
+                        flip_all_ratio = float(flip_mask.float().mean().item())
+                        style_correct_count = int(style_correct.sum().item())
+                        if style_correct_count > 0:
+                            flip_on_style_correct_ratio = float(
+                                flip_mask[style_correct].float().mean().item()
+                            )
+                        else:
+                            flip_on_style_correct_ratio = 0.0
+
+                    hard_ce_delta_samples[domain].append(hard_ce_delta_vec.detach().cpu())
 
                     # 線性 warmup：從 epoch 0 到 60，z_hard 權重從 0 → 0.5
                     # 之後維持 0.5；z_style 權重始終為 1 - w_hard。
                     warmup_epochs = 60.0
                     # 以當前 iteration 推出「目前是第幾個 epoch」（浮點數）
                     current_epoch = (k + 1) / float(STEPS_PER_EPOCH) if STEPS_PER_EPOCH > 0 else 0.0
-                    hard_weight = 0.5 * min(max(current_epoch / warmup_epochs, 0.0), 1.0)
+                    hard_weight = 0.2 * min(max(current_epoch / warmup_epochs, 0.0), 1.0)
                     style_weight = 1.0 - hard_weight
 
                     if adv_equal_ce_weight:
@@ -808,6 +865,18 @@ def run(num_domains):
                     hard_ce_delta_meters[domain].update(hard_ce_delta, data.size(0))
                     hard_ce_harder_ratio_meters[domain].update(hard_ce_harder_ratio, data.size(0))
                     hard_ood_loss_meters[domain].update(float(hard_ood_loss.item()), data.size(0))
+                    hard_style_conf_meters[domain].update(style_conf, data.size(0))
+                    hard_hard_conf_meters[domain].update(hard_conf, data.size(0))
+                    hard_style_target_max_gap_meters[domain].update(style_target_max_gap, data.size(0))
+                    hard_hard_target_max_gap_meters[domain].update(hard_target_max_gap, data.size(0))
+                    hard_flip_all_ratio_meters[domain].update(flip_all_ratio, data.size(0))
+                    hard_flip_on_style_correct_ratio_meters[domain].update(
+                        flip_on_style_correct_ratio, data.size(0)
+                    )
+                    hard_mu_hit_lower_ratio_meters[domain].update(mu_hit_lower_ratio, data.size(0))
+                    hard_mu_hit_upper_ratio_meters[domain].update(mu_hit_upper_ratio, data.size(0))
+                    hard_sigma_hit_lower_ratio_meters[domain].update(sigma_hit_lower_ratio, data.size(0))
+                    hard_sigma_hit_upper_ratio_meters[domain].update(sigma_hit_upper_ratio, data.size(0))
                     adv_ood_loss_meters[domain].update(float(L_ood.item()), data.size(0))
                     adv_cls_inner_meters[domain].update(float(L_cls_inner.item()), data.size(0))
                 else:
@@ -1075,22 +1144,45 @@ def run(num_domains):
             avg_train_acc_val = avg_train_acc.item() if hasattr(avg_train_acc, 'item') else float(avg_train_acc)
             avg_test_acc_val = avg_test_acc.item() if hasattr(avg_test_acc, 'item') else float(avg_test_acc)
             print(f"Epoch {epoch}: avg_loss={avg_train_loss_val:.3f}, avg_train_acc={avg_train_acc_val:.2f}%, avg_test_acc={avg_test_acc_val:.2f}%")
-            for _d in domain_names:
-                print(
-                    f"[confidence] epoch={epoch} domain={_d} "
-                    f"clean_train={float(clean_conf_meters[_d].avg):.4f} "
-                    f"style_train={float(style_conf_meters[_d].avg):.4f} "
-                    f"test={float(test_confidences[_d]):.4f} "
-                    f"ce_cos={float(clean_style_ce_cos_meters[_d].avg):.4f} "
-                    f"sym_kl={float(clean_style_sym_kl_meters[_d].avg):.6f}"
-                )
+            if not getattr(args, "use_hard_style_adv", False):
+                for _d in domain_names:
+                    print(
+                        f"[confidence] epoch={epoch} domain={_d} "
+                        f"clean_train={float(clean_conf_meters[_d].avg):.4f} "
+                        f"style_train={float(style_conf_meters[_d].avg):.4f} "
+                        f"test={float(test_confidences[_d]):.4f} "
+                        f"ce_cos={float(clean_style_ce_cos_meters[_d].avg):.4f} "
+                        f"sym_kl={float(clean_style_sym_kl_meters[_d].avg):.6f}"
+                    )
             if getattr(args, "use_hard_style_adv", False):
                 for _d in domain_names:
                     print(
-                        f"[hard_ood] epoch={epoch} domain={_d} "
-                        f"hard_ood_loss={float(hard_ood_loss_meters[_d].avg):.6f} "
-                        f"inner_ood_loss={float(adv_ood_loss_meters[_d].avg):.6f}"
+                        f"[hard_cls] epoch={epoch} domain={_d} "
+                        f"style_conf={float(hard_style_conf_meters[_d].avg):.4f} "
+                        f"hard_conf={float(hard_hard_conf_meters[_d].avg):.4f} "
+                        f"style_gap(max-target)={float(hard_style_target_max_gap_meters[_d].avg):.6f} "
+                        f"hard_gap(max-target)={float(hard_hard_target_max_gap_meters[_d].avg):.6f} "
+                        f"flip_all={float(hard_flip_all_ratio_meters[_d].avg):.4f} "
+                        f"flip_on_style_correct={float(hard_flip_on_style_correct_ratio_meters[_d].avg):.4f}"
                     )
+                    mean_delta = float(hard_ce_delta_meters[_d].avg)
+                    if len(hard_ce_delta_samples[_d]) == 0:
+                        print(
+                            f"[hard_ce_delta_dist] epoch={epoch} domain={_d} "
+                            f"mean={mean_delta:.6f} no_samples"
+                        )
+                    else:
+                        delta_all = torch.cat(hard_ce_delta_samples[_d], dim=0)
+                        qs = torch.quantile(
+                            delta_all,
+                            torch.tensor([0.25, 0.50, 0.75, 0.90], dtype=delta_all.dtype),
+                        )
+                        p25, p50, p75, p90 = float(qs[0].item()), float(qs[1].item()), float(qs[2].item()), float(qs[3].item())
+                        std = float(delta_all.std(unbiased=False).item())
+                        print(
+                            f"[hard_ce_delta_dist] epoch={epoch} domain={_d} "
+                            f"mean={mean_delta:.6f} std={std:.6f} p25={p25:.6f} p50={p50:.6f} p75={p75:.6f} p90={p90:.6f}"
+                        )
             if getattr(args, "use_hard_style_adv", False) and bool(getattr(args, "hard_adv_monitor_sparsity", False)):
                 for _d in domain_names:
                     print(
@@ -1136,8 +1228,6 @@ def run(num_domains):
                 log_dict[f"{domain}/hard_ce"] = float(hard_ce_meters[domain].avg)
                 log_dict[f"{domain}/hard_ce_delta"] = float(hard_ce_delta_meters[domain].avg)
                 log_dict[f"{domain}/hard_ce_harder_ratio"] = float(hard_ce_harder_ratio_meters[domain].avg)
-                log_dict[f"{domain}/hard_ood_loss"] = float(hard_ood_loss_meters[domain].avg)
-                log_dict[f"{domain}/adv_ood_loss"] = float(adv_ood_loss_meters[domain].avg)
                 log_dict[f"{domain}/adv_cls_inner"] = float(adv_cls_inner_meters[domain].avg)
                 log_dict[f"{domain}/mu_orig_norm"] = float(mu_orig_norm_meters[domain].avg)
                 log_dict[f"{domain}/sigma_orig_norm"] = float(sigma_orig_norm_meters[domain].avg)
@@ -1287,7 +1377,18 @@ def run(num_domains):
                 hard_ce_meters[domain].reset()
                 hard_ce_delta_meters[domain].reset()
                 hard_ce_harder_ratio_meters[domain].reset()
+                hard_ce_delta_samples[domain].clear()
                 hard_ood_loss_meters[domain].reset()
+                hard_style_conf_meters[domain].reset()
+                hard_hard_conf_meters[domain].reset()
+                hard_style_target_max_gap_meters[domain].reset()
+                hard_hard_target_max_gap_meters[domain].reset()
+                hard_flip_all_ratio_meters[domain].reset()
+                hard_flip_on_style_correct_ratio_meters[domain].reset()
+                hard_mu_hit_lower_ratio_meters[domain].reset()
+                hard_mu_hit_upper_ratio_meters[domain].reset()
+                hard_sigma_hit_lower_ratio_meters[domain].reset()
+                hard_sigma_hit_upper_ratio_meters[domain].reset()
                 adv_ood_loss_meters[domain].reset()
                 adv_cls_inner_meters[domain].reset()
                 mu_orig_norm_meters[domain].reset()
