@@ -106,6 +106,44 @@ def compute_loader_avg_confidence(model, data_loader):
     return (total_conf / max(1, total_count))
 
 
+def compute_loader_per_class_accuracy(model, data_loader, num_classes):
+    """
+    Compute per-class accuracy on a data loader.
+
+    Returns:
+        per_class_acc: list[float] length=num_classes, each in [0, 100]
+        class_correct: list[int]
+        class_total: list[int]
+    """
+    was_training = model.training
+    model.eval()
+    class_correct = [0 for _ in range(num_classes)]
+    class_total = [0 for _ in range(num_classes)]
+    with torch.no_grad():
+        for batch in data_loader:
+            data, target, _ = util.unpack_batch(batch)
+            data = data.cuda(non_blocking=True)
+            target = target.cuda(non_blocking=True)
+            logits = model(data)
+            pred = logits.argmax(dim=1)
+            for c in range(num_classes):
+                mask = (target == c)
+                cnt = int(mask.sum().item())
+                if cnt == 0:
+                    continue
+                class_total[c] += cnt
+                class_correct[c] += int((pred[mask] == target[mask]).sum().item())
+    if was_training:
+        model.train()
+    per_class_acc = []
+    for c in range(num_classes):
+        if class_total[c] > 0:
+            per_class_acc.append(100.0 * float(class_correct[c]) / float(class_total[c]))
+        else:
+            per_class_acc.append(0.0)
+    return per_class_acc, class_correct, class_total
+
+
 def run(num_domains):
     """
     Single process training function for decentralized learning.
@@ -366,15 +404,54 @@ def run(num_domains):
     grad_mu_cls_l1_max_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Pooled feature shift: vec_hard vs vec_style (same forward path intent as style branch baseline).
     vec_hard_vs_style_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
-    # Terminal-only monitoring (not logged to wandb); enabled by --hard_adv_monitor_sparsity.
+    # Style CE vs Hard CE gradient monitors (per-parameter-group).
+    grad_style_norm_layer3_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_hard_norm_layer3_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_style_hard_cos_layer3_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_style_norm_layer4_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_hard_norm_layer4_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_style_hard_cos_layer4_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_style_norm_head_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_hard_norm_head_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_style_hard_cos_head_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_style_norm_backbone_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_hard_norm_backbone_meters = {domain: util.AverageMeter() for domain in domain_names}
+    grad_style_hard_cos_backbone_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Consensus drift monitors (model aggregation pre/post communicate).
+    drift_l2_layer4_meters = {domain: util.AverageMeter() for domain in domain_names}
+    drift_rel_layer4_meters = {domain: util.AverageMeter() for domain in domain_names}
+    drift_l2_head_meters = {domain: util.AverageMeter() for domain in domain_names}
+    drift_rel_head_meters = {domain: util.AverageMeter() for domain in domain_names}
+    drift_l2_backbone_meters = {domain: util.AverageMeter() for domain in domain_names}
+    drift_rel_backbone_meters = {domain: util.AverageMeter() for domain in domain_names}
+    drift_pairwise_head_pre_meters = util.AverageMeter()
+    drift_pairwise_head_post_meters = util.AverageMeter()
+    drift_pairwise_backbone_pre_meters = util.AverageMeter()
+    drift_pairwise_backbone_post_meters = util.AverageMeter()
+    # Terminal-only monitoring; enabled by --hard_adv_monitor_sparsity / --hard_adv_monitor_direction.
     z_hard_sparsity_meters = {domain: util.AverageMeter() for domain in domain_names}
     vec_hard_sparsity_meters = {domain: util.AverageMeter() for domain in domain_names}
     vec_clean_l4_sparsity_meters = {domain: util.AverageMeter() for domain in domain_names}
     vec_hard_vs_clean_l4_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
+    vec_style_hard_dir_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
+    vec_style_from_clean_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    vec_hard_from_clean_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    vec_style_hard_dir_cos_low03_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Orthogonal hard-adv debug (only meaningful when --hard_adv_orthogonal_style_clean).
+    # removed_ratio = ||proj_v(g)|| / ||g|| in concat(mu,sigma) space, computed per-sample and averaged.
+    orth_removed_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Fraction of samples that fall back to the original gradient because ||g_orth|| is too small.
+    orth_fallback_frac_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Terminal-only: per-sample direction cosine distribution for epoch-level quantiles.
+    vec_style_hard_dir_cos_samples = {domain: [] for domain in domain_names}
     loss_diff_meters = {domain: util.AverageMeter() for domain in domain_names} if getattr(args, 'use_ood', False) else None
     # Accumulate batch-mean |grad_mu_cls| per channel for optional epoch dump (only when log_grad_parts batches run).
     grad_mu_cls_abs_ch_sum = {domain: None for domain in domain_names}
     grad_mu_cls_abs_ch_count = {domain: 0 for domain in domain_names}
+    # Sketch-on-photo class-wise monitor (PACS has 7 classes).
+    sketch_num_classes = 7
+    sketch_vol_window = 10
+    sketch_class_acc_history = [[] for _ in range(sketch_num_classes)]
     tic = time.time()
 
     # ===== start training with fixed total steps K (Algorithm 1) =====
@@ -483,6 +560,9 @@ def run(num_domains):
             hard_adv_z_base = str(getattr(args, "hard_adv_z_base", "clean")).lower()
             hard_adv_clean_loss_weight = float(getattr(args, "hard_adv_clean_loss_weight", 0.0))
             hard_adv_monitor_sparsity = bool(getattr(args, "hard_adv_monitor_sparsity", False))
+            hard_adv_monitor_direction = bool(getattr(args, "hard_adv_monitor_direction", False))
+            hard_adv_orthogonal_style_clean = bool(getattr(args, "hard_adv_orthogonal_style_clean", False))
+            hard_adv_orth_fallback_ratio = float(getattr(args, "hard_adv_orth_fallback_ratio", 0.05))
             log_grad_parts_every = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
             # Use step index to estimate the current (integer) epoch.
             # Note: wandb logging uses 1-based epoch = (k+1)//STEPS_PER_EPOCH.
@@ -522,8 +602,11 @@ def run(num_domains):
                 z_clean = None
                 need_clean_for_adv = (hard_adv_z_base == "clean")
                 need_clean_for_dump = should_save_spatial_dump and (clean_layer3_cache.get(domain) is None)
-                need_clean_for_monitor = hard_adv_monitor_sparsity and (hard_adv_z_base == "clean")
-                if need_clean_for_adv or need_clean_for_dump or need_clean_for_monitor:
+                # For monitor_direction, always compute z_clean reference regardless of hard_adv_z_base.
+                # This runs in the existing safe monitor path (temporary eval + restored mode).
+                need_clean_for_monitor = hard_adv_monitor_sparsity or hard_adv_monitor_direction
+                need_clean_for_orth = bool(getattr(args, "hard_adv_orthogonal_style_clean", False))
+                if need_clean_for_adv or need_clean_for_dump or need_clean_for_monitor or need_clean_for_orth:
                     # Get z_clean with gradient graph while preventing an extra BN running-stats update.
                     # We temporarily switch backbone/model to eval() for this forward only.
                     backbone_for_clean = getattr(model, "backbone", None)
@@ -581,6 +664,19 @@ def run(num_domains):
                         sigma_orig_norm = sigma_orig.norm().item()
                         mu_orig_norm_meters[domain].update(mu_orig_norm, data.size(0))
                         sigma_orig_norm_meters[domain].update(sigma_orig_norm, data.size(0))
+
+                    # Unit direction of (style - clean) in (mu, sigma) concat space for optional orthogonal inner grads.
+                    v_style_clean_unit = None
+                    if hard_adv_orthogonal_style_clean and z_clean is not None:
+                        with torch.no_grad():
+                            mu_clean_ref = z_clean.detach().mean(dim=(2, 3), keepdim=True)
+                            var_clean_ref = z_clean.detach().var(dim=(2, 3), unbiased=False, keepdim=True)
+                            sigma_clean_ref = torch.sqrt(var_clean_ref + adv_eps)
+                            d_mu_sc = (mu_orig - mu_clean_ref).reshape(z_style.size(0), -1)
+                            d_sig_sc = (sigma_orig - sigma_clean_ref).reshape(z_style.size(0), -1)
+                            v_cat = torch.cat([d_mu_sc, d_sig_sc], dim=1)
+                            v_norm = v_cat.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                            v_style_clean_unit = v_cat / v_norm
 
                     # z_hat uses detached z_base-normalized content (inner loop should not affect backbone).
                     z_norm_detached = (z_base.detach() - mu_base) / (sigma_base + adv_eps)
@@ -677,6 +773,28 @@ def run(num_domains):
                             grad_mu, grad_sigma = torch.autograd.grad(
                                 L_adv, [mu_cur, sigma_cur], create_graph=False
                             )
+
+                        # Optional: remove inner-loop gradient component parallel to (style-clean) in (mu,sigma) space.
+                        if v_style_clean_unit is not None:
+                            Bsz, Cch = z_style.size(0), z_style.size(1)
+                            g_mu_f = grad_mu.reshape(Bsz, -1)
+                            g_sig_f = grad_sigma.reshape(Bsz, -1)
+                            g_cat = torch.cat([g_mu_f, g_sig_f], dim=1)
+                            v = v_style_clean_unit
+                            dot = (g_cat * v).sum(dim=1, keepdim=True)
+                            g_par = dot * v
+                            g_orth = g_cat - g_par
+                            g_orth_n = g_orth.norm(dim=1, keepdim=True)
+                            g_cat_n = g_cat.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                            tiny = g_orth_n < (hard_adv_orth_fallback_ratio * g_cat_n)
+                            g_use = torch.where(tiny, g_cat, g_orth)
+                            grad_mu = g_use[:, :Cch].reshape_as(grad_mu)
+                            grad_sigma = g_use[:, Cch:].reshape_as(grad_sigma)
+                            with torch.no_grad():
+                                removed_ratio = (g_par.norm(dim=1) / g_cat_n.squeeze(1)).mean().item()
+                                fallback_frac = tiny.float().mean().item()
+                            orth_removed_ratio_meters[domain].update(float(removed_ratio), data.size(0))
+                            orth_fallback_frac_meters[domain].update(float(fallback_frac), data.size(0))
 
                         # 監控梯度範數（取最後一步為代表）
                         grad_mu_norm = grad_mu.norm().item()
@@ -785,7 +903,7 @@ def run(num_domains):
                             finally:
                                 diffusion_model.train(prev_diff_training_for_monitor)
                         # Monitoring-only reference: run z_clean through layer4+pool once when available.
-                        if hard_adv_monitor_sparsity and z_clean is not None:
+                        if (hard_adv_monitor_sparsity or hard_adv_monitor_direction) and z_clean is not None:
                             with torch.no_grad():
                                 _logits_clean_l4, _vec_clean_l4 = model.forward_from_layer3(z_clean.detach())
                     finally:
@@ -809,6 +927,22 @@ def run(num_domains):
                         if z_clean is not None:
                             vec_clean_l4_sparsity_meters[domain].update(vec_clean_l4_sparsity, data.size(0))
                             vec_hard_vs_clean_l4_delta_meters[domain].update(vec_hard_vs_clean_l4_delta, data.size(0))
+                    if hard_adv_monitor_direction and z_clean is not None:
+                        with torch.no_grad():
+                            d_style = vec_style.detach() - _vec_clean_l4.detach()
+                            d_hard = _vec_hard.detach() - _vec_clean_l4.detach()
+                            d_style_norm = d_style.norm(dim=1)
+                            d_hard_norm = d_hard.norm(dim=1)
+                            dir_cos_vec = F.cosine_similarity(d_style, d_hard, dim=1, eps=1e-12)
+                            dir_cos = dir_cos_vec.mean().item()
+                            dir_cos_low03 = float((dir_cos_vec < 0.3).float().mean().item())
+                            vec_style_from_clean_norm = d_style_norm.mean().item()
+                            vec_hard_from_clean_norm = d_hard_norm.mean().item()
+                        vec_style_hard_dir_cos_meters[domain].update(float(dir_cos), data.size(0))
+                        vec_style_hard_dir_cos_low03_meters[domain].update(float(dir_cos_low03), data.size(0))
+                        vec_style_from_clean_norm_meters[domain].update(float(vec_style_from_clean_norm), data.size(0))
+                        vec_hard_from_clean_norm_meters[domain].update(float(vec_hard_from_clean_norm), data.size(0))
+                        vec_style_hard_dir_cos_samples[domain].append(dir_cos_vec.detach().cpu())
 
                     loss_style_ce = criterion(logits_style, target)
                     hard_ce_vec = F.cross_entropy(logits_hard, target, reduction='none')
@@ -844,6 +978,75 @@ def run(num_domains):
                             flip_on_style_correct_ratio = 0.0
 
                     hard_ce_delta_samples[domain].append(hard_ce_delta_vec.detach().cpu())
+
+                    # Gradient conflict monitor: compare grads from style/hard CE over selected groups.
+                    backbone_mod = getattr(model, "backbone", None)
+                    if backbone_mod is not None and hasattr(backbone_mod, "layer3") and hasattr(backbone_mod, "layer4") and hasattr(backbone_mod, "fc"):
+                        full_backbone_params = [p for p in backbone_mod.parameters() if p.requires_grad]
+                        if len(full_backbone_params) > 0:
+                            grad_style_all = torch.autograd.grad(
+                                loss_style_ce,
+                                full_backbone_params,
+                                retain_graph=True,
+                                allow_unused=True,
+                            )
+                            grad_hard_all = torch.autograd.grad(
+                                loss_hard_ce,
+                                full_backbone_params,
+                                retain_graph=True,
+                                allow_unused=True,
+                            )
+                            grad_style_map = {id(p): g for p, g in zip(full_backbone_params, grad_style_all)}
+                            grad_hard_map = {id(p): g for p, g in zip(full_backbone_params, grad_hard_all)}
+
+                            def _norm_and_cos(subset_params):
+                                style_chunks, hard_chunks = [], []
+                                for _p in subset_params:
+                                    gs = grad_style_map.get(id(_p))
+                                    gh = grad_hard_map.get(id(_p))
+                                    if gs is None or gh is None:
+                                        continue
+                                    style_chunks.append(gs.reshape(-1))
+                                    hard_chunks.append(gh.reshape(-1))
+                                if len(style_chunks) == 0:
+                                    return 0.0, 0.0, 0.0
+                                gs_vec = torch.cat(style_chunks, dim=0)
+                                gh_vec = torch.cat(hard_chunks, dim=0)
+                                gs_norm = float(gs_vec.norm().item())
+                                gh_norm = float(gh_vec.norm().item())
+                                if gs_norm <= 0.0 or gh_norm <= 0.0:
+                                    return gs_norm, gh_norm, 0.0
+                                cos = float(
+                                    F.cosine_similarity(
+                                        gs_vec.unsqueeze(0),
+                                        gh_vec.unsqueeze(0),
+                                        dim=1,
+                                        eps=1e-12,
+                                    ).item()
+                                )
+                                return gs_norm, gh_norm, cos
+
+                            layer3_params = [p for p in backbone_mod.layer3.parameters() if p.requires_grad]
+                            layer4_params = [p for p in backbone_mod.layer4.parameters() if p.requires_grad]
+                            head_params = [p for p in backbone_mod.fc.parameters() if p.requires_grad]
+
+                            s3, h3, c3 = _norm_and_cos(layer3_params)
+                            s4, h4, c4 = _norm_and_cos(layer4_params)
+                            sh, hh, ch = _norm_and_cos(head_params)
+                            sb, hb, cb = _norm_and_cos(full_backbone_params)
+
+                            grad_style_norm_layer3_meters[domain].update(s3, data.size(0))
+                            grad_hard_norm_layer3_meters[domain].update(h3, data.size(0))
+                            grad_style_hard_cos_layer3_meters[domain].update(c3, data.size(0))
+                            grad_style_norm_layer4_meters[domain].update(s4, data.size(0))
+                            grad_hard_norm_layer4_meters[domain].update(h4, data.size(0))
+                            grad_style_hard_cos_layer4_meters[domain].update(c4, data.size(0))
+                            grad_style_norm_head_meters[domain].update(sh, data.size(0))
+                            grad_hard_norm_head_meters[domain].update(hh, data.size(0))
+                            grad_style_hard_cos_head_meters[domain].update(ch, data.size(0))
+                            grad_style_norm_backbone_meters[domain].update(sb, data.size(0))
+                            grad_hard_norm_backbone_meters[domain].update(hb, data.size(0))
+                            grad_style_hard_cos_backbone_meters[domain].update(cb, data.size(0))
 
                     # 線性 warmup：從 epoch 0 到 60，z_hard 權重從 0 → 0.5
                     # 之後維持 0.5；z_style 權重始終為 1 - w_hard。
@@ -1069,10 +1272,107 @@ def run(num_domains):
                         bn_states_dict[domain][name]['num_batches_tracked'] = module.num_batches_tracked.clone()
         
         # ========== 第三阶段：交换训练后的模型参数 ==========
+        # Snapshot model parameters before consensus aggregation for drift monitoring.
+        pre_comm_snapshots = {}
+        for domain in domain_names:
+            backbone = getattr(models_dict[domain], "backbone", None)
+            if backbone is None:
+                continue
+            pre_comm_snapshots[domain] = {
+                "layer4": [p.detach().clone() for p in backbone.layer4.parameters() if p.requires_grad],
+                "head": [p.detach().clone() for p in backbone.fc.parameters() if p.requires_grad],
+                "backbone": [p.detach().clone() for p in backbone.parameters() if p.requires_grad],
+            }
+
+        def _flatten_param_list(params):
+            if len(params) == 0:
+                return None
+            return torch.cat([p.reshape(-1) for p in params], dim=0)
+
+        pre_head_vecs = {}
+        pre_backbone_vecs = {}
+        for domain in domain_names:
+            if domain not in pre_comm_snapshots:
+                continue
+            v_head = _flatten_param_list(pre_comm_snapshots[domain]["head"])
+            v_backbone = _flatten_param_list(pre_comm_snapshots[domain]["backbone"])
+            if v_head is not None:
+                pre_head_vecs[domain] = v_head
+            if v_backbone is not None:
+                pre_backbone_vecs[domain] = v_backbone
+
+        def _pairwise_mean(vec_dict):
+            keys = list(vec_dict.keys())
+            if len(keys) < 2:
+                return 0.0
+            vals = []
+            for i in range(len(keys)):
+                vi = vec_dict[keys[i]]
+                for j in range(i + 1, len(keys)):
+                    vj = vec_dict[keys[j]]
+                    vals.append(float((vi - vj).norm().item()))
+            if len(vals) == 0:
+                return 0.0
+            return float(sum(vals) / len(vals))
+
+        pairwise_head_pre = _pairwise_mean(pre_head_vecs)
+        pairwise_backbone_pre = _pairwise_mean(pre_backbone_vecs)
+
         # Exchange updated model parameters after training step
         # Note: style_vecs_dict is None here since we only exchange model parameters (not style stats)
         d_comm_time_after = communicator.communicate(models_dict, style_vecs_dict=None)
         comm_time += d_comm_time_after
+
+        # Compute per-domain self drift and pairwise post-aggregation drift.
+        post_head_vecs = {}
+        post_backbone_vecs = {}
+        for domain in domain_names:
+            if domain not in pre_comm_snapshots:
+                continue
+            backbone = getattr(models_dict[domain], "backbone", None)
+            if backbone is None:
+                continue
+            post_layer4 = [p.detach() for p in backbone.layer4.parameters() if p.requires_grad]
+            post_head = [p.detach() for p in backbone.fc.parameters() if p.requires_grad]
+            post_backbone = [p.detach() for p in backbone.parameters() if p.requires_grad]
+
+            def _drift_stats(pre_list, post_list):
+                if len(pre_list) == 0 or len(post_list) == 0:
+                    return 0.0, 0.0
+                delta_sq = 0.0
+                base_sq = 0.0
+                for p0, p1 in zip(pre_list, post_list):
+                    d = (p1 - p0).reshape(-1)
+                    b = p0.reshape(-1)
+                    delta_sq += float(torch.dot(d, d).item())
+                    base_sq += float(torch.dot(b, b).item())
+                l2 = (delta_sq + 1e-24) ** 0.5
+                rel = l2 / ((base_sq + 1e-24) ** 0.5 + 1e-12)
+                return l2, rel
+
+            l2_l4, rel_l4 = _drift_stats(pre_comm_snapshots[domain]["layer4"], post_layer4)
+            l2_head, rel_head = _drift_stats(pre_comm_snapshots[domain]["head"], post_head)
+            l2_backbone, rel_backbone = _drift_stats(pre_comm_snapshots[domain]["backbone"], post_backbone)
+            drift_l2_layer4_meters[domain].update(l2_l4, 1)
+            drift_rel_layer4_meters[domain].update(rel_l4, 1)
+            drift_l2_head_meters[domain].update(l2_head, 1)
+            drift_rel_head_meters[domain].update(rel_head, 1)
+            drift_l2_backbone_meters[domain].update(l2_backbone, 1)
+            drift_rel_backbone_meters[domain].update(rel_backbone, 1)
+
+            v_head_post = _flatten_param_list(post_head)
+            v_backbone_post = _flatten_param_list(post_backbone)
+            if v_head_post is not None:
+                post_head_vecs[domain] = v_head_post
+            if v_backbone_post is not None:
+                post_backbone_vecs[domain] = v_backbone_post
+
+        pairwise_head_post = _pairwise_mean(post_head_vecs)
+        pairwise_backbone_post = _pairwise_mean(post_backbone_vecs)
+        drift_pairwise_head_pre_meters.update(pairwise_head_pre, 1)
+        drift_pairwise_head_post_meters.update(pairwise_head_post, 1)
+        drift_pairwise_backbone_pre_meters.update(pairwise_backbone_pre, 1)
+        drift_pairwise_backbone_post_meters.update(pairwise_backbone_post, 1)
         
         # 检查通信后的参数一致性（每epoch检查一次，只在不一致时打印）
         if (k + 1) % STEPS_PER_EPOCH == 0:
@@ -1120,6 +1420,41 @@ def run(num_domains):
                 test_acc = util.test(models_dict[domain], test_loader)
                 test_accs[domain] = test_acc
                 test_confidences[domain] = compute_loader_avg_confidence(models_dict[domain], test_loader)
+                if args.dataset == "pacs" and domain == "sketch":
+                    per_cls_acc, _cls_correct, _cls_total = compute_loader_per_class_accuracy(
+                        models_dict[domain], test_loader, sketch_num_classes
+                    )
+                    for _c in range(sketch_num_classes):
+                        sketch_class_acc_history[_c].append(float(per_cls_acc[_c]))
+                    # Terminal summary: print per-class acc and top-3 volatile classes.
+                    per_cls_str = ", ".join(
+                        f"c{_c}={per_cls_acc[_c]:.2f}" for _c in range(sketch_num_classes)
+                    )
+                    print(
+                        f"[sketch_photo_per_class] epoch={epoch} acc: {per_cls_str}"
+                    )
+                    cls_stats = []
+                    for _c in range(sketch_num_classes):
+                        hist = sketch_class_acc_history[_c]
+                        cur = hist[-1]
+                        prev = hist[-2] if len(hist) >= 2 else cur
+                        delta = abs(cur - prev)
+                        recent = hist[-min(len(hist), sketch_vol_window):]
+                        recent_t = torch.tensor(recent, dtype=torch.float32)
+                        vol_std = float(recent_t.std(unbiased=False).item()) if len(recent) > 1 else 0.0
+                        cls_stats.append((_c, cur, delta, vol_std))
+                    top_delta = sorted(cls_stats, key=lambda x: x[2], reverse=True)[:3]
+                    top_std = sorted(cls_stats, key=lambda x: x[3], reverse=True)[:3]
+                    top_delta_str = ", ".join(
+                        f"c{_c}(d={_d:.2f})" for _c, _cur, _d, _s in top_delta
+                    )
+                    top_std_str = ", ".join(
+                        f"c{_c}(std={_s:.2f})" for _c, _cur, _d, _s in top_std
+                    )
+                    print(
+                        f"[sketch_photo_class_volatility] epoch={epoch} "
+                        f"top_delta: {top_delta_str} | top_std(w={sketch_vol_window}): {top_std_str}"
+                    )
             
             # 測試後再次清理緩存，確保記憶體被釋放
             torch.cuda.empty_cache()
@@ -1192,6 +1527,28 @@ def run(num_domains):
                         f"vec_clean_l4={float(vec_clean_l4_sparsity_meters[_d].avg):.6f} "
                         f"vec_hard_vs_clean_l4_l2={float(vec_hard_vs_clean_l4_delta_meters[_d].avg):.6f}"
                     )
+            if getattr(args, "use_hard_style_adv", False) and bool(getattr(args, "hard_adv_monitor_direction", False)):
+                for _d in domain_names:
+                    if len(vec_style_hard_dir_cos_samples[_d]) > 0:
+                        cos_all = torch.cat(vec_style_hard_dir_cos_samples[_d], dim=0)
+                        qs = torch.quantile(
+                            cos_all,
+                            torch.tensor([0.10, 0.50, 0.90], dtype=cos_all.dtype),
+                        )
+                        p10, p50, p90 = float(qs[0].item()), float(qs[1].item()), float(qs[2].item())
+                    else:
+                        p10, p50, p90 = 0.0, 0.0, 0.0
+                    print(
+                        f"[style_hard_direction] epoch={epoch} domain={_d} "
+                        f"cos={float(vec_style_hard_dir_cos_meters[_d].avg):.6f} "
+                        f"p10={p10:.6f} p50={p50:.6f} p90={p90:.6f} "
+                        f"frac_lt_0.3={float(vec_style_hard_dir_cos_low03_meters[_d].avg):.6f} "
+                        f"|style-clean|={float(vec_style_from_clean_norm_meters[_d].avg):.6f} "
+                        f"|hard-clean|={float(vec_hard_from_clean_norm_meters[_d].avg):.6f} "
+                        f"|hard-style|={float(vec_hard_vs_style_delta_meters[_d].avg):.6f} "
+                        f"orth_removed={float(orth_removed_ratio_meters[_d].avg):.6f} "
+                        f"orth_fallback={float(orth_fallback_frac_meters[_d].avg):.6f}"
+                    )
 
             # Epoch-mean |grad_mu_cls| per channel (only from batches where log_grad_parts ran this epoch).
             grad_mu_cls_ch_avg_epoch = {}
@@ -1235,6 +1592,27 @@ def run(num_domains):
                 log_dict[f"{domain}/grad_sigma_norm"] = float(grad_sigma_norm_meters[domain].avg)
                 log_dict[f"{domain}/rel_mu_step"] = float(rel_mu_step_meters[domain].avg)
                 log_dict[f"{domain}/rel_sigma_step"] = float(rel_sigma_step_meters[domain].avg)
+                log_dict[f"{domain}/grad_style_norm/layer3"] = float(grad_style_norm_layer3_meters[domain].avg)
+                log_dict[f"{domain}/grad_hard_norm/layer3"] = float(grad_hard_norm_layer3_meters[domain].avg)
+                log_dict[f"{domain}/grad_style_hard_cos/layer3"] = float(grad_style_hard_cos_layer3_meters[domain].avg)
+                log_dict[f"{domain}/grad_style_norm/layer4"] = float(grad_style_norm_layer4_meters[domain].avg)
+                log_dict[f"{domain}/grad_hard_norm/layer4"] = float(grad_hard_norm_layer4_meters[domain].avg)
+                log_dict[f"{domain}/grad_style_hard_cos/layer4"] = float(grad_style_hard_cos_layer4_meters[domain].avg)
+                log_dict[f"{domain}/grad_style_norm/head"] = float(grad_style_norm_head_meters[domain].avg)
+                log_dict[f"{domain}/grad_hard_norm/head"] = float(grad_hard_norm_head_meters[domain].avg)
+                log_dict[f"{domain}/grad_style_hard_cos/head"] = float(grad_style_hard_cos_head_meters[domain].avg)
+                log_dict[f"{domain}/grad_style_norm/full_backbone"] = float(grad_style_norm_backbone_meters[domain].avg)
+                log_dict[f"{domain}/grad_hard_norm/full_backbone"] = float(grad_hard_norm_backbone_meters[domain].avg)
+                log_dict[f"{domain}/grad_style_hard_cos/full_backbone"] = float(grad_style_hard_cos_backbone_meters[domain].avg)
+                log_dict[f"{domain}/consensus_drift/layer4_l2"] = float(drift_l2_layer4_meters[domain].avg)
+                log_dict[f"{domain}/consensus_drift/layer4_rel"] = float(drift_rel_layer4_meters[domain].avg)
+                log_dict[f"{domain}/consensus_drift/head_l2"] = float(drift_l2_head_meters[domain].avg)
+                log_dict[f"{domain}/consensus_drift/head_rel"] = float(drift_rel_head_meters[domain].avg)
+                log_dict[f"{domain}/consensus_drift/full_backbone_l2"] = float(drift_l2_backbone_meters[domain].avg)
+                log_dict[f"{domain}/consensus_drift/full_backbone_rel"] = float(drift_rel_backbone_meters[domain].avg)
+                log_dict[f"{domain}/style_hard_direction/cos"] = float(vec_style_hard_dir_cos_meters[domain].avg)
+                log_dict[f"{domain}/style_hard_direction/style_clean_norm"] = float(vec_style_from_clean_norm_meters[domain].avg)
+                log_dict[f"{domain}/style_hard_direction/hard_clean_norm"] = float(vec_hard_from_clean_norm_meters[domain].avg)
                 log_grad_parts_every = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
                 do_log_grad_parts = bool(getattr(args, "hard_adv_log_grad_parts", False)) and (
                     log_grad_parts_every > 0 and (epoch % log_grad_parts_every == 0)
@@ -1250,6 +1628,33 @@ def run(num_domains):
                         _v = grad_mu_cls_ch_avg_epoch[domain].numpy()
                         log_dict[f"{domain}/grad_mu_cls_abs_per_channel_hist"] = wandb.Histogram(_v)
                 log_dict[f"{domain}/vec_hard_vs_style_delta"] = float(vec_hard_vs_style_delta_meters[domain].avg)
+                if args.dataset == "pacs" and domain == "sketch":
+                    cls_stats = []
+                    for _c in range(sketch_num_classes):
+                        hist = sketch_class_acc_history[_c]
+                        if len(hist) == 0:
+                            continue
+                        cur = hist[-1]
+                        prev = hist[-2] if len(hist) >= 2 else cur
+                        delta = abs(cur - prev)
+                        recent = hist[-min(len(hist), sketch_vol_window):]
+                        recent_t = torch.tensor(recent, dtype=torch.float32)
+                        vol_std = float(recent_t.std(unbiased=False).item()) if len(recent) > 1 else 0.0
+                        cls_stats.append((_c, cur, delta, vol_std))
+                    if len(cls_stats) > 0:
+                        worst_cur = min(cls_stats, key=lambda x: x[1])
+                        top_delta_one = max(cls_stats, key=lambda x: x[2])
+                        top_std_one = max(cls_stats, key=lambda x: x[3])
+                        log_dict[f"{domain}/class_monitor/worst_class_id"] = float(worst_cur[0])
+                        log_dict[f"{domain}/class_monitor/worst_class_acc"] = float(worst_cur[1])
+                        log_dict[f"{domain}/class_monitor/max_delta_class_id"] = float(top_delta_one[0])
+                        log_dict[f"{domain}/class_monitor/max_delta"] = float(top_delta_one[2])
+                        log_dict[f"{domain}/class_monitor/max_std_class_id"] = float(top_std_one[0])
+                        log_dict[f"{domain}/class_monitor/max_std"] = float(top_std_one[3])
+            log_dict["consensus_drift/pairwise_head_pre"] = float(drift_pairwise_head_pre_meters.avg)
+            log_dict["consensus_drift/pairwise_head_post"] = float(drift_pairwise_head_post_meters.avg)
+            log_dict["consensus_drift/pairwise_full_backbone_pre"] = float(drift_pairwise_backbone_pre_meters.avg)
+            log_dict["consensus_drift/pairwise_full_backbone_post"] = float(drift_pairwise_backbone_post_meters.avg)
 
             log_grad_parts_every_ep = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
             do_log_grad_parts_ep = bool(getattr(args, "hard_adv_log_grad_parts", False)) and (
@@ -1402,6 +1807,31 @@ def run(num_domains):
                 grad_ood_cls_cos_meters[domain].reset()
                 grad_mu_cls_l1_max_ratio_meters[domain].reset()
                 vec_hard_vs_style_delta_meters[domain].reset()
+                grad_style_norm_layer3_meters[domain].reset()
+                grad_hard_norm_layer3_meters[domain].reset()
+                grad_style_hard_cos_layer3_meters[domain].reset()
+                grad_style_norm_layer4_meters[domain].reset()
+                grad_hard_norm_layer4_meters[domain].reset()
+                grad_style_hard_cos_layer4_meters[domain].reset()
+                grad_style_norm_head_meters[domain].reset()
+                grad_hard_norm_head_meters[domain].reset()
+                grad_style_hard_cos_head_meters[domain].reset()
+                grad_style_norm_backbone_meters[domain].reset()
+                grad_hard_norm_backbone_meters[domain].reset()
+                grad_style_hard_cos_backbone_meters[domain].reset()
+                drift_l2_layer4_meters[domain].reset()
+                drift_rel_layer4_meters[domain].reset()
+                drift_l2_head_meters[domain].reset()
+                drift_rel_head_meters[domain].reset()
+                drift_l2_backbone_meters[domain].reset()
+                drift_rel_backbone_meters[domain].reset()
+                vec_style_hard_dir_cos_meters[domain].reset()
+                vec_style_from_clean_norm_meters[domain].reset()
+                vec_hard_from_clean_norm_meters[domain].reset()
+                vec_style_hard_dir_cos_low03_meters[domain].reset()
+                orth_removed_ratio_meters[domain].reset()
+                orth_fallback_frac_meters[domain].reset()
+                vec_style_hard_dir_cos_samples[domain].clear()
                 if bool(getattr(args, "hard_adv_monitor_sparsity", False)):
                     z_hard_sparsity_meters[domain].reset()
                     vec_hard_sparsity_meters[domain].reset()
@@ -1409,6 +1839,10 @@ def run(num_domains):
                     vec_hard_vs_clean_l4_delta_meters[domain].reset()
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].reset()
+            drift_pairwise_head_pre_meters.reset()
+            drift_pairwise_head_post_meters.reset()
+            drift_pairwise_backbone_pre_meters.reset()
+            drift_pairwise_backbone_post_meters.reset()
             tic = time.time()
 
     # ===== Save final models (backbone + diffusion + normalization stats) =====
@@ -1551,6 +1985,15 @@ if __name__ == "__main__":
                         help='only compute/log hard_adv_log_grad_parts every N epochs (0 disables). Default: 10')
     parser.add_argument('--hard_adv_monitor_sparsity', action='store_true',
                         help='extra hard-adv monitor: print epoch-level sparsity for z_hard/_vec_hard/vec_clean_l4 in terminal (adds one extra forward_from_layer3 per batch)')
+    parser.add_argument('--hard_adv_monitor_direction', action='store_true',
+                        help='extra hard-adv monitor: compare direction (z_style-z_clean) vs (z_hard-z_clean) in pooled feature space')
+    parser.add_argument('--hard_adv_orthogonal_style_clean', action='store_true',
+                        help='inner loop: project (grad_mu,grad_sigma) orthogonal to per-sample '
+                             '(mu_style-mu_clean, sigma_style-sigma_clean) in concat space (requires z_clean; '
+                             'adds one extract_features_to_layer3 when not already computed)')
+    parser.add_argument('--hard_adv_orth_fallback_ratio', type=float, default=0.05,
+                        help='after orthogonal projection, if ||g_orth|| < ratio * ||g|| for a sample, use original g '
+                             '(default: 0.05)')
     parser.add_argument('--hard_adv_z_base', type=str, default='clean', choices=['clean', 'style'],
                         help='base feature map used to compose z_hard content: clean (default) or style')
     parser.add_argument('--hard_adv_clean_loss_weight', type=float, default=0.0,
