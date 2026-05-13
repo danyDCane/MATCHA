@@ -437,6 +437,9 @@ def run(num_domains):
     vec_style_from_clean_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
     vec_hard_from_clean_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
     vec_style_hard_dir_cos_low03_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # cos(hard-style, style-clean): alignment of layer4-pooled shift (hard−style) vs (style−clean); per-sample mean.
+    vec_hs_sc_dir_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
+    vec_hs_sc_dir_cos_low03_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Orthogonal hard-adv debug (only meaningful when --hard_adv_orthogonal_style_clean).
     # removed_ratio = ||proj_v(g)|| / ||g|| in concat(mu,sigma) space, computed per-sample and averaged.
     orth_removed_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
@@ -444,6 +447,7 @@ def run(num_domains):
     orth_fallback_frac_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Terminal-only: per-sample direction cosine distribution for epoch-level quantiles.
     vec_style_hard_dir_cos_samples = {domain: [] for domain in domain_names}
+    vec_hs_sc_dir_cos_samples = {domain: [] for domain in domain_names}
     loss_diff_meters = {domain: util.AverageMeter() for domain in domain_names} if getattr(args, 'use_ood', False) else None
     # Accumulate batch-mean |grad_mu_cls| per channel for optional epoch dump (only when log_grad_parts batches run).
     grad_mu_cls_abs_ch_sum = {domain: None for domain in domain_names}
@@ -911,9 +915,10 @@ def run(num_domains):
                             backbone.layer4.train(prev_layer4_training)
 
                     # 監控：style 分支 pooled 向量(vec_style) vs z_hard 的 pooled 向量(_vec_hard)
-                    # 代表 hard 相對於原本 z_style 在 avgpool 後表徵上的改動量。
+                    # |hard-style|：與 |style-clean| 一致，為每個樣本 L2 後對 batch 取平均（非整張 (B,D) 一個 norm）。
                     with torch.no_grad():
-                        vec_delta = (_vec_hard - vec_style.detach()).norm().item()
+                        d_hard_style = _vec_hard.detach() - vec_style.detach()
+                        vec_delta = d_hard_style.norm(dim=1).mean().item()
                     vec_hard_vs_style_delta_meters[domain].update(vec_delta, data.size(0))
                     if hard_adv_monitor_sparsity:
                         with torch.no_grad():
@@ -938,11 +943,19 @@ def run(num_domains):
                             dir_cos_low03 = float((dir_cos_vec < 0.3).float().mean().item())
                             vec_style_from_clean_norm = d_style_norm.mean().item()
                             vec_hard_from_clean_norm = d_hard_norm.mean().item()
+                            # cos((hard−style), (style−clean)): 與 d_style 同為每樣本 512 維差分；
+                            # 高→困難方向與「擾動風格相對 clean」同向；近 0→在 pooled 空間大致正交探索。
+                            cos_hs_sc_vec = F.cosine_similarity(d_hard_style, d_style, dim=1, eps=1e-12)
+                            cos_hs_sc = cos_hs_sc_vec.mean().item()
+                            cos_hs_sc_low03 = float((cos_hs_sc_vec < 0.3).float().mean().item())
                         vec_style_hard_dir_cos_meters[domain].update(float(dir_cos), data.size(0))
                         vec_style_hard_dir_cos_low03_meters[domain].update(float(dir_cos_low03), data.size(0))
                         vec_style_from_clean_norm_meters[domain].update(float(vec_style_from_clean_norm), data.size(0))
                         vec_hard_from_clean_norm_meters[domain].update(float(vec_hard_from_clean_norm), data.size(0))
                         vec_style_hard_dir_cos_samples[domain].append(dir_cos_vec.detach().cpu())
+                        vec_hs_sc_dir_cos_meters[domain].update(float(cos_hs_sc), data.size(0))
+                        vec_hs_sc_dir_cos_low03_meters[domain].update(float(cos_hs_sc_low03), data.size(0))
+                        vec_hs_sc_dir_cos_samples[domain].append(cos_hs_sc_vec.detach().cpu())
 
                     loss_style_ce = criterion(logits_style, target)
                     hard_ce_vec = F.cross_entropy(logits_hard, target, reduction='none')
@@ -1538,14 +1551,26 @@ def run(num_domains):
                         p10, p50, p90 = float(qs[0].item()), float(qs[1].item()), float(qs[2].item())
                     else:
                         p10, p50, p90 = 0.0, 0.0, 0.0
+                    if len(vec_hs_sc_dir_cos_samples[_d]) > 0:
+                        cos_hs = torch.cat(vec_hs_sc_dir_cos_samples[_d], dim=0)
+                        qs_hs = torch.quantile(
+                            cos_hs,
+                            torch.tensor([0.10, 0.50, 0.90], dtype=cos_hs.dtype),
+                        )
+                        hs_p10, hs_p50, hs_p90 = float(qs_hs[0].item()), float(qs_hs[1].item()), float(qs_hs[2].item())
+                    else:
+                        hs_p10, hs_p50, hs_p90 = 0.0, 0.0, 0.0
                     print(
                         f"[style_hard_direction] epoch={epoch} domain={_d} "
-                        f"cos={float(vec_style_hard_dir_cos_meters[_d].avg):.6f} "
+                        f"cos(style-clean,hard-clean)={float(vec_style_hard_dir_cos_meters[_d].avg):.6f} "
                         f"p10={p10:.6f} p50={p50:.6f} p90={p90:.6f} "
                         f"frac_lt_0.3={float(vec_style_hard_dir_cos_low03_meters[_d].avg):.6f} "
                         f"|style-clean|={float(vec_style_from_clean_norm_meters[_d].avg):.6f} "
                         f"|hard-clean|={float(vec_hard_from_clean_norm_meters[_d].avg):.6f} "
                         f"|hard-style|={float(vec_hard_vs_style_delta_meters[_d].avg):.6f} "
+                        f"cos(hard-style,style-clean)={float(vec_hs_sc_dir_cos_meters[_d].avg):.6f} "
+                        f"hs_p10={hs_p10:.6f} hs_p50={hs_p50:.6f} hs_p90={hs_p90:.6f} "
+                        f"hs_frac_lt_0.3={float(vec_hs_sc_dir_cos_low03_meters[_d].avg):.6f} "
                         f"orth_removed={float(orth_removed_ratio_meters[_d].avg):.6f} "
                         f"orth_fallback={float(orth_fallback_frac_meters[_d].avg):.6f}"
                     )
@@ -1611,6 +1636,12 @@ def run(num_domains):
                 log_dict[f"{domain}/consensus_drift/full_backbone_l2"] = float(drift_l2_backbone_meters[domain].avg)
                 log_dict[f"{domain}/consensus_drift/full_backbone_rel"] = float(drift_rel_backbone_meters[domain].avg)
                 log_dict[f"{domain}/style_hard_direction/cos"] = float(vec_style_hard_dir_cos_meters[domain].avg)
+                log_dict[f"{domain}/style_hard_direction/cos_hard_style_vs_style_clean"] = float(
+                    vec_hs_sc_dir_cos_meters[domain].avg
+                )
+                log_dict[f"{domain}/style_hard_direction/frac_hs_sc_lt_0.3"] = float(
+                    vec_hs_sc_dir_cos_low03_meters[domain].avg
+                )
                 log_dict[f"{domain}/style_hard_direction/style_clean_norm"] = float(vec_style_from_clean_norm_meters[domain].avg)
                 log_dict[f"{domain}/style_hard_direction/hard_clean_norm"] = float(vec_hard_from_clean_norm_meters[domain].avg)
                 log_grad_parts_every = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
@@ -1829,9 +1860,12 @@ def run(num_domains):
                 vec_style_from_clean_norm_meters[domain].reset()
                 vec_hard_from_clean_norm_meters[domain].reset()
                 vec_style_hard_dir_cos_low03_meters[domain].reset()
+                vec_hs_sc_dir_cos_meters[domain].reset()
+                vec_hs_sc_dir_cos_low03_meters[domain].reset()
                 orth_removed_ratio_meters[domain].reset()
                 orth_fallback_frac_meters[domain].reset()
                 vec_style_hard_dir_cos_samples[domain].clear()
+                vec_hs_sc_dir_cos_samples[domain].clear()
                 if bool(getattr(args, "hard_adv_monitor_sparsity", False)):
                     z_hard_sparsity_meters[domain].reset()
                     vec_hard_sparsity_meters[domain].reset()
