@@ -144,6 +144,45 @@ def compute_loader_per_class_accuracy(model, data_loader, num_classes):
     return per_class_acc, class_correct, class_total
 
 
+def _collect_test_style_pool_layer3_mu_sigma(model, dataset, indices, batch_size, adv_eps, pin_memory=True):
+    """
+    Run leave-out test images through the current backbone and stack per-sample layer3
+    spatial mean/std (same convention as hard-adv mu_orig/sigma_orig).
+    Returns (mu_stack, sigma_stack) each [N,C,1,1] on CUDA, or (None, None) if empty.
+    """
+    from torch.utils.data import Subset, DataLoader
+
+    subset = Subset(dataset, indices)
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
+    was_training = model.training
+    model.eval()
+    mu_chunks, sig_chunks = [], []
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                inputs, _, _ = util.unpack_batch(batch)
+                inputs = inputs.cuda(non_blocking=True)
+                feats = model.extract_features_to_layer3(inputs)
+                z3 = feats["layer3"]
+                mu = z3.mean(dim=(2, 3), keepdim=True)
+                var = z3.var(dim=(2, 3), unbiased=False, keepdim=True)
+                sigma = torch.sqrt(var + adv_eps)
+                mu_chunks.append(mu)
+                sig_chunks.append(sigma)
+    finally:
+        model.train(was_training)
+
+    if len(mu_chunks) == 0:
+        return None, None
+    return torch.cat(mu_chunks, dim=0), torch.cat(sig_chunks, dim=0)
+
+
 def run(num_domains):
     """
     Single process training function for decentralized learning.
@@ -442,6 +481,13 @@ def run(num_domains):
     orth_removed_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Fraction of samples that fall back to the original gradient because ||g_orth|| is too small.
     orth_fallback_frac_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # concat(mu,sigma) distance vs leave-out test style pool (Phase A: --hard_style_test_pool).
+    style_triplet_l2_orig_pool_meters = {domain: util.AverageMeter() for domain in domain_names}
+    style_triplet_l2_hard_pool_meters = {domain: util.AverageMeter() for domain in domain_names}
+    style_triplet_l2_orig_hard_meters = {domain: util.AverageMeter() for domain in domain_names}
+    style_triplet_cos_orig_pool_meters = {domain: util.AverageMeter() for domain in domain_names}
+    style_triplet_cos_hard_pool_meters = {domain: util.AverageMeter() for domain in domain_names}
+    style_triplet_cos_orig_hard_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Terminal-only: per-sample direction cosine distribution for epoch-level quantiles.
     vec_style_hard_dir_cos_samples = {domain: [] for domain in domain_names}
     loss_diff_meters = {domain: util.AverageMeter() for domain in domain_names} if getattr(args, 'use_ood', False) else None
@@ -454,6 +500,15 @@ def run(num_domains):
     sketch_class_acc_history = [[] for _ in range(sketch_num_classes)]
     tic = time.time()
 
+    hard_style_test_pool = bool(getattr(args, "hard_style_test_pool", False))
+    test_style_pool_frac = float(getattr(args, "hard_style_test_pool_frac", 0.1))
+    # Per-domain stacked [N,C,1,1]; rebuilt at each pseudo-epoch start when --hard_style_test_pool.
+    test_style_pool_mu = {d: None for d in domain_names}
+    test_style_pool_sigma = {d: None for d in domain_names}
+    # Mean over pool -> [1,C,1,1] anchor for (1-beta)*orig + beta*anchor.
+    test_style_anchor_mu = {d: None for d in domain_names}
+    test_style_anchor_sigma = {d: None for d in domain_names}
+
     # ===== start training with fixed total steps K (Algorithm 1) =====
     for k in range(K):
         # Set all models to training mode
@@ -461,6 +516,73 @@ def run(num_domains):
             model.train()
 
         start_time = time.time()
+
+        # Phase A: rebuild leave-out test style pool at epoch boundaries (current backbone, eval extract).
+        if (
+            hard_style_test_pool
+            and getattr(args, "use_hard_style_adv", False)
+            and STEPS_PER_EPOCH > 0
+            and (k % STEPS_PER_EPOCH == 0)
+            and args.model == "res"
+        ):
+            epoch_for_pool = int(k // STEPS_PER_EPOCH) + 1
+            _, test_loader_shared = domain_loaders[domain_names[0]]
+            test_ds = test_loader_shared.dataset
+            n_tot = len(test_ds)
+            pool_n = max(1, int(round(n_tot * test_style_pool_frac)))
+            gen = torch.Generator()
+            gen.manual_seed(int(args.randomSeed) + epoch_for_pool * 100_003 + 17)
+            perm = torch.randperm(n_tot, generator=gen)[:pool_n]
+            pool_indices = perm.tolist()
+            pool_bs = min(int(args.bs), int(test_loader_shared.batch_size or 64))
+            adv_eps_pool = float(getattr(args, "hard_adv_eps", 1e-6))
+            pin_mem = bool(getattr(test_loader_shared, "pin_memory", True))
+            print(
+                f"[test_style_pool] epoch={epoch_for_pool} rebuild leave-out test indices: "
+                f"n_test={n_tot} pool_size={pool_n} frac={test_style_pool_frac} "
+                f"mode={str(getattr(args, 'hard_style_test_pool_mode', 'random')).lower()} "
+                f"beta={max(0.0, min(1.0, float(getattr(args, 'hard_style_test_anchor_beta', 0.1))))}"
+            )
+            for _dom in domain_names:
+                mdl = models_dict[_dom]
+                try:
+                    pmu, psig = _collect_test_style_pool_layer3_mu_sigma(
+                        mdl,
+                        test_ds,
+                        pool_indices,
+                        pool_bs,
+                        adv_eps_pool,
+                        pin_memory=pin_mem,
+                    )
+                except AttributeError as exc:
+                    print(
+                        f"[test_style_pool] ERROR domain={_dom}: need extract_features_to_layer3 on model ({exc}). "
+                        "Disabling pool for this run step."
+                    )
+                    pmu, psig = None, None
+                test_style_pool_mu[_dom] = pmu
+                test_style_pool_sigma[_dom] = psig
+                if pmu is None or psig is None:
+                    test_style_anchor_mu[_dom] = None
+                    test_style_anchor_sigma[_dom] = None
+                    print(f"[test_style_pool] WARNING domain={_dom}: empty pool; z_hard falls back to adversarial mu/sigma.")
+                else:
+                    _mode = str(getattr(args, "hard_style_test_pool_mode", "random")).lower()
+                    if _mode == "mean":
+                        test_style_anchor_mu[_dom] = pmu.mean(dim=0, keepdim=True)
+                        test_style_anchor_sigma[_dom] = psig.mean(dim=0, keepdim=True)
+                    else:
+                        test_style_anchor_mu[_dom] = None
+                        test_style_anchor_sigma[_dom] = None
+                    if _mode == "mean":
+                        print(
+                            f"[test_style_pool] domain={_dom} stacked_mu_sigma shape={tuple(pmu.shape)} "
+                            f"anchor_mu_sigma shape={tuple(test_style_anchor_mu[_dom].shape)} mode=mean"
+                        )
+                    else:
+                        print(
+                            f"[test_style_pool] domain={_dom} stacked_mu_sigma shape={tuple(pmu.shape)} mode=random"
+                        )
 
         # ========== 第一阶段：计算所有 domain 的风格统计量（不训练）==========
         style_vecs_dict = {}
@@ -563,6 +685,10 @@ def run(num_domains):
             hard_adv_monitor_direction = bool(getattr(args, "hard_adv_monitor_direction", False))
             hard_adv_orthogonal_style_clean = bool(getattr(args, "hard_adv_orthogonal_style_clean", False))
             hard_adv_orth_fallback_ratio = float(getattr(args, "hard_adv_orth_fallback_ratio", 0.05))
+            hard_style_test_anchor_beta = max(
+                0.0, min(1.0, float(getattr(args, "hard_style_test_anchor_beta", 0.1)))
+            )
+            hard_style_test_pool_mode = str(getattr(args, "hard_style_test_pool_mode", "random")).lower()
             log_grad_parts_every = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
             # Use step index to estimate the current (integer) epoch.
             # Note: wandb logging uses 1-based epoch = (k+1)//STEPS_PER_EPOCH.
@@ -877,10 +1003,94 @@ def run(num_domains):
                     for p in diffusion_model.parameters():
                         p.requires_grad_(True)
 
-                    # Outer loop: z_hard re-composed from LIVE z_base-normalized content
-                    # while using style-derived (mu/sigma) adversarial updates.
+                    # Outer loop: z_hard re-composed from LIVE z_base-normalized content.
+                    # Default: adversarial mu_hard/sigma_hard.
+                    # --hard_style_test_pool: leave-out test subset -> stacked [N,C,1,1] pmu/psig per epoch.
+                    #   mode=random: per-sample idx~U(0,N-1), mu_t=pmu[idx], mix (1-beta)*orig+beta*drawn.
+                    #   mode=mean: pool mean anchor, mix (1-beta)*orig+beta*anchor. beta=1 -> pure ref side.
                     z_norm_live = (z_base - mu_base) / (sigma_base + adv_eps)
-                    z_hard = z_norm_live * sigma_hard + mu_hard
+                    pmu = test_style_pool_mu.get(domain) if hard_style_test_pool else None
+                    psig = test_style_pool_sigma.get(domain) if hard_style_test_pool else None
+                    pool_ok = (
+                        hard_style_test_pool
+                        and pmu is not None
+                        and psig is not None
+                        and pmu.numel() > 0
+                        and pmu.size(0) > 0
+                    )
+                    if pool_ok:
+                        Bsz = z_style.size(0)
+                        b = hard_style_test_anchor_beta
+                        if hard_style_test_pool_mode == "mean":
+                            amu = test_style_anchor_mu.get(domain)
+                            asig = test_style_anchor_sigma.get(domain)
+                            if amu is None or asig is None:
+                                z_hard = z_norm_live * sigma_hard + mu_hard
+                            else:
+                                mu_mix = (1.0 - b) * mu_orig + b * amu
+                                sigma_mix = (1.0 - b) * sigma_orig + b * asig
+                                z_hard = z_norm_live * sigma_mix + mu_mix
+                                with torch.no_grad():
+                                    amu_b = amu.expand(Bsz, -1, -1, -1)
+                                    asig_b = asig.expand(Bsz, -1, -1, -1)
+                                    co = torch.cat(
+                                        [mu_orig.reshape(Bsz, -1), sigma_orig.reshape(Bsz, -1)], dim=1
+                                    )
+                                    ch = torch.cat(
+                                        [mu_hard.reshape(Bsz, -1), sigma_hard.reshape(Bsz, -1)], dim=1
+                                    )
+                                    ct = torch.cat(
+                                        [amu_b.reshape(Bsz, -1), asig_b.reshape(Bsz, -1)], dim=1
+                                    )
+                                    l2_ot = float((co - ct).norm(dim=1).mean().item())
+                                    l2_ht = float((ch - ct).norm(dim=1).mean().item())
+                                    l2_oh = float((co - ch).norm(dim=1).mean().item())
+                                    cos_ot = float(F.cosine_similarity(co, ct, dim=1, eps=1e-12).mean().item())
+                                    cos_ht = float(F.cosine_similarity(ch, ct, dim=1, eps=1e-12).mean().item())
+                                    cos_oh = float(F.cosine_similarity(co, ch, dim=1, eps=1e-12).mean().item())
+                                style_triplet_l2_orig_pool_meters[domain].update(l2_ot, data.size(0))
+                                style_triplet_l2_hard_pool_meters[domain].update(l2_ht, data.size(0))
+                                style_triplet_l2_orig_hard_meters[domain].update(l2_oh, data.size(0))
+                                style_triplet_cos_orig_pool_meters[domain].update(cos_ot, data.size(0))
+                                style_triplet_cos_hard_pool_meters[domain].update(cos_ht, data.size(0))
+                                style_triplet_cos_orig_hard_meters[domain].update(cos_oh, data.size(0))
+                        else:
+                            idx = torch.randint(
+                                0,
+                                pmu.size(0),
+                                (Bsz,),
+                                device=z_style.device,
+                                dtype=torch.long,
+                            )
+                            mu_t = pmu[idx]
+                            sigma_t = psig[idx]
+                            mu_mix = (1.0 - b) * mu_orig + b * mu_t
+                            sigma_mix = (1.0 - b) * sigma_orig + b * sigma_t
+                            z_hard = z_norm_live * sigma_mix + mu_mix
+                            with torch.no_grad():
+                                co = torch.cat(
+                                    [mu_orig.reshape(Bsz, -1), sigma_orig.reshape(Bsz, -1)], dim=1
+                                )
+                                ch = torch.cat(
+                                    [mu_hard.reshape(Bsz, -1), sigma_hard.reshape(Bsz, -1)], dim=1
+                                )
+                                ct = torch.cat(
+                                    [mu_t.reshape(Bsz, -1), sigma_t.reshape(Bsz, -1)], dim=1
+                                )
+                                l2_ot = float((co - ct).norm(dim=1).mean().item())
+                                l2_ht = float((ch - ct).norm(dim=1).mean().item())
+                                l2_oh = float((co - ch).norm(dim=1).mean().item())
+                                cos_ot = float(F.cosine_similarity(co, ct, dim=1, eps=1e-12).mean().item())
+                                cos_ht = float(F.cosine_similarity(ch, ct, dim=1, eps=1e-12).mean().item())
+                                cos_oh = float(F.cosine_similarity(co, ch, dim=1, eps=1e-12).mean().item())
+                            style_triplet_l2_orig_pool_meters[domain].update(l2_ot, data.size(0))
+                            style_triplet_l2_hard_pool_meters[domain].update(l2_ht, data.size(0))
+                            style_triplet_l2_orig_hard_meters[domain].update(l2_oh, data.size(0))
+                            style_triplet_cos_orig_pool_meters[domain].update(cos_ot, data.size(0))
+                            style_triplet_cos_hard_pool_meters[domain].update(cos_ht, data.size(0))
+                            style_triplet_cos_orig_hard_meters[domain].update(cos_oh, data.size(0))
+                    else:
+                        z_hard = z_norm_live * sigma_hard + mu_hard
                     if not torch.isfinite(z_hard).all():
                         raise FloatingPointError("Non-finite z_hard detected before outer loop.")
                     # z_style分支保留 train() 让 layer4 BN running stats 更新一次；
@@ -1549,6 +1759,20 @@ def run(num_domains):
                         f"orth_removed={float(orth_removed_ratio_meters[_d].avg):.6f} "
                         f"orth_fallback={float(orth_fallback_frac_meters[_d].avg):.6f}"
                     )
+            if getattr(args, "hard_style_test_pool", False) and getattr(args, "use_hard_style_adv", False):
+                _bprint = max(0.0, min(1.0, float(getattr(args, "hard_style_test_anchor_beta", 0.1))))
+                _mprint = str(getattr(args, "hard_style_test_pool_mode", "random")).lower()
+                _ref = "anchor" if _mprint == "mean" else "draw"
+                for _d in domain_names:
+                    print(
+                        f"[style_mu_sigma_triplet] epoch={epoch} domain={_d} mode={_mprint} beta={_bprint:.4f} "
+                        f"L2(orig,{_ref})={float(style_triplet_l2_orig_pool_meters[_d].avg):.6f} "
+                        f"L2(hard,{_ref})={float(style_triplet_l2_hard_pool_meters[_d].avg):.6f} "
+                        f"L2(orig,hard)={float(style_triplet_l2_orig_hard_meters[_d].avg):.6f} "
+                        f"cos(orig,{_ref})={float(style_triplet_cos_orig_pool_meters[_d].avg):.6f} "
+                        f"cos(hard,{_ref})={float(style_triplet_cos_hard_pool_meters[_d].avg):.6f} "
+                        f"cos(orig,hard)={float(style_triplet_cos_orig_hard_meters[_d].avg):.6f}"
+                    )
 
             # Epoch-mean |grad_mu_cls| per channel (only from batches where log_grad_parts ran this epoch).
             grad_mu_cls_ch_avg_epoch = {}
@@ -1831,6 +2055,12 @@ def run(num_domains):
                 vec_style_hard_dir_cos_low03_meters[domain].reset()
                 orth_removed_ratio_meters[domain].reset()
                 orth_fallback_frac_meters[domain].reset()
+                style_triplet_l2_orig_pool_meters[domain].reset()
+                style_triplet_l2_hard_pool_meters[domain].reset()
+                style_triplet_l2_orig_hard_meters[domain].reset()
+                style_triplet_cos_orig_pool_meters[domain].reset()
+                style_triplet_cos_hard_pool_meters[domain].reset()
+                style_triplet_cos_orig_hard_meters[domain].reset()
                 vec_style_hard_dir_cos_samples[domain].clear()
                 if bool(getattr(args, "hard_adv_monitor_sparsity", False)):
                     z_hard_sparsity_meters[domain].reset()
@@ -1998,6 +2228,20 @@ if __name__ == "__main__":
                         help='base feature map used to compose z_hard content: clean (default) or style')
     parser.add_argument('--hard_adv_clean_loss_weight', type=float, default=0.0,
                         help='extra CE weight on clean logits from model(data, communicator=None); 0 disables (default: 0.0)')
+    parser.add_argument('--hard_style_test_pool', action='store_true',
+                        help='Phase A oracle: each pseudo-epoch rebuild layer3 mu/sigma pool from a random subset of '
+                             'leave-out test set (current backbone). Compose z_hard with '
+                             '(mu,sigma)=(1-beta)(mu_orig,sigma_orig)+beta*ref where ref is chosen by '
+                             '--hard_style_test_pool_mode (random per-sample pool row, or mean anchor). '
+                             'Inner loop still runs for metrics.')
+    parser.add_argument('--hard_style_test_pool_frac', type=float, default=0.1,
+                        help='fraction of leave-out test images in the pool (default: 0.1)')
+    parser.add_argument('--hard_style_test_pool_mode', type=str, default='random', choices=['random', 'mean'],
+                        help='random: per-sample draw from pool then mix with orig (matches prior full-replace when '
+                             'beta=1); mean: mix with pool-mean anchor (default: random)')
+    parser.add_argument('--hard_style_test_anchor_beta', type=float, default=0.1,
+                        help='mixing weight beta in [0,1]: (1-beta)*(mu_orig,sigma_orig)+beta*ref; beta=1 uses only '
+                             'ref (drawn row in random mode, pool mean in mean mode) (default: 0.1)')
     parser.add_argument('--save_spatial_debug_tensors', action='store_true',
                         help='save layer3 spatial debug tensors (input, z_clean, z_style, z_hard) for one batch per selected epoch')
     parser.add_argument('--spatial_debug_domain', type=str, default='sketch',
