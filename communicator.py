@@ -571,7 +571,10 @@ class SingleProcessCommunicator(object):
         self.neighbor_style_stats_by_domain = {}  # {domain_name: {neighbor_domain: unflattened_stats}}
         self.active_domain = None
         self.channels_per_layer = None
-        
+        # Optional: layer3 StyleShift may sample STYLEDDG stats from a leave-out test subset (train.py fills this).
+        self.style_shift_leaveout_test_prob = 0.0
+        self.leaveout_layer3_style_stats_by_domain = {}  # {domain_name: dict from compute_layer_style_stats on z3}
+
         # Build adjacency list for domains based on topology
         self._build_domain_adjacency()
     

@@ -167,20 +167,40 @@ class StyleShift(nn.Module):
                 print(f"[StyleShift {layer_name}] Skipped: communicator has no neighbor_style_stats")
             return features
         
-        if not communicator.neighbor_style_stats:
-            if verbose:
-                print(f"[StyleShift {layer_name}] Skipped: neighbor_style_stats is empty")
-            return features
-        
-        # Randomly select a neighbor
-        neighbor_ranks = list(communicator.neighbor_style_stats.keys())
-        if not neighbor_ranks:
-            if verbose:
-                print(f"[StyleShift {layer_name}] Skipped: no neighbor ranks available")
-            return features
-        
-        selected_neighbor = random.choice(neighbor_ranks)
-        neighbor_stats = communicator.neighbor_style_stats[selected_neighbor]
+        use_leaveout_layer3 = False
+        leaveout_layer3_stats = None
+        if layer_name == "layer3":
+            leaveout_prob = float(getattr(communicator, "style_shift_leaveout_test_prob", 0.0) or 0.0)
+            by_dom = getattr(communicator, "leaveout_layer3_style_stats_by_domain", None) or {}
+            act = getattr(communicator, "active_domain", None)
+            if (
+                leaveout_prob > 0.0
+                and act is not None
+                and act in by_dom
+                and by_dom[act] is not None
+                and random.random() < leaveout_prob
+            ):
+                use_leaveout_layer3 = True
+                leaveout_layer3_stats = by_dom[act]
+
+        if use_leaveout_layer3:
+            neighbor_stats = {"layer3": leaveout_layer3_stats}
+            selected_neighbor = "__leaveout_test__"
+        else:
+            if not communicator.neighbor_style_stats:
+                if verbose:
+                    print(f"[StyleShift {layer_name}] Skipped: neighbor_style_stats is empty")
+                return features
+
+            # Randomly select a neighbor
+            neighbor_ranks = list(communicator.neighbor_style_stats.keys())
+            if not neighbor_ranks:
+                if verbose:
+                    print(f"[StyleShift {layer_name}] Skipped: no neighbor ranks available")
+                return features
+
+            selected_neighbor = random.choice(neighbor_ranks)
+            neighbor_stats = communicator.neighbor_style_stats[selected_neighbor]
         
         # Check if the layer exists in neighbor stats
         if layer_name not in neighbor_stats:

@@ -24,6 +24,7 @@ import torchvision.models as models
 import wandb
 
 from style_stats import (
+    compute_layer_style_stats,
     compute_multi_layer_style_stats,
     flatten_style_stats,
 )
@@ -183,6 +184,42 @@ def _collect_test_style_pool_layer3_mu_sigma(model, dataset, indices, batch_size
     return torch.cat(mu_chunks, dim=0), torch.cat(sig_chunks, dim=0)
 
 
+def _compute_leaveout_layer3_styleddg_stats(
+    model, dataset, indices, batch_size, style_eta, pin_memory=True
+):
+    """
+    Concatenate layer3 maps for leave-out test indices (eval, no_grad), then compute
+    STYLEDDG-style batch statistics for StyleShift / DSU (same keys as neighbor_stats['layer3']).
+    """
+    from torch.utils.data import Subset, DataLoader
+
+    subset = Subset(dataset, indices)
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
+    was_training = model.training
+    model.eval()
+    z3_chunks = []
+    try:
+        with torch.no_grad():
+            for batch in loader:
+                inputs, _, _ = util.unpack_batch(batch)
+                inputs = inputs.cuda(non_blocking=True)
+                feats = model.extract_features_to_layer3(inputs)
+                z3_chunks.append(feats["layer3"])
+    finally:
+        model.train(was_training)
+
+    if len(z3_chunks) == 0:
+        return None
+    z3_all = torch.cat(z3_chunks, dim=0)
+    return compute_layer_style_stats(z3_all, eta=style_eta)
+
+
 def run(num_domains):
     """
     Single process training function for decentralized learning.
@@ -307,6 +344,9 @@ def run(num_domains):
 
     # define single process communicator
     communicator = SingleProcessCommunicator(domain_names, GP)
+    communicator.style_shift_leaveout_test_prob = float(
+        getattr(args, "style_shift_leaveout_test_prob", 0.0) or 0.0
+    )
 
     # select neural network model for each domain
     if args.dataset == 'pacs':
@@ -401,11 +441,7 @@ def run(num_domains):
     style_aug_flag_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Meters for z_style / z_hard training (enabled by --use_hard_style_adv)
     task_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
-    clean_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
-    clean_conf_meters = {domain: util.AverageMeter() for domain in domain_names}
     style_conf_meters = {domain: util.AverageMeter() for domain in domain_names}
-    clean_style_ce_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
-    clean_style_sym_kl_meters = {domain: util.AverageMeter() for domain in domain_names}
     style_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
     hard_ce_meters = {domain: util.AverageMeter() for domain in domain_names}
     hard_ce_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
@@ -502,6 +538,7 @@ def run(num_domains):
 
     hard_style_test_pool = bool(getattr(args, "hard_style_test_pool", False))
     test_style_pool_frac = float(getattr(args, "hard_style_test_pool_frac", 0.1))
+    style_shift_leaveout_test_prob = float(getattr(args, "style_shift_leaveout_test_prob", 0.0) or 0.0)
     # Per-domain stacked [N,C,1,1]; rebuilt at each pseudo-epoch start when --hard_style_test_pool.
     test_style_pool_mu = {d: None for d in domain_names}
     test_style_pool_sigma = {d: None for d in domain_names}
@@ -517,10 +554,17 @@ def run(num_domains):
 
         start_time = time.time()
 
-        # Phase A: rebuild leave-out test style pool at epoch boundaries (current backbone, eval extract).
-        if (
+        # Phase A: rebuild leave-out test style pool (hard-adv) and/or layer3 StyleShift leave-out STYLEDDG stats.
+        need_test_style_pool = (
             hard_style_test_pool
             and getattr(args, "use_hard_style_adv", False)
+        )
+        need_style_shift_leaveout = (
+            style_shift_leaveout_test_prob > 0.0
+            and getattr(args, "use_style_shift", False)
+        )
+        if (
+            (need_test_style_pool or need_style_shift_leaveout)
             and STEPS_PER_EPOCH > 0
             and (k % STEPS_PER_EPOCH == 0)
             and args.model == "res"
@@ -529,60 +573,100 @@ def run(num_domains):
             _, test_loader_shared = domain_loaders[domain_names[0]]
             test_ds = test_loader_shared.dataset
             n_tot = len(test_ds)
-            pool_n = max(1, int(round(n_tot * test_style_pool_frac)))
             gen = torch.Generator()
             gen.manual_seed(int(args.randomSeed) + epoch_for_pool * 100_003 + 17)
-            perm = torch.randperm(n_tot, generator=gen)[:pool_n]
-            pool_indices = perm.tolist()
             pool_bs = min(int(args.bs), int(test_loader_shared.batch_size or 64))
-            adv_eps_pool = float(getattr(args, "hard_adv_eps", 1e-6))
             pin_mem = bool(getattr(test_loader_shared, "pin_memory", True))
-            print(
-                f"[test_style_pool] epoch={epoch_for_pool} rebuild leave-out test indices: "
-                f"n_test={n_tot} pool_size={pool_n} frac={test_style_pool_frac} "
-                f"mode={str(getattr(args, 'hard_style_test_pool_mode', 'random')).lower()} "
-                f"beta={max(0.0, min(1.0, float(getattr(args, 'hard_style_test_anchor_beta', 0.1))))}"
-            )
-            for _dom in domain_names:
-                mdl = models_dict[_dom]
-                try:
-                    pmu, psig = _collect_test_style_pool_layer3_mu_sigma(
-                        mdl,
-                        test_ds,
-                        pool_indices,
-                        pool_bs,
-                        adv_eps_pool,
-                        pin_memory=pin_mem,
-                    )
-                except AttributeError as exc:
-                    print(
-                        f"[test_style_pool] ERROR domain={_dom}: need extract_features_to_layer3 on model ({exc}). "
-                        "Disabling pool for this run step."
-                    )
-                    pmu, psig = None, None
-                test_style_pool_mu[_dom] = pmu
-                test_style_pool_sigma[_dom] = psig
-                if pmu is None or psig is None:
-                    test_style_anchor_mu[_dom] = None
-                    test_style_anchor_sigma[_dom] = None
-                    print(f"[test_style_pool] WARNING domain={_dom}: empty pool; z_hard falls back to adversarial mu/sigma.")
-                else:
-                    _mode = str(getattr(args, "hard_style_test_pool_mode", "random")).lower()
-                    if _mode == "mean":
-                        test_style_anchor_mu[_dom] = pmu.mean(dim=0, keepdim=True)
-                        test_style_anchor_sigma[_dom] = psig.mean(dim=0, keepdim=True)
-                    else:
+            style_eta = float(getattr(args, "style_eta", 1e-5))
+
+            pool_indices = None
+            if need_test_style_pool:
+                pool_n = max(1, int(round(n_tot * test_style_pool_frac)))
+                pool_indices = torch.randperm(n_tot, generator=gen)[:pool_n].tolist()
+
+            leaveout_indices = None
+            if need_style_shift_leaveout:
+                leaveout_frac = float(getattr(args, "style_shift_leaveout_test_frac", test_style_pool_frac))
+                leaveout_n = max(1, int(round(n_tot * leaveout_frac)))
+                leaveout_indices = torch.randperm(n_tot, generator=gen)[:leaveout_n].tolist()
+
+            if need_test_style_pool and pool_indices is not None:
+                adv_eps_pool = float(getattr(args, "hard_adv_eps", 1e-6))
+                print(
+                    f"[test_style_pool] epoch={epoch_for_pool} rebuild leave-out test indices: "
+                    f"n_test={n_tot} pool_size={len(pool_indices)} frac={test_style_pool_frac} "
+                    f"mode={str(getattr(args, 'hard_style_test_pool_mode', 'random')).lower()} "
+                    f"beta={max(0.0, min(1.0, float(getattr(args, 'hard_style_test_anchor_beta', 0.1))))}"
+                )
+                for _dom in domain_names:
+                    mdl = models_dict[_dom]
+                    try:
+                        pmu, psig = _collect_test_style_pool_layer3_mu_sigma(
+                            mdl,
+                            test_ds,
+                            pool_indices,
+                            pool_bs,
+                            adv_eps_pool,
+                            pin_memory=pin_mem,
+                        )
+                    except AttributeError as exc:
+                        print(
+                            f"[test_style_pool] ERROR domain={_dom}: need extract_features_to_layer3 on model ({exc}). "
+                            "Disabling pool for this run step."
+                        )
+                        pmu, psig = None, None
+                    test_style_pool_mu[_dom] = pmu
+                    test_style_pool_sigma[_dom] = psig
+                    if pmu is None or psig is None:
                         test_style_anchor_mu[_dom] = None
                         test_style_anchor_sigma[_dom] = None
-                    if _mode == "mean":
-                        print(
-                            f"[test_style_pool] domain={_dom} stacked_mu_sigma shape={tuple(pmu.shape)} "
-                            f"anchor_mu_sigma shape={tuple(test_style_anchor_mu[_dom].shape)} mode=mean"
-                        )
+                        print(f"[test_style_pool] WARNING domain={_dom}: empty pool; z_hard falls back to adversarial mu/sigma.")
                     else:
-                        print(
-                            f"[test_style_pool] domain={_dom} stacked_mu_sigma shape={tuple(pmu.shape)} mode=random"
+                        _mode = str(getattr(args, "hard_style_test_pool_mode", "random")).lower()
+                        if _mode == "mean":
+                            test_style_anchor_mu[_dom] = pmu.mean(dim=0, keepdim=True)
+                            test_style_anchor_sigma[_dom] = psig.mean(dim=0, keepdim=True)
+                        else:
+                            test_style_anchor_mu[_dom] = None
+                            test_style_anchor_sigma[_dom] = None
+                        if _mode == "mean":
+                            print(
+                                f"[test_style_pool] domain={_dom} stacked_mu_sigma shape={tuple(pmu.shape)} "
+                                f"anchor_mu_sigma shape={tuple(test_style_anchor_mu[_dom].shape)} mode=mean"
+                            )
+                        else:
+                            print(
+                                f"[test_style_pool] domain={_dom} stacked_mu_sigma shape={tuple(pmu.shape)} mode=random"
+                            )
+
+            if need_style_shift_leaveout and leaveout_indices is not None:
+                leaveout_frac = float(getattr(args, "style_shift_leaveout_test_frac", test_style_pool_frac))
+                print(
+                    f"[style_shift_leaveout_test] epoch={epoch_for_pool} rebuild layer3 STYLEDDG stats from "
+                    f"leave-out test subset: n_test={n_tot} subset_size={len(leaveout_indices)} "
+                    f"frac={leaveout_frac} prob={style_shift_leaveout_test_prob}"
+                )
+                leaveout_by_dom = {}
+                for _dom in domain_names:
+                    mdl = models_dict[_dom]
+                    try:
+                        st = _compute_leaveout_layer3_styleddg_stats(
+                            mdl,
+                            test_ds,
+                            leaveout_indices,
+                            pool_bs,
+                            style_eta,
+                            pin_memory=pin_mem,
                         )
+                    except AttributeError as exc:
+                        print(
+                            f"[style_shift_leaveout_test] ERROR domain={_dom}: need extract_features_to_layer3 ({exc})."
+                        )
+                        st = None
+                    leaveout_by_dom[_dom] = st
+                    if st is None:
+                        print(f"[style_shift_leaveout_test] WARNING domain={_dom}: empty stats; layer3 leave-out branch disabled for this domain.")
+                communicator.leaveout_layer3_style_stats_by_domain = leaveout_by_dom
 
         # ========== 第一阶段：计算所有 domain 的风格统计量（不训练）==========
         style_vecs_dict = {}
@@ -680,7 +764,6 @@ def run(num_domains):
             adv_cls_only = bool(getattr(args, "hard_adv_cls_only", False))
             adv_equal_ce_weight = bool(getattr(args, "hard_adv_equal_ce_weight", False))
             hard_adv_z_base = str(getattr(args, "hard_adv_z_base", "clean")).lower()
-            hard_adv_clean_loss_weight = float(getattr(args, "hard_adv_clean_loss_weight", 0.0))
             hard_adv_monitor_sparsity = bool(getattr(args, "hard_adv_monitor_sparsity", False))
             hard_adv_monitor_direction = bool(getattr(args, "hard_adv_monitor_direction", False))
             hard_adv_orthogonal_style_clean = bool(getattr(args, "hard_adv_orthogonal_style_clean", False))
@@ -1330,34 +1413,7 @@ def run(num_domains):
 
                 output = logits_style
             else:
-                # Original training path (logits only)
-                # Isolate BN updates for clean branch:
-                # use eval() so BN running stats are not updated, while keeping autograd enabled.
-                backbone_for_clean = getattr(model, "backbone", None)
-                prev_backbone_training_for_clean = None
-                prev_model_training_for_clean = model.training
-                if backbone_for_clean is not None:
-                    prev_backbone_training_for_clean = backbone_for_clean.training
-                    backbone_for_clean.eval()
-                else:
-                    model.eval()
-                try:
-                    logits_clean = model(
-                        data,
-                        return_blocks=False,
-                        communicator=None,
-                        debug_style_shift=False,
-                        iter_num=k+1,
-                        rank=domain_names.index(domain),
-                    )
-                finally:
-                    if backbone_for_clean is not None and prev_backbone_training_for_clean is not None:
-                        backbone_for_clean.train(prev_backbone_training_for_clean)
-                    else:
-                        model.train(prev_model_training_for_clean)
-                loss_clean_ce = criterion(logits_clean, target)
-                clean_ce_meters[domain].update(float(loss_clean_ce.item()), data.size(0))
-
+                # Original training path: single forward (optional style communicator on ResNet).
                 if (use_style_stats or use_style_shift) and args.model == "res":
                     communicator.set_active_domain(domain)
                     output = model(
@@ -1375,42 +1431,11 @@ def run(num_domains):
                 style_aug_flag_meters[domain].update(1.0 if style_aug_activated else 0.0, data.size(0))
 
                 loss = criterion(output, target)
-                if hard_adv_clean_loss_weight > 0.0:
-                    loss = loss + hard_adv_clean_loss_weight * loss_clean_ce
 
                 with torch.no_grad():
-                    probs_clean = F.softmax(logits_clean, dim=1)
                     probs_style = F.softmax(output, dim=1)
-                    clean_conf = probs_clean.max(dim=1).values.mean().item()
                     style_conf = probs_style.max(dim=1).values.mean().item()
-                    clean_conf_meters[domain].update(clean_conf, data.size(0))
                     style_conf_meters[domain].update(style_conf, data.size(0))
-
-                    # Cosine between per-sample CE vectors to detect opposite trend.
-                    loss_clean_vec = F.cross_entropy(logits_clean, target, reduction='none')
-                    loss_style_vec = F.cross_entropy(output, target, reduction='none')
-                    ce_cos = F.cosine_similarity(
-                        loss_clean_vec.unsqueeze(0),
-                        loss_style_vec.unsqueeze(0),
-                        dim=1,
-                        eps=1e-8,
-                    ).item()
-                    clean_style_ce_cos_meters[domain].update(float(ce_cos), data.size(0))
-
-                    # Symmetric KL between clean/style prediction distributions.
-                    eps_kl = 1e-8
-                    kl_clean_to_style = F.kl_div(
-                        torch.log(probs_clean.clamp_min(eps_kl)),
-                        probs_style,
-                        reduction='batchmean',
-                    )
-                    kl_style_to_clean = F.kl_div(
-                        torch.log(probs_style.clamp_min(eps_kl)),
-                        probs_clean,
-                        reduction='batchmean',
-                    )
-                    sym_kl = 0.5 * (kl_clean_to_style + kl_style_to_clean)
-                    clean_style_sym_kl_meters[domain].update(float(sym_kl.item()), data.size(0))
             
             # Compute diffusion loss if OOD detection is enabled
             if getattr(args, 'use_ood', False) and domain in diffusion_models_dict:
@@ -1693,11 +1718,8 @@ def run(num_domains):
                 for _d in domain_names:
                     print(
                         f"[confidence] epoch={epoch} domain={_d} "
-                        f"clean_train={float(clean_conf_meters[_d].avg):.4f} "
                         f"style_train={float(style_conf_meters[_d].avg):.4f} "
-                        f"test={float(test_confidences[_d]):.4f} "
-                        f"ce_cos={float(clean_style_ce_cos_meters[_d].avg):.4f} "
-                        f"sym_kl={float(clean_style_sym_kl_meters[_d].avg):.6f}"
+                        f"test={float(test_confidences[_d]):.4f}"
                     )
             if getattr(args, "use_hard_style_adv", False):
                 for _d in domain_names:
@@ -1804,7 +1826,6 @@ def run(num_domains):
                 log_dict[f"{domain}/test_acc"] = test_accs[domain].item() if hasattr(test_accs[domain], 'item') else float(test_accs[domain])
                 # Hard-style-adv metrics (only meaningful when --use_hard_style_adv)
                 log_dict[f"{domain}/task_loss"] = float(task_loss_meters[domain].avg)
-                log_dict[f"{domain}/clean_ce"] = float(clean_ce_meters[domain].avg)
                 log_dict[f"{domain}/style_ce"] = float(style_ce_meters[domain].avg)
                 log_dict[f"{domain}/hard_ce"] = float(hard_ce_meters[domain].avg)
                 log_dict[f"{domain}/hard_ce_delta"] = float(hard_ce_delta_meters[domain].avg)
@@ -1997,11 +2018,7 @@ def run(num_domains):
                 top1_dict[domain].reset()
                 style_aug_flag_meters[domain].reset()
                 task_loss_meters[domain].reset()
-                clean_ce_meters[domain].reset()
-                clean_conf_meters[domain].reset()
                 style_conf_meters[domain].reset()
-                clean_style_ce_cos_meters[domain].reset()
-                clean_style_sym_kl_meters[domain].reset()
                 style_ce_meters[domain].reset()
                 hard_ce_meters[domain].reset()
                 hard_ce_delta_meters[domain].reset()
@@ -2170,6 +2187,14 @@ if __name__ == "__main__":
                         help='probability of activating style shift module (default: 0.5)')
     parser.add_argument('--style_shift_ratio', type=float, default=0.5,
                         help='ratio of samples in batch to be transformed (default: 0.5)')
+    parser.add_argument('--style_shift_leaveout_test_prob', type=float, default=0.0,
+                        help='If >0 and --use_style_shift: layer3 StyleShift may draw DSU target style from '
+                             'STYLEDDG stats computed on a leave-out test subset (rebuilt each pseudo-epoch). '
+                             'Strong oracle / train-test leakage if you report accuracy on the same test set; '
+                             'does not require --use_hard_style_adv.')
+    parser.add_argument('--style_shift_leaveout_test_frac', type=float, default=0.1,
+                        help='Fraction of the shared test loader used to build layer3 leave-out STYLEDDG stats when '
+                             '--style_shift_leaveout_test_prob > 0 (same test dataset as --hard_style_test_pool).')
     parser.add_argument('--style_explore_alpha', type=float, default=3.0,
                         help='extrapolation coefficient for style explore module (default: 3.0)')
     parser.add_argument('--style_explore_ratio', type=float, default=0.5,
@@ -2227,7 +2252,8 @@ if __name__ == "__main__":
     parser.add_argument('--hard_adv_z_base', type=str, default='clean', choices=['clean', 'style'],
                         help='base feature map used to compose z_hard content: clean (default) or style')
     parser.add_argument('--hard_adv_clean_loss_weight', type=float, default=0.0,
-                        help='extra CE weight on clean logits from model(data, communicator=None); 0 disables (default: 0.0)')
+                        help='(unused) Previously mixed CE(logits_clean) into the style branch loss; the extra clean '
+                             'forward was removed. Kept for CLI compatibility; value is ignored.')
     parser.add_argument('--hard_style_test_pool', action='store_true',
                         help='Phase A oracle: each pseudo-epoch rebuild layer3 mu/sigma pool from a random subset of '
                              'leave-out test set (current backbone). Compose z_hard with '

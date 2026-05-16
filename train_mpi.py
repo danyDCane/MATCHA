@@ -547,6 +547,10 @@ if __name__ == "__main__":
                         help='probability of activating style shift module (default: 0.5)')
     parser.add_argument('--style_shift_ratio', type=float, default=0.5,
                         help='ratio of samples in batch to be transformed (default: 0.5)')
+    parser.add_argument('--style_shift_leaveout_test_prob', type=float, default=0.0,
+                        help='(single-process train.py only) If >0: layer3 StyleShift may use leave-out test STYLEDDG stats.')
+    parser.add_argument('--style_shift_leaveout_test_frac', type=float, default=0.1,
+                        help='Test fraction for --style_shift_leaveout_test_prob (single-process train.py only).')
     parser.add_argument('--style_explore_alpha', type=float, default=3.0,
                         help='extrapolation coefficient for style explore module (default: 3.0)')
     parser.add_argument('--style_explore_ratio', type=float, default=0.5,
