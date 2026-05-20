@@ -144,6 +144,70 @@ def compute_loader_per_class_accuracy(model, data_loader, num_classes):
     return per_class_acc, class_correct, class_total
 
 
+def format_ce_delta_per_class_summary(delta_all, label_all, num_classes, top_k=3):
+    """
+    Summarize which classes drive high CE deltas (terminal-only).
+
+    Reports:
+      - top classes by batch-mean delta (all samples in epoch)
+      - among samples with delta >= global p90: class counts in the tail
+      - per-class fraction of samples landing in the global top-10% tail
+    """
+    if delta_all.numel() == 0:
+        return "no_samples", "no_samples"
+    label_all = label_all.long().view(-1)
+    delta_all = delta_all.view(-1).float()
+
+    per_cls_stats = []
+    for c in range(num_classes):
+        mask = label_all == c
+        n = int(mask.sum().item())
+        if n > 0:
+            per_cls_stats.append((c, float(delta_all[mask].mean().item()), n))
+    if len(per_cls_stats) == 0:
+        mean_str = "no_labeled_samples"
+    else:
+        top_mean = sorted(per_cls_stats, key=lambda x: x[1], reverse=True)[:top_k]
+        mean_str = ", ".join(
+            f"c{c}(mean={m:.4f},n={n})" for c, m, n in top_mean
+        )
+
+    p90_thr = float(
+        torch.quantile(
+            delta_all,
+            torch.tensor(0.90, dtype=delta_all.dtype),
+        ).item()
+    )
+    tail_mask = delta_all >= p90_thr
+    n_tail = int(tail_mask.sum().item())
+    if n_tail == 0:
+        return mean_str, f"p90_thr={p90_thr:.4f} no_tail_samples"
+
+    tail_labels = label_all[tail_mask]
+    tail_counts = []
+    tail_rates = []
+    for c, _m, n_cls in per_cls_stats:
+        in_tail = int((tail_labels == c).sum().item())
+        if in_tail > 0:
+            tail_counts.append((c, in_tail))
+        tail_rates.append((c, in_tail / float(n_cls), n_cls))
+
+    top_tail = sorted(tail_counts, key=lambda x: x[1], reverse=True)[:top_k]
+    top_rate = sorted(tail_rates, key=lambda x: x[1], reverse=True)[:top_k]
+    tail_count_str = ", ".join(
+        f"c{c}({cnt}/{n_tail}={100.0 * cnt / n_tail:.1f}%)"
+        for c, cnt in top_tail
+    )
+    tail_rate_str = ", ".join(
+        f"c{c}(frac={r:.2f},n={n})" for c, r, n in top_rate
+    )
+    tail_str = (
+        f"p90_thr={p90_thr:.4f} tail_n={n_tail} "
+        f"top_in_tail: {tail_count_str} | top_tail_frac: {tail_rate_str}"
+    )
+    return mean_str, tail_str
+
+
 def run(num_domains):
     """
     Single process training function for decentralized learning.
@@ -373,6 +437,10 @@ def run(num_domains):
     hard_ce_harder_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Terminal-only: accumulate per-sample hard CE deltas for epoch-level distribution stats.
     hard_ce_delta_samples = {domain: [] for domain in domain_names}
+    hard_ce_delta_label_samples = {domain: [] for domain in domain_names}
+    style_hard_ce_delta_meters = {domain: util.AverageMeter() for domain in domain_names}
+    style_hard_ce_delta_samples = {domain: [] for domain in domain_names}
+    style_hard_ce_delta_label_samples = {domain: [] for domain in domain_names}
     hard_ood_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Terminal-only hard-adv classification behavior monitors.
     hard_style_conf_meters = {domain: util.AverageMeter() for domain in domain_names}
@@ -957,13 +1025,16 @@ def run(num_domains):
                         vec_hs_sc_dir_cos_low03_meters[domain].update(float(cos_hs_sc_low03), data.size(0))
                         vec_hs_sc_dir_cos_samples[domain].append(cos_hs_sc_vec.detach().cpu())
 
-                    loss_style_ce = criterion(logits_style, target)
+                    style_ce_vec = F.cross_entropy(logits_style, target, reduction='none')
+                    loss_style_ce = style_ce_vec.mean()
                     hard_ce_vec = F.cross_entropy(logits_hard, target, reduction='none')
                     loss_hard_ce = hard_ce_vec.mean()
                     with torch.no_grad():
                         hard_ce_delta_vec = hard_ce_vec - L_cls_inner_vec.detach()
                         hard_ce_delta = float(hard_ce_delta_vec.mean().item())
                         hard_ce_harder_ratio = float((hard_ce_delta_vec > 0).float().mean().item())
+                        style_hard_ce_delta_vec = hard_ce_vec - style_ce_vec.detach()
+                        style_hard_ce_delta = float(style_hard_ce_delta_vec.mean().item())
                         probs_style = F.softmax(logits_style, dim=1)
                         probs_hard = F.softmax(logits_hard, dim=1)
                         style_conf = float(probs_style.max(dim=1).values.mean().item())
@@ -991,6 +1062,9 @@ def run(num_domains):
                             flip_on_style_correct_ratio = 0.0
 
                     hard_ce_delta_samples[domain].append(hard_ce_delta_vec.detach().cpu())
+                    hard_ce_delta_label_samples[domain].append(target.detach().cpu())
+                    style_hard_ce_delta_samples[domain].append(style_hard_ce_delta_vec.detach().cpu())
+                    style_hard_ce_delta_label_samples[domain].append(target.detach().cpu())
 
                     # Gradient conflict monitor: compare grads from style/hard CE over selected groups.
                     backbone_mod = getattr(model, "backbone", None)
@@ -1080,6 +1154,7 @@ def run(num_domains):
                     hard_ce_meters[domain].update(float(loss_hard_ce.item()), data.size(0))
                     hard_ce_delta_meters[domain].update(hard_ce_delta, data.size(0))
                     hard_ce_harder_ratio_meters[domain].update(hard_ce_harder_ratio, data.size(0))
+                    style_hard_ce_delta_meters[domain].update(style_hard_ce_delta, data.size(0))
                     hard_ood_loss_meters[domain].update(float(hard_ood_loss.item()), data.size(0))
                     hard_style_conf_meters[domain].update(style_conf, data.size(0))
                     hard_hard_conf_meters[domain].update(hard_conf, data.size(0))
@@ -1531,6 +1606,46 @@ def run(num_domains):
                             f"[hard_ce_delta_dist] epoch={epoch} domain={_d} "
                             f"mean={mean_delta:.6f} std={std:.6f} p25={p25:.6f} p50={p50:.6f} p75={p75:.6f} p90={p90:.6f}"
                         )
+                        label_all = torch.cat(hard_ce_delta_label_samples[_d], dim=0)
+                        mean_cls_str, tail_cls_str = format_ce_delta_per_class_summary(
+                            delta_all, label_all, num_classes
+                        )
+                        print(
+                            f"[hard_ce_delta_per_class] epoch={epoch} domain={_d} "
+                            f"top_mean_delta: {mean_cls_str} | {tail_cls_str}"
+                        )
+                    mean_sh_delta = float(style_hard_ce_delta_meters[_d].avg)
+                    if len(style_hard_ce_delta_samples[_d]) == 0:
+                        print(
+                            f"[style_hard_ce_delta_dist] epoch={epoch} domain={_d} "
+                            f"mean={mean_sh_delta:.6f} no_samples"
+                        )
+                    else:
+                        sh_delta_all = torch.cat(style_hard_ce_delta_samples[_d], dim=0)
+                        qs_sh = torch.quantile(
+                            sh_delta_all,
+                            torch.tensor([0.25, 0.50, 0.75, 0.90], dtype=sh_delta_all.dtype),
+                        )
+                        sh_p25, sh_p50, sh_p75, sh_p90 = (
+                            float(qs_sh[0].item()),
+                            float(qs_sh[1].item()),
+                            float(qs_sh[2].item()),
+                            float(qs_sh[3].item()),
+                        )
+                        sh_std = float(sh_delta_all.std(unbiased=False).item())
+                        print(
+                            f"[style_hard_ce_delta_dist] epoch={epoch} domain={_d} "
+                            f"mean={mean_sh_delta:.6f} std={sh_std:.6f} "
+                            f"p25={sh_p25:.6f} p50={sh_p50:.6f} p75={sh_p75:.6f} p90={sh_p90:.6f}"
+                        )
+                        sh_label_all = torch.cat(style_hard_ce_delta_label_samples[_d], dim=0)
+                        sh_mean_cls_str, sh_tail_cls_str = format_ce_delta_per_class_summary(
+                            sh_delta_all, sh_label_all, num_classes
+                        )
+                        print(
+                            f"[style_hard_ce_delta_per_class] epoch={epoch} domain={_d} "
+                            f"top_mean_delta: {sh_mean_cls_str} | {sh_tail_cls_str}"
+                        )
             if getattr(args, "use_hard_style_adv", False) and bool(getattr(args, "hard_adv_monitor_sparsity", False)):
                 for _d in domain_names:
                     print(
@@ -1636,12 +1751,6 @@ def run(num_domains):
                 log_dict[f"{domain}/consensus_drift/full_backbone_l2"] = float(drift_l2_backbone_meters[domain].avg)
                 log_dict[f"{domain}/consensus_drift/full_backbone_rel"] = float(drift_rel_backbone_meters[domain].avg)
                 log_dict[f"{domain}/style_hard_direction/cos"] = float(vec_style_hard_dir_cos_meters[domain].avg)
-                log_dict[f"{domain}/style_hard_direction/cos_hard_style_vs_style_clean"] = float(
-                    vec_hs_sc_dir_cos_meters[domain].avg
-                )
-                log_dict[f"{domain}/style_hard_direction/frac_hs_sc_lt_0.3"] = float(
-                    vec_hs_sc_dir_cos_low03_meters[domain].avg
-                )
                 log_dict[f"{domain}/style_hard_direction/style_clean_norm"] = float(vec_style_from_clean_norm_meters[domain].avg)
                 log_dict[f"{domain}/style_hard_direction/hard_clean_norm"] = float(vec_hard_from_clean_norm_meters[domain].avg)
                 log_grad_parts_every = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
@@ -1814,6 +1923,10 @@ def run(num_domains):
                 hard_ce_delta_meters[domain].reset()
                 hard_ce_harder_ratio_meters[domain].reset()
                 hard_ce_delta_samples[domain].clear()
+                hard_ce_delta_label_samples[domain].clear()
+                style_hard_ce_delta_meters[domain].reset()
+                style_hard_ce_delta_samples[domain].clear()
+                style_hard_ce_delta_label_samples[domain].clear()
                 hard_ood_loss_meters[domain].reset()
                 hard_style_conf_meters[domain].reset()
                 hard_hard_conf_meters[domain].reset()
