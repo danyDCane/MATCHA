@@ -561,7 +561,11 @@ class SingleProcessCommunicator(object):
         self.topology = topology
         self.neighbor_weight = topology.neighbor_weight
         self.iter = 0
-        
+        # 聚合健康度診斷（D1–D4）；由 train.py 注入 AggDiagnostics 實例，預設關閉。
+        # diag_epoch 供診斷 CSV 標記當前 epoch（train.py 每輪更新）。
+        self.diag = None
+        self.diag_epoch = 0
+
         # Style statistics storage (same as base class)
         self.local_style_vec = None
         self.neighbor_style_vecs = {}  # {domain_name: style_vec_tensor}
@@ -710,6 +714,11 @@ class SingleProcessCommunicator(object):
                         # so named_parameters() should only return denoiser parameters
                     }
             
+            # ===== 診斷 hook：聚合前（snapshot 已完成，模型參數尚未被 copy_ 覆蓋）=====
+            # 用聚合前的 denoiser/backbone 抓 D4 的 L_pre。內部 eval 隔離 + RNG 還原，對訓練零副作用。
+            if self.diag is not None:
+                self.diag.before_agg(models_dict, self.diag_epoch)
+
             # Precompute MH degrees on the active graph (node-level)
             degrees = [0 for _ in range(self.num_domains)]
             for graph_id, flag in enumerate(active_flags):
@@ -802,7 +811,12 @@ class SingleProcessCommunicator(object):
                                 selfweight * original_diffusion_params[param_name] +
                                 diffusion_neighbor_sum[param_name]
                             )
-    
+
+            # ===== 診斷 hook：聚合後（所有節點 backbone+diffusion 已更新）=====
+            # 算 D1（denoiser 參數發散度）與 D4（ΔL，用聚合前快取的 feat 隔離 denoiser 效應）。
+            if self.diag is not None:
+                self.diag.after_agg(models_dict, self.diag_epoch)
+
     def averaging(self, active_flags=None):
         """
         Perform averaging operation (no-op for single process, but kept for compatibility).

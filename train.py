@@ -315,6 +315,35 @@ def run(num_domains):
                     'running_var': module.running_var.clone(),
                     'num_batches_tracked': module.num_batches_tracked.clone() if hasattr(module, 'num_batches_tracked') else None
                 }
+    # ===== 聚合健康度診斷（D1–D4）初始化（純記錄、對訓練零副作用）=====
+    diag = None
+    if getattr(args, 'enable_agg_diag', False):
+        if not getattr(args, 'use_ood', False):
+            print("\033[91m[AGG-DIAG] --enable_agg_diag 需搭配 --use_ood（diffusion_model 才存在），診斷停用\033[0m")
+        else:
+            from dood.agg_diagnostics import AggDiagnostics
+            t_probe = args.diag_t_probe if args.diag_t_probe >= 0 else getattr(args, 'diffusion_steps', 1000) // 2
+            diag_dir = os.path.join(args.savePath, 'agg_diag')
+            diag = AggDiagnostics(
+                save_dir=diag_dir,
+                node_to_domain=node_to_domain if node_to_domain else {d: d for d in domain_names},
+                t_probe=t_probe,
+                d4_every=args.diag_d4_every,
+            )
+            # 對每節點抽一批固定 ID probe 影像（存著重複使用，不隨訓練改變）。
+            # 用獨立 iterator 取，不動 train_iters。
+            for domain in domain_names:
+                _tl, _ = domain_loaders[domain]
+                _batch = next(iter(_tl))
+                _data, _target, _ = util.unpack_batch(_batch)
+                _data = _data.cuda(non_blocking=True)[:args.diag_probe_bs]
+                _target = _target.cuda(non_blocking=True)[:args.diag_probe_bs]
+                diag.set_probe_images(domain, _data, _target)
+            communicator.diag = diag
+            print(f"[AGG-DIAG] enabled. t_probe={t_probe}, d4_every={args.diag_d4_every}, "
+                  f"N={args.diag_every_n_epoch}, M={args.diag_every_m_epoch}, "
+                  f"nodes={len(domain_names)}, dir={diag_dir}", flush=True)
+
     # init recorders for each domain
     comp_time, comm_time = 0, 0
     # Use domain index for recorder (compatible with existing Recorder interface)
@@ -1002,6 +1031,8 @@ def run(num_domains):
         # ========== 第三阶段：交换训练后的模型参数 ==========
         # Exchange updated model parameters after training step
         # Note: style_vecs_dict is None here since we only exchange model parameters (not style stats)
+        # 更新診斷 epoch 標記（聚合 hook 會在 communicate 內讀取）
+        communicator.diag_epoch = (k // STEPS_PER_EPOCH) + 1
         d_comm_time_after = communicator.communicate(models_dict, style_vecs_dict=None)
         comm_time += d_comm_time_after
         
@@ -1075,6 +1106,13 @@ def run(num_domains):
             avg_train_acc_val = avg_train_acc.item() if hasattr(avg_train_acc, 'item') else float(avg_train_acc)
             avg_test_acc_val = avg_test_acc.item() if hasattr(avg_test_acc, 'item') else float(avg_test_acc)
             print(f"Epoch {epoch}: avg_loss={avg_train_loss_val:.3f}, avg_train_acc={avg_train_acc_val:.2f}%, avg_test_acc={avg_test_acc_val:.2f}%")
+
+            # ===== 聚合診斷 D2/D3（epoch 級）=====
+            if diag is not None:
+                if args.diag_every_n_epoch > 0 and epoch % args.diag_every_n_epoch == 0:
+                    diag.log_d2(models_dict, epoch)
+                if args.diag_every_m_epoch > 0 and epoch % args.diag_every_m_epoch == 0:
+                    diag.log_d3(models_dict, epoch)
             for _d in domain_names:
                 print(
                     f"[confidence] epoch={epoch} domain={_d} "
@@ -1341,6 +1379,10 @@ def run(num_domains):
         recorder.save_to_file()
     wandb.finish()
 
+    # 關閉診斷 CSV
+    if diag is not None:
+        diag.close()
+
 
 if __name__ == "__main__":
 
@@ -1391,6 +1433,20 @@ if __name__ == "__main__":
     parser.add_argument('--randomSeed', type=int, help='random seed')
     parser.add_argument('--total_iter', type=int, help='total training iterations (if not set, uses epoch * max_steps_per_epoch)')
     parser.add_argument('--wandb_project', default='MATCHA', type=str, help='wandb project name')
+
+    # ===== 聚合健康度診斷（D1–D4），純記錄、零 sys.exit；需搭配 --use_ood =====
+    parser.add_argument('--enable_agg_diag', action='store_true',
+                        help='enable diffusion aggregation health diagnostics (D1-D4 logger)')
+    parser.add_argument('--diag_t_probe', type=int, default=-1,
+                        help='fixed diffusion timestep for D2/D4 DSM loss (-1 => diffusion_steps//2)')
+    parser.add_argument('--diag_every_n_epoch', type=int, default=1,
+                        help='D2 (aggregated-model ID NLL) every N epochs')
+    parser.add_argument('--diag_every_m_epoch', type=int, default=20,
+                        help='D3 (cross-node heterogeneity matrix) every M epochs (M>>N)')
+    parser.add_argument('--diag_d4_every', type=int, default=1,
+                        help='D4 (pre/post-agg dL) every K communication rounds (D1 every round)')
+    parser.add_argument('--diag_probe_bs', type=int, default=64,
+                        help='batch size of the fixed ID probe images cached for D2/D3/D4')
 
     # ===== Style statistics / StyleDDG-related options =====
     parser.add_argument('--use_style_stats', action='store_true',
