@@ -27,7 +27,8 @@ from style_stats import (
     compute_multi_layer_style_stats,
     flatten_style_stats,
 )
-cudnn.benchmark = True
+cudnn.benchmark = False
+cudnn.deterministic = True
 
 import util
 from graph_manager import FixedProcessor, MatchaProcessor
@@ -391,6 +392,53 @@ def run(num_domains):
     # Accumulate batch-mean |grad_mu_cls| per channel for optional epoch dump (only when log_grad_parts batches run).
     grad_mu_cls_abs_ch_sum = {domain: None for domain in domain_names}
     grad_mu_cls_abs_ch_count = {domain: 0 for domain in domain_names}
+
+    # ===== V2-B-1: score-norm regularizer meters (only meaningful when --use_score_reg) =====
+    use_score_reg = bool(getattr(args, 'use_score_reg', False))
+    reg_t_probe = (
+        args.reg_t_probe if getattr(args, 'reg_t_probe', -1) >= 0
+        else getattr(args, 'diffusion_steps', 1000) // 2
+    )
+    loss_reg_meters = {domain: util.AverageMeter() for domain in domain_names}
+    lambda_eff_meters = {domain: util.AverageMeter() for domain in domain_names}
+    loss_reg_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Gradient-conflict diagnostic meters (R8). Populated only when --enable_score_reg_diag.
+    score_reg_g_cls_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    score_reg_g_reg_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    score_reg_g_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
+
+    def _compute_lambda_eff(epoch_1based: int) -> float:
+        """V2-B-1 lambda schedule: 0 during warmup, optional linear ramp over reg_lambda_ramp_epochs."""
+        if not use_score_reg:
+            return 0.0
+        warmup = int(getattr(args, 'reg_warmup_epoch', 30))
+        if epoch_1based <= warmup:
+            return 0.0
+        target = float(getattr(args, 'lambda_reg', 0.05))
+        schedule = str(getattr(args, 'reg_lambda_schedule', 'linear')).lower()
+        if schedule == 'linear':
+            ramp = max(1, int(getattr(args, 'reg_lambda_ramp_epochs', 10)))
+            progress = min((epoch_1based - warmup) / float(ramp), 1.0)
+            return target * progress
+        return target
+
+    if use_score_reg:
+        if not getattr(args, 'use_ood', False):
+            raise RuntimeError("--use_score_reg requires --use_ood (needs diffusion score model).")
+        if args.model != 'res':
+            raise RuntimeError("--use_score_reg currently supports only --model res.")
+        if getattr(args, 'resnet_type', 'simplified') != 'standard':
+            raise RuntimeError("--use_score_reg requires --resnet_type standard (needs forward_to_layer3_style/forward_from_layer3).")
+        if getattr(args, 'use_hard_style_adv', False):
+            raise RuntimeError("--use_score_reg is mutually exclusive with --use_hard_style_adv in V2-B-1 (clean A/B baseline).")
+        print(
+            f"[V2-B-1] score-norm regularizer enabled. "
+            f"lambda_reg={args.lambda_reg}, warmup_epoch={args.reg_warmup_epoch}, "
+            f"t_probe={reg_t_probe}, schedule={args.reg_lambda_schedule} (ramp={args.reg_lambda_ramp_epochs}ep), "
+            f"diag={bool(getattr(args, 'enable_score_reg_diag', False))}",
+            flush=True,
+        )
+
     tic = time.time()
 
     # ===== start training with fixed total steps K (Algorithm 1) =====
@@ -905,7 +953,21 @@ def run(num_domains):
                 loss_clean_ce = criterion(logits_clean, target)
                 clean_ce_meters[domain].update(float(loss_clean_ce.item()), data.size(0))
 
-                if (use_style_stats or use_style_shift) and args.model == "res":
+                # vec_style is only produced by V2-B-1's two-step forward; otherwise None.
+                vec_style_for_reg = None
+                if use_score_reg:
+                    # V2-B-1: two-step forward so logits and vec_style share the SAME z_style graph.
+                    # Avoids re-running style aug (which is stochastic) for the regularizer input.
+                    communicator.set_active_domain(domain)
+                    z_style_pooled = model.forward_to_layer3_style(
+                        data,
+                        communicator=communicator if (use_style_stats or use_style_shift) else None,
+                        debug_style_shift=debug_style_shift,
+                        iter_num=k+1,
+                        rank=domain_names.index(domain),
+                    )
+                    output, vec_style_for_reg = model.forward_from_layer3(z_style_pooled)
+                elif (use_style_stats or use_style_shift) and args.model == "res":
                     communicator.set_active_domain(domain)
                     output = model(
                         data,
@@ -921,9 +983,59 @@ def run(num_domains):
                 style_aug_activated = bool(getattr(model, "last_style_aug_activated", False))
                 style_aug_flag_meters[domain].update(1.0 if style_aug_activated else 0.0, data.size(0))
 
-                loss = criterion(output, target)
+                loss_cls = criterion(output, target)
+                loss = loss_cls
                 if hard_adv_clean_loss_weight > 0.0:
                     loss = loss + hard_adv_clean_loss_weight * loss_clean_ce
+
+                # ===== V2-B-1: score-norm regularizer (after lambda_eff > 0) =====
+                if use_score_reg and vec_style_for_reg is not None:
+                    lambda_eff = _compute_lambda_eff(epoch_i_1based)
+                    if lambda_eff > 0.0 and domain in diffusion_models_dict:
+                        diffusion_model = diffusion_models_dict[domain]
+                        prev_diff_training = diffusion_model.training
+                        diffusion_model.eval()  # freeze normalize queue + denoiser BN
+                        for _p in diffusion_model.parameters():
+                            _p.requires_grad_(False)  # score = pure measurement tool
+                        try:
+                            vec_norm_for_reg = diffusion_model.normalize(vec_style_for_reg)
+                            loss_reg = diffusion_model.get_loss_at_timestep(vec_norm_for_reg, reg_t_probe)
+                        finally:
+                            for _p in diffusion_model.parameters():
+                                _p.requires_grad_(True)
+                            diffusion_model.train(prev_diff_training)
+
+                        # Optional gradient-conflict diagnostic (R8) — must run BEFORE
+                        # the main loss is finalized so we can autograd.grad(loss_cls,...)
+                        # and autograd.grad(lambda_eff*loss_reg,...) independently on the same graph.
+                        if bool(getattr(args, 'enable_score_reg_diag', False)) and (
+                            int(getattr(args, 'score_reg_diag_every', 50)) > 0
+                            and (k % int(getattr(args, 'score_reg_diag_every', 50)) == 0)
+                        ):
+                            from dood.score_reg_diagnostics import compute_grad_conflict
+                            backbone_params = [p for p in model.parameters() if p.requires_grad]
+                            try:
+                                diag_stats = compute_grad_conflict(
+                                    loss_cls=loss_cls,
+                                    loss_reg_weighted=lambda_eff * loss_reg,
+                                    params=backbone_params,
+                                )
+                                score_reg_g_cls_norm_meters[domain].update(diag_stats['g_cls_norm'], 1)
+                                score_reg_g_reg_norm_meters[domain].update(diag_stats['g_reg_norm'], 1)
+                                score_reg_g_cos_meters[domain].update(diag_stats['g_cos'], 1)
+                            except Exception as _e:
+                                # Don't crash training because of diagnostic failure.
+                                print(f"[V2-B-1][diag][WARN] grad_conflict failed: {_e}", flush=True)
+
+                        loss = loss + lambda_eff * loss_reg
+
+                        loss_reg_val = float(loss_reg.item())
+                        loss_reg_meters[domain].update(loss_reg_val, data.size(0))
+                        lambda_eff_meters[domain].update(lambda_eff, data.size(0))
+                        ratio_denom = float(loss.item()) if float(loss.item()) > 0 else 1e-12
+                        loss_reg_ratio_meters[domain].update(
+                            (lambda_eff * loss_reg_val) / ratio_denom, data.size(0)
+                        )
 
                 with torch.no_grad():
                     probs_clean = F.softmax(logits_clean, dim=1)
@@ -959,11 +1071,31 @@ def run(num_domains):
                     sym_kl = 0.5 * (kl_clean_to_style + kl_style_to_clean)
                     clean_style_sym_kl_meters[domain].update(float(sym_kl.item()), data.size(0))
             
+            # record training loss and accuracy
+            record_start = time.time()
+            acc1 = util.comp_accuracy(output, target)
+            losses_dict[domain].update(loss.item(), data.size(0))
+            top1_dict[domain].update(acc1[0], data.size(0))
+            record_end = time.time()
+
+            # backward pass for classification
+            # IMPORTANT: this MUST run BEFORE the diffusion training block below.
+            # V2-B-1 puts diffusion_model parameters inside the main loss graph
+            # (via loss_reg = diffusion_model.get_loss_at_timestep(vec_norm, t_probe));
+            # if diffusion training (optimizer_diffusion.step) updates those params
+            # in-place first, loss.backward() detects the version mismatch and raises
+            # "variable modified by inplace operation". Pre-V2-B-1 the order was reversed
+            # because main loss did not touch diffusion params.
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
             # Compute diffusion loss if OOD detection is enabled
+            # (Moved AFTER main optimizer.step() — see comment above.)
             if getattr(args, 'use_ood', False) and domain in diffusion_models_dict:
                 diffusion_model = diffusion_models_dict[domain]
                 optimizer_diffusion = optimizers_diffusion_dict[domain]
-                
+
                 # Extract intermediate features for diffusion model.
                 # Run this extra forward in eval + no_grad so BatchNorm running stats are NOT
                 # updated a second time (the classification forward above already updated them).
@@ -983,35 +1115,23 @@ def run(num_domains):
                         backbone.train()
                     else:
                         model.train()
-                
+
                 # Normalize features and compute diffusion loss
                 # Detach latents to avoid affecting backbone gradients
                 latents_for_diff = latents.detach().requires_grad_(True)
                 diffusion_model.train()
                 latents_normalized = diffusion_model.normalize(latents_for_diff)
-                
+
                 loss_diff = diffusion_model.get_loss_iter(latents_normalized)
-                
+
                 # Backward pass for diffusion model
                 optimizer_diffusion.zero_grad()
                 loss_diff.backward()
                 optimizer_diffusion.step()
-                
+
                 # Record diffusion loss for averaging
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].update(loss_diff.item(), data.size(0))
-
-            # record training loss and accuracy
-            record_start = time.time()
-            acc1 = util.comp_accuracy(output, target)
-            losses_dict[domain].update(loss.item(), data.size(0))
-            top1_dict[domain].update(acc1[0], data.size(0))
-            record_end = time.time()
-
-            # backward pass for classification
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
 
             # update cosine annealing scheduler (purely step-based)
             schedulers_dict[domain].step()
@@ -1107,6 +1227,23 @@ def run(num_domains):
             avg_test_acc_val = avg_test_acc.item() if hasattr(avg_test_acc, 'item') else float(avg_test_acc)
             print(f"Epoch {epoch}: avg_loss={avg_train_loss_val:.3f}, avg_train_acc={avg_train_acc_val:.2f}%, avg_test_acc={avg_test_acc_val:.2f}%")
 
+            # ===== V2-B-1: epoch summary for score-norm regularizer =====
+            if use_score_reg:
+                _loss_reg_avg = sum(float(loss_reg_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+                _lambda_eff_avg = sum(float(lambda_eff_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+                _reg_ratio_avg = sum(float(loss_reg_ratio_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+                _style_rate_avg = sum(float(style_aug_flag_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+                _v2b1_msg = (
+                    f"  [V2-B-1] loss_reg={_loss_reg_avg:.4f}  lambda_eff={_lambda_eff_avg:.4f}  "
+                    f"r(reg/total)={_reg_ratio_avg*100:.1f}%  style_aug_rate={_style_rate_avg*100:.1f}%"
+                )
+                if bool(getattr(args, 'enable_score_reg_diag', False)):
+                    _gcos_avg = sum(float(score_reg_g_cos_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+                    _gcls_avg = sum(float(score_reg_g_cls_norm_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+                    _greg_avg = sum(float(score_reg_g_reg_norm_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+                    _v2b1_msg += f"  | grad_cos(cls,reg)={_gcos_avg:+.3f}  ||g_cls||={_gcls_avg:.3f}  ||g_reg||={_greg_avg:.3f}"
+                print(_v2b1_msg, flush=True)
+
             # ===== 聚合診斷 D2/D3（epoch 級）=====
             if diag is not None:
                 if args.diag_every_n_epoch > 0 and epoch % args.diag_every_n_epoch == 0:
@@ -1198,6 +1335,17 @@ def run(num_domains):
                         _v = grad_mu_cls_ch_avg_epoch[domain].numpy()
                         log_dict[f"{domain}/grad_mu_cls_abs_per_channel_hist"] = wandb.Histogram(_v)
                 log_dict[f"{domain}/vec_hard_vs_style_delta"] = float(vec_hard_vs_style_delta_meters[domain].avg)
+
+                # V2-B-1: score-norm regularizer metrics (only meaningful when --use_score_reg)
+                if use_score_reg:
+                    log_dict[f"{domain}/loss_reg"] = float(loss_reg_meters[domain].avg)
+                    log_dict[f"{domain}/lambda_eff"] = float(lambda_eff_meters[domain].avg)
+                    log_dict[f"{domain}/loss_reg_ratio"] = float(loss_reg_ratio_meters[domain].avg)
+                    log_dict[f"{domain}/style_aug_activated_rate"] = float(style_aug_flag_meters[domain].avg)
+                    if bool(getattr(args, 'enable_score_reg_diag', False)):
+                        log_dict[f"{domain}/score_reg_g_cls_norm"] = float(score_reg_g_cls_norm_meters[domain].avg)
+                        log_dict[f"{domain}/score_reg_g_reg_norm"] = float(score_reg_g_reg_norm_meters[domain].avg)
+                        log_dict[f"{domain}/score_reg_g_cos"] = float(score_reg_g_cos_meters[domain].avg)
 
             log_grad_parts_every_ep = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
             do_log_grad_parts_ep = bool(getattr(args, "hard_adv_log_grad_parts", False)) and (
@@ -1346,6 +1494,13 @@ def run(num_domains):
                     vec_hard_vs_clean_l4_delta_meters[domain].reset()
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].reset()
+                # V2-B-1 meters
+                loss_reg_meters[domain].reset()
+                lambda_eff_meters[domain].reset()
+                loss_reg_ratio_meters[domain].reset()
+                score_reg_g_cls_norm_meters[domain].reset()
+                score_reg_g_reg_norm_meters[domain].reset()
+                score_reg_g_cos_meters[domain].reset()
             tic = time.time()
 
     # ===== Save final models (backbone + diffusion + normalization stats) =====
@@ -1530,6 +1685,29 @@ if __name__ == "__main__":
                         help='Learning rate for diffusion model (default: 5e-5)')
     parser.add_argument('--lambda_diff', type=float, default=1.0,
                         help='Weight for diffusion loss (default: 1.0)')
+
+    # ===== V2-B-1: score-norm regularizer on vec_style (opens backbone gradient path) =====
+    parser.add_argument('--use_score_reg', action='store_true',
+                        help='V2-B-1: add score-norm regularizer on vec_style (pooled 512-d after style aug). '
+                             'Forces forward_to_layer3_style + forward_from_layer3 two-step forward so '
+                             'logits and vec_style share the same z_style graph. Requires --use_ood and resnet_type=standard.')
+    parser.add_argument('--lambda_reg', type=float, default=0.05,
+                        help='V2-B-1: target weight for score-norm regularizer (default 0.05, FOOGD-SAG default).')
+    parser.add_argument('--reg_warmup_epoch', type=int, default=30,
+                        help='V2-B-1: epochs to wait before activating score-norm regularizer (default 30, '
+                             'aligns with V1 stage1 D2 stabilization point).')
+    parser.add_argument('--reg_t_probe', type=int, default=-1,
+                        help='V2-B-1: fixed diffusion timestep for score-norm regularizer (-1 => diffusion_steps//2).')
+    parser.add_argument('--reg_lambda_schedule', type=str, default='linear', choices=['off', 'linear'],
+                        help='V2-B-1: lambda schedule after warmup. linear=ramp 0->lambda_reg over 10 epochs; '
+                             'off=step-on at warmup end (default linear).')
+    parser.add_argument('--reg_lambda_ramp_epochs', type=int, default=10,
+                        help='V2-B-1: number of epochs to ramp lambda from 0 to lambda_reg after warmup (default 10).')
+    parser.add_argument('--enable_score_reg_diag', action='store_true',
+                        help='V2-B-1: enable backbone gradient-conflict diagnostic (cls vs reg cos & norms). '
+                             'Adds extra autograd.grad calls; only runs every --score_reg_diag_every steps.')
+    parser.add_argument('--score_reg_diag_every', type=int, default=50,
+                        help='V2-B-1: run gradient-conflict diagnostic every N optimizer steps (default 50).')
 
     args = parser.parse_args()
 
