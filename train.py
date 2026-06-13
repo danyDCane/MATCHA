@@ -336,7 +336,11 @@ def run(num_domains):
             for domain in domain_names:
                 _tl, _ = domain_loaders[domain]
                 _batch = next(iter(_tl))
-                _data, _target, _ = util.unpack_batch(_batch)
+                if getattr(args, 'use_fourier_aug', False):
+                    # Fourier wrapper yields (raw_norm, aug_norm, target, meta); probe uses raw.
+                    _data, _target = _batch[0], _batch[2]
+                else:
+                    _data, _target, _ = util.unpack_batch(_batch)
                 _data = _data.cuda(non_blocking=True)[:args.diag_probe_bs]
                 _target = _target.cuda(non_blocking=True)[:args.diag_probe_bs]
                 diag.set_probe_images(domain, _data, _target)
@@ -351,6 +355,13 @@ def run(num_domains):
     recorders = {domain: util.Recorder(args, domain_names.index(domain)) for domain in domain_names}
     losses_dict = {domain: util.AverageMeter() for domain in domain_names}
     top1_dict = {domain: util.AverageMeter() for domain in domain_names}
+    # Fourier aug (Option B) Path F/S separation meters (R1b); unused/zero when fourier off
+    fourier_acc_f_dict = {domain: util.AverageMeter() for domain in domain_names}
+    fourier_loss_s_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # Gradient-conflict between Path S and Path F (cos<0 => fighting on backbone)
+    fourier_g_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
+    fourier_g_s_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    fourier_g_f_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
     style_aug_flag_meters = {domain: util.AverageMeter() for domain in domain_names}
     # Meters for z_style / z_hard training (enabled by --use_hard_style_adv)
     task_loss_meters = {domain: util.AverageMeter() for domain in domain_names}
@@ -393,53 +404,46 @@ def run(num_domains):
     grad_mu_cls_abs_ch_sum = {domain: None for domain in domain_names}
     grad_mu_cls_abs_ch_count = {domain: 0 for domain in domain_names}
 
-    # ===== V2-B-1: score-norm regularizer meters (only meaningful when --use_score_reg) =====
-    use_score_reg = bool(getattr(args, 'use_score_reg', False))
-    reg_t_probe = (
-        args.reg_t_probe if getattr(args, 'reg_t_probe', -1) >= 0
-        else getattr(args, 'diffusion_steps', 1000) // 2
-    )
-    loss_reg_meters = {domain: util.AverageMeter() for domain in domain_names}
-    lambda_eff_meters = {domain: util.AverageMeter() for domain in domain_names}
-    loss_reg_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
-    # Gradient-conflict diagnostic meters (R8). Populated only when --enable_score_reg_diag.
-    score_reg_g_cls_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
-    score_reg_g_reg_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
-    score_reg_g_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
+    # ===== KSD generalization coupling meters (only meaningful when --use_ksd_reg) =====
+    # Phase 1 (replaces V2-B-1 score-norm reg): pull the style-shifted (augmented) penultimate
+    # toward the clean-source density using KSD with the FROZEN diffusion as score witness, plus
+    # GRADIENT BALANCING that sets lambda so ||lam*g_ksd|| = ksd_grad_ratio * ||g_cls|| (breaks the
+    # V2-B-1 ~4e-4 gradient damping). ksd_grad_ratio=0 => KSD-off control (same two-step forward,
+    # no KSD loss) == the deterministic V1 73.29 setup.
+    use_ksd_reg = bool(getattr(args, 'use_ksd_reg', False))
+    ksd_grad_ratio = float(getattr(args, 'ksd_grad_ratio', 0.1))
+    ksd_score_t = int(getattr(args, 'ksd_score_timestep', 25))
+    ksd_balance_every = max(1, int(getattr(args, 'ksd_balance_every', 20)))
+    # Lambda held between balance measurements (gradient balancing runs every ksd_balance_every steps).
+    ksd_lambda_held = {domain: 0.0 for domain in domain_names}
+    # Monitoring meters (KSD做動健康監控).
+    loss_ksd_meters = {domain: util.AverageMeter() for domain in domain_names}
+    ksd_lambda_meters = {domain: util.AverageMeter() for domain in domain_names}
+    ksd_bw_meters = {domain: util.AverageMeter() for domain in domain_names}
+    ksd_g_cls_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    ksd_g_ksd_norm_meters = {domain: util.AverageMeter() for domain in domain_names}
+    ksd_g_cos_meters = {domain: util.AverageMeter() for domain in domain_names}
+    ksd_achieved_ratio_meters = {domain: util.AverageMeter() for domain in domain_names}
 
-    def _compute_lambda_eff(epoch_1based: int) -> float:
-        """V2-B-1 lambda schedule: 0 during warmup, optional linear ramp over reg_lambda_ramp_epochs."""
-        if not use_score_reg:
-            return 0.0
-        warmup = int(getattr(args, 'reg_warmup_epoch', 30))
-        if epoch_1based <= warmup:
-            return 0.0
-        target = float(getattr(args, 'lambda_reg', 0.05))
-        schedule = str(getattr(args, 'reg_lambda_schedule', 'linear')).lower()
-        if schedule == 'linear':
-            ramp = max(1, int(getattr(args, 'reg_lambda_ramp_epochs', 10)))
-            progress = min((epoch_1based - warmup) / float(ramp), 1.0)
-            return target * progress
-        return target
-
-    if use_score_reg:
+    if use_ksd_reg:
         if not getattr(args, 'use_ood', False):
-            raise RuntimeError("--use_score_reg requires --use_ood (needs diffusion score model).")
+            raise RuntimeError("--use_ksd_reg requires --use_ood (needs diffusion score witness).")
         if args.model != 'res':
-            raise RuntimeError("--use_score_reg currently supports only --model res.")
+            raise RuntimeError("--use_ksd_reg currently supports only --model res.")
         if getattr(args, 'resnet_type', 'simplified') != 'standard':
-            raise RuntimeError("--use_score_reg requires --resnet_type standard (needs forward_to_layer3_style/forward_from_layer3).")
+            raise RuntimeError("--use_ksd_reg requires --resnet_type standard (needs forward_to_layer3_style/forward_from_layer3).")
         if getattr(args, 'use_hard_style_adv', False):
-            raise RuntimeError("--use_score_reg is mutually exclusive with --use_hard_style_adv in V2-B-1 (clean A/B baseline).")
+            raise RuntimeError("--use_ksd_reg is mutually exclusive with --use_hard_style_adv (clean A/B baseline).")
         print(
-            f"[V2-B-1] score-norm regularizer enabled. "
-            f"lambda_reg={args.lambda_reg}, warmup_epoch={args.reg_warmup_epoch}, "
-            f"t_probe={reg_t_probe}, schedule={args.reg_lambda_schedule} (ramp={args.reg_lambda_ramp_epochs}ep), "
-            f"diag={bool(getattr(args, 'enable_score_reg_diag', False))}",
+            f"[KSD] generalization coupling enabled. "
+            f"grad_ratio={ksd_grad_ratio}, score_t={ksd_score_t} (low-sigma witness), "
+            f"balance_every={ksd_balance_every} steps. grad_ratio=0 => KSD-off control (= V1 forward).",
             flush=True,
         )
 
     tic = time.time()
+
+    use_fourier_aug = getattr(args, 'use_fourier_aug', False)
 
     # ===== start training with fixed total steps K (Algorithm 1) =====
     for k in range(K):
@@ -458,10 +462,18 @@ def run(num_domains):
         if (getattr(args, "use_style_stats", False) or getattr(args, "use_style_shift", False)) and args.model == "res":
             for domain in domain_names:
                 batch = next(train_iters[domain])
-                data, target, meta = util.unpack_batch(batch)
-                data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
-                batch_cache[domain] = (data, target, meta)
-                
+                if use_fourier_aug:
+                    # 4-tuple: (raw_norm, fourier_aug_norm, target, meta)
+                    data, data_aug, target, meta = batch[0], batch[1], batch[2], batch[3]
+                    data = data.cuda(non_blocking=True)
+                    data_aug = data_aug.cuda(non_blocking=True)
+                    target = target.cuda(non_blocking=True)
+                    batch_cache[domain] = (data, data_aug, target, meta)
+                else:
+                    data, target, meta = util.unpack_batch(batch)
+                    data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
+                    batch_cache[domain] = (data, target, meta)
+
                 with torch.no_grad():  # 不计算梯度，节省内存
                     model = models_dict[domain]
                     # 只提取特征到 layer3，不应用 style shift
@@ -523,11 +535,20 @@ def run(num_domains):
             
             # Reuse phase-1 batch when style stats are enabled; otherwise fetch normally.
             if domain in batch_cache:
-                data, target, batch_meta = batch_cache[domain]
+                if use_fourier_aug:
+                    data, data_aug, target, batch_meta = batch_cache[domain]
+                else:
+                    data, target, batch_meta = batch_cache[domain]
             else:
                 batch = next(train_iters[domain])
-                data, target, batch_meta = util.unpack_batch(batch)
-                data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
+                if use_fourier_aug:
+                    data, data_aug, target, batch_meta = batch[0], batch[1], batch[2], batch[3]
+                    data = data.cuda(non_blocking=True)
+                    data_aug = data_aug.cuda(non_blocking=True)
+                    target = target.cuda(non_blocking=True)
+                else:
+                    data, target, batch_meta = util.unpack_batch(batch)
+                    data, target = data.cuda(non_blocking=True), target.cuda(non_blocking=True)
             
             # Forward + loss
             # Note: communicator.neighbor_style_stats uses domain names as keys in single process mode.
@@ -924,21 +945,59 @@ def run(num_domains):
                     spatial_dump_saved_epochs.add(epoch_i_1based)
 
                 output = logits_style
+            elif use_fourier_aug and getattr(args, 'fourier_concat_forward', False):
+                # arm5c (FOOGD-exact): ONE forward over cat([clean, fourier]) + ONE CE, so BN
+                # sees the mixed clean+fourier batch statistics (matches FOOGD client_fedavg
+                # data=cat([x_ori,x_s2o]) + CE). Contrast arm5b's TWO separate forwards
+                # (0.5*CE_clean + 0.5*CE_fourier) where BN normalizes clean / fourier separately.
+                # Loss math is equivalent; the only difference is forward/BN coupling.
+                # No style / score-reg here (same flags-off config as arm5b). train-BN is implicit
+                # (model is in train()). The two-forward fourier_grad probe does not apply.
+                _n_clean = data.size(0)
+                _combined = torch.cat([data, data_aug], dim=0)
+                _logits_cat = model(
+                    _combined,
+                    return_blocks=False,
+                    communicator=None,
+                    debug_style_shift=False,
+                    iter_num=k+1,
+                    rank=domain_names.index(domain),
+                )
+                _target_cat = torch.cat([target, target], dim=0)
+                loss = criterion(_logits_cat, _target_cat)
+                # Split halves only for meters (clean = Path S analogue, fourier = Path F analogue).
+                output = _logits_cat[:_n_clean]
+                logits_clean = _logits_cat[_n_clean:]
+                loss_clean_ce = criterion(logits_clean, target)
+                clean_ce_meters[domain].update(float(loss_clean_ce.item()), data.size(0))
+                with torch.no_grad():
+                    acc_f = util.comp_accuracy(logits_clean, target)
+                fourier_acc_f_dict[domain].update(acc_f[0], data.size(0))
+                fourier_loss_s_meters[domain].update(float(criterion(output, target).item()), data.size(0))
+                style_aug_activated = False
+                style_aug_flag_meters[domain].update(0.0, data.size(0))
             else:
                 # Original training path (logits only)
-                # Isolate BN updates for clean branch:
-                # use eval() so BN running stats are not updated, while keeping autograd enabled.
+                # Isolate BN updates for clean branch: use eval() so BN running stats are
+                # not updated, while keeping autograd enabled.
+                # arm1 (--fourier_train_bn): for the Fourier Path F, do NOT freeze BN, so the
+                # fourier features update BN running stats (matches FOOGD's train-BN fourier view).
+                # This tests whether the eval-BN choice was handicapping Path F.
+                freeze_clean_bn = not (use_fourier_aug and getattr(args, 'fourier_train_bn', False))
                 backbone_for_clean = getattr(model, "backbone", None)
                 prev_backbone_training_for_clean = None
                 prev_model_training_for_clean = model.training
-                if backbone_for_clean is not None:
-                    prev_backbone_training_for_clean = backbone_for_clean.training
-                    backbone_for_clean.eval()
-                else:
-                    model.eval()
+                if freeze_clean_bn:
+                    if backbone_for_clean is not None:
+                        prev_backbone_training_for_clean = backbone_for_clean.training
+                        backbone_for_clean.eval()
+                    else:
+                        model.eval()
                 try:
+                    # Path F (Option B): Fourier-augmented input through the clean forward
+                    # (communicator=None). BN frozen by default (eval-BN); train-BN under arm1.
                     logits_clean = model(
-                        data,
+                        data_aug if use_fourier_aug else data,
                         return_blocks=False,
                         communicator=None,
                         debug_style_shift=False,
@@ -946,18 +1005,26 @@ def run(num_domains):
                         rank=domain_names.index(domain),
                     )
                 finally:
-                    if backbone_for_clean is not None and prev_backbone_training_for_clean is not None:
-                        backbone_for_clean.train(prev_backbone_training_for_clean)
-                    else:
-                        model.train(prev_model_training_for_clean)
+                    if freeze_clean_bn:
+                        if backbone_for_clean is not None and prev_backbone_training_for_clean is not None:
+                            backbone_for_clean.train(prev_backbone_training_for_clean)
+                        else:
+                            model.train(prev_model_training_for_clean)
                 loss_clean_ce = criterion(logits_clean, target)
                 clean_ce_meters[domain].update(float(loss_clean_ce.item()), data.size(0))
+                if use_fourier_aug:
+                    # Path F train acc (R1b): does the model learn amplitude-invariance?
+                    with torch.no_grad():
+                        acc_f = util.comp_accuracy(logits_clean, target)
+                    fourier_acc_f_dict[domain].update(acc_f[0], data.size(0))
 
-                # vec_style is only produced by V2-B-1's two-step forward; otherwise None.
+                # vec_style_for_reg (= grad-enabled style-shifted penultimate = KSD's z_aug) is only
+                # produced by the two-step forward; otherwise None. Triggered by KSD coupling OR the
+                # passive --score_diag probe (both consume the same z_aug).
                 vec_style_for_reg = None
-                if use_score_reg:
-                    # V2-B-1: two-step forward so logits and vec_style share the SAME z_style graph.
-                    # Avoids re-running style aug (which is stochastic) for the regularizer input.
+                if use_ksd_reg or bool(getattr(args, 'score_diag', False)):
+                    # Two-step forward so logits and vec_style_for_reg share the SAME z_style graph.
+                    # Avoids re-running style aug (which is stochastic) for the KSD / probe input.
                     communicator.set_active_domain(domain)
                     z_style_pooled = model.forward_to_layer3_style(
                         data,
@@ -983,59 +1050,191 @@ def run(num_domains):
                 style_aug_activated = bool(getattr(model, "last_style_aug_activated", False))
                 style_aug_flag_meters[domain].update(1.0 if style_aug_activated else 0.0, data.size(0))
 
-                loss_cls = criterion(output, target)
+                # ===== Phase 0 (--score_diag): passive diffusion-score DIRECTION diagnostic =====
+                # Reuses vec_style_for_reg (the REAL style-shifted penultimate from the two-step
+                # forward above) as z_style; z_clean from a passive clean forward. Checks whether the
+                # diffusion score (∇log p of clean-source density) points the style-shifted feature
+                # BACK toward the clean manifold (=> usable KSD witness for Phase 1). PASSIVE: logs
+                # only, applies NO loss / no backward; diffusion frozen (no queue / BN / RNG change).
+                if (bool(getattr(args, 'score_diag', False)) and vec_style_for_reg is not None
+                        and domain in diffusion_models_dict
+                        and int(getattr(args, 'score_diag_every', 50)) > 0
+                        and (k % int(getattr(args, 'score_diag_every', 50)) == 0)):
+                    try:
+                        _dm = diffusion_models_dict[domain]
+                        _dp = _dm.diffusion_process
+                        _sigmas = _dp.sqrt_one_minus_alphas_cumprod.to(data.device)
+                        _t_list = [int(s) for s in str(getattr(args, 'score_diag_t', '10,25,50')).split(',') if s.strip()]
+                        _bb = getattr(model, 'backbone', None)
+                        _prev_bb = _bb.training if _bb is not None else model.training
+                        _prev_dm = _dm.training
+                        (_bb.eval() if _bb is not None else model.eval())  # clean forward: no BN update / no styleshift
+                        _dm.eval()                                          # don't touch normalize queue / denoiser BN
+                        with torch.no_grad():
+                            z_clean = model.intermediate_forward(data)      # clean penultimate (no style shift)
+                            z_style = vec_style_for_reg.detach()            # REAL style-shifted penultimate (reused)
+                            zc_n = _dm.normalize(z_clean)
+                            zs_n = _dm.normalize(z_style)
+                            _disp = zs_n - zc_n
+                            _dispn = _disp.norm(dim=1).mean().item()
+                            _act = 1.0 if style_aug_activated else 0.0
+                            for _t in _t_list:
+                                _t = max(1, min(_t, int(_dp.num_timesteps) - 1))
+                                _sig = float(_sigmas[_t])
+                                _tt = torch.full((z_clean.size(0),), _t, device=data.device, dtype=torch.long)
+                                _sc = -_dm.denoiser(zc_n, _tt) / (_sig + 1e-8)
+                                _ss = -_dm.denoiser(zs_n, _tt) / (_sig + 1e-8)
+                                _nc = _sc.norm(dim=1).mean().item()
+                                _ns = _ss.norm(dim=1).mean().item()
+                                _cv = F.cosine_similarity(_ss, _disp, dim=1, eps=1e-8)
+                                _cos = _cv.mean().item()
+                                _fn = (_cv < 0).float().mean().item()
+                                # console-only (NOT wandb): extra wandb.log calls would bump the
+                                # global step and shift the V1 metrics' x-axis out of alignment with
+                                # the baseline run. Parse [score_diag] from the log for Phase 0 analysis.
+                                print(f"[score_diag] epoch={epoch_i_1based} domain={domain} t={_t} "
+                                      f"sigma={_sig:.4f} sty_act={_act:.1f} disp={_dispn:.4f} "
+                                      f"|s_clean|={_nc:.4f} |s_style|={_ns:.4f} ratio={_ns/(_nc+1e-8):.3f} "
+                                      f"cos={_cos:+.4f} frac_cos_neg={_fn:.3f}", flush=True)
+                        # ---- ratio_aug: z_aug->clean DIRECT-OBJECTIVE measure (Phase 1.5) ----
+                        # ratio_aug = KSD(z_aug;q) / KSD(z_clean;q) under the frozen witness at the
+                        # SAME t the coupling optimizes (ksd_score_timestep). ->1 = z_aug as in-dist as
+                        # clean (objective met); >>1 = not pulled. The ratio cancels the diffusion-maturity
+                        # confound within a run; decisive read = KSD-on vs ratio=0 control trajectory.
+                        # compute_KSD uses autograd.grad (Term2/3) so this MUST run OUTSIDE the no_grad
+                        # block above with grad-enabled inputs (flag_retain/create=False => value-only).
+                        if int(getattr(args, 'score_diag_ksd', 1)) == 1:
+                            try:
+                                from dood.ksd import (
+                                    compute_KSD, SE_kernel_multi, trace_SE_kernel_multi, median_heruistic,
+                                )
+                                _tk = max(1, min(int(getattr(args, 'ksd_score_timestep', 25)),
+                                                 int(_dp.num_timesteps) - 1))
+                                _sigk = float(_sigmas[_tk])
+                                for _pp in _dm.parameters():
+                                    _pp.requires_grad_(False)  # frozen witness: grad to z only, not params
+
+                                def _score_fn_diag(z):
+                                    z_n = _dm.normalize(z)
+                                    _tt = torch.full((z.size(0),), _tk, device=z.device, dtype=torch.long)
+                                    return -_dm.denoiser(z_n, _tt) / (_sigk + 1e-8)
+
+                                _zc_g = z_clean.detach().clone().requires_grad_(True)
+                                _za_g = z_style.detach().clone().requires_grad_(True)
+                                _bwk = median_heruistic(_zc_g.detach(), _zc_g.detach())
+                                _ksd_c = compute_KSD(_zc_g, _zc_g, _score_fn_diag, SE_kernel_multi,
+                                                     trace_SE_kernel_multi, _bwk,
+                                                     flag_U=True, flag_retain=False, flag_create=False)
+                                _ksd_a = compute_KSD(_za_g, _za_g, _score_fn_diag, SE_kernel_multi,
+                                                     trace_SE_kernel_multi, _bwk,
+                                                     flag_U=True, flag_retain=False, flag_create=False)
+                                _kc = float(_ksd_c.item()); _ka = float(_ksd_a.item())
+                                print(f"[score_diag_ksd] epoch={epoch_i_1based} domain={domain} t={_tk} "
+                                      f"ratio_aug={_ka/(_kc+1e-12):.4f} ksd_clean={_kc:.4f} "
+                                      f"ksd_aug={_ka:.4f} bw={float(_bwk):.3f}", flush=True)
+                            except Exception as _e2:
+                                print(f"[score_diag_ksd][WARN] failed: {_e2}", flush=True)
+                            finally:
+                                for _pp in _dm.parameters():
+                                    _pp.requires_grad_(True)
+                        _dm.train(_prev_dm)
+                        (_bb.train(_prev_bb) if _bb is not None else model.train(_prev_bb))
+                    except Exception as _e:
+                        print(f"[score_diag][WARN] failed: {_e}", flush=True)
+
+                loss_cls = criterion(output, target)   # Path S (channel-stat aug) loss
                 loss = loss_cls
-                if hard_adv_clean_loss_weight > 0.0:
+                if use_fourier_aug:
+                    # Option B: equal-weight Path S + Path F, single backward.
+                    fourier_loss_s_meters[domain].update(float(loss_cls.item()), data.size(0))
+                    # Gradient-conflict probe (do BEFORE finalizing/backward so we can
+                    # autograd.grad each weighted path loss on the shared backbone).
+                    # cos(g_S, g_F) < 0 => the two paths fight on the backbone (the −acc could
+                    # be gradient cancellation, not "fourier useless"). reuses compute_grad_conflict.
+                    if bool(getattr(args, 'fourier_grad_diag', False)) and (
+                        int(getattr(args, 'fourier_grad_diag_every', 50)) > 0
+                        and (k % int(getattr(args, 'fourier_grad_diag_every', 50)) == 0)
+                    ):
+                        from dood.score_reg_diagnostics import compute_grad_conflict
+                        _bb_params = [p for p in model.parameters() if p.requires_grad]
+                        try:
+                            _gc = compute_grad_conflict(
+                                loss_cls=0.5 * loss_cls,          # Path S contribution
+                                loss_reg_weighted=0.5 * loss_clean_ce,  # Path F contribution
+                                params=_bb_params,
+                            )
+                            fourier_g_s_norm_meters[domain].update(_gc['g_cls_norm'], 1)
+                            fourier_g_f_norm_meters[domain].update(_gc['g_reg_norm'], 1)
+                            fourier_g_cos_meters[domain].update(_gc['g_cos'], 1)
+                        except Exception as _e:
+                            print(f"[fourier][diag][WARN] grad_conflict failed: {_e}", flush=True)
+                    loss = 0.5 * loss_cls + 0.5 * loss_clean_ce
+                elif hard_adv_clean_loss_weight > 0.0:
                     loss = loss + hard_adv_clean_loss_weight * loss_clean_ce
 
-                # ===== V2-B-1: score-norm regularizer (after lambda_eff > 0) =====
-                if use_score_reg and vec_style_for_reg is not None:
-                    lambda_eff = _compute_lambda_eff(epoch_i_1based)
-                    if lambda_eff > 0.0 and domain in diffusion_models_dict:
-                        diffusion_model = diffusion_models_dict[domain]
-                        prev_diff_training = diffusion_model.training
-                        diffusion_model.eval()  # freeze normalize queue + denoiser BN
-                        for _p in diffusion_model.parameters():
-                            _p.requires_grad_(False)  # score = pure measurement tool
-                        try:
-                            vec_norm_for_reg = diffusion_model.normalize(vec_style_for_reg)
-                            loss_reg = diffusion_model.get_loss_at_timestep(vec_norm_for_reg, reg_t_probe)
-                        finally:
-                            for _p in diffusion_model.parameters():
-                                _p.requires_grad_(True)
-                            diffusion_model.train(prev_diff_training)
+                # ===== KSD generalization coupling (replaces V2-B-1 score-norm reg) =====
+                # KSD pulls z_aug (= grad-enabled style-shifted penultimate) toward the clean-source
+                # density; diffusion is a FROZEN witness (grad flows THROUGH the denoiser to z_aug, not
+                # to its params). Gradient balancing sets lambda so ||lam*g_ksd|| = ratio*||g_cls||.
+                if (use_ksd_reg and ksd_grad_ratio > 0.0
+                        and vec_style_for_reg is not None and domain in diffusion_models_dict):
+                    from dood.ksd import (
+                        compute_KSD, SE_kernel_multi, trace_SE_kernel_multi, median_heruistic,
+                    )
+                    from dood.score_reg_diagnostics import compute_grad_conflict
+                    diffusion_model = diffusion_models_dict[domain]
+                    z_aug = vec_style_for_reg  # do NOT detach: KSD gradient must reach the backbone
+                    prev_diff_training = diffusion_model.training
+                    diffusion_model.eval()  # freeze normalize queue + denoiser BN (witness only)
+                    for _p in diffusion_model.parameters():
+                        _p.requires_grad_(False)  # frozen witness: grad flows through to z_aug, not params
+                    try:
+                        _dp = diffusion_model.diffusion_process
+                        _t = max(1, min(int(ksd_score_t), int(_dp.num_timesteps) - 1))
+                        _sig_t = float(_dp.sqrt_one_minus_alphas_cumprod[_t])
 
-                        # Optional gradient-conflict diagnostic (R8) — must run BEFORE
-                        # the main loss is finalized so we can autograd.grad(loss_cls,...)
-                        # and autograd.grad(lambda_eff*loss_reg,...) independently on the same graph.
-                        if bool(getattr(args, 'enable_score_reg_diag', False)) and (
-                            int(getattr(args, 'score_reg_diag_every', 50)) > 0
-                            and (k % int(getattr(args, 'score_reg_diag_every', 50)) == 0)
-                        ):
-                            from dood.score_reg_diagnostics import compute_grad_conflict
-                            backbone_params = [p for p in model.parameters() if p.requires_grad]
-                            try:
-                                diag_stats = compute_grad_conflict(
-                                    loss_cls=loss_cls,
-                                    loss_reg_weighted=lambda_eff * loss_reg,
-                                    params=backbone_params,
-                                )
-                                score_reg_g_cls_norm_meters[domain].update(diag_stats['g_cls_norm'], 1)
-                                score_reg_g_reg_norm_meters[domain].update(diag_stats['g_reg_norm'], 1)
-                                score_reg_g_cos_meters[domain].update(diag_stats['g_cos'], 1)
-                            except Exception as _e:
-                                # Don't crash training because of diagnostic failure.
-                                print(f"[V2-B-1][diag][WARN] grad_conflict failed: {_e}", flush=True)
+                        def _score_fn(z):
+                            # grad-enabled witness direction field: score = -eps_pred / sigma at low t
+                            z_n = diffusion_model.normalize(z)
+                            _tt = torch.full((z.size(0),), _t, device=z.device, dtype=torch.long)
+                            return -diffusion_model.denoiser(z_n, _tt) / (_sig_t + 1e-8)
 
-                        loss = loss + lambda_eff * loss_reg
-
-                        loss_reg_val = float(loss_reg.item())
-                        loss_reg_meters[domain].update(loss_reg_val, data.size(0))
-                        lambda_eff_meters[domain].update(lambda_eff, data.size(0))
-                        ratio_denom = float(loss.item()) if float(loss.item()) > 0 else 1e-12
-                        loss_reg_ratio_meters[domain].update(
-                            (lambda_eff * loss_reg_val) / ratio_denom, data.size(0)
+                        bw = median_heruistic(z_aug.detach(), z_aug.detach())
+                        loss_ksd = compute_KSD(
+                            z_aug, z_aug, _score_fn, SE_kernel_multi, trace_SE_kernel_multi, bw,
+                            flag_U=True, flag_retain=True, flag_create=True,  # MUST be True (grad to backbone)
                         )
+
+                        # ---- Gradient balancing (key lever, every ksd_balance_every steps) ----
+                        if (k % ksd_balance_every == 0) and ksd_grad_ratio > 0.0:
+                            backbone_params = [p for p in model.parameters() if p.requires_grad]
+                            gc = compute_grad_conflict(
+                                loss_cls=loss_cls,
+                                loss_reg_weighted=loss_ksd,  # raw g_ksd at lambda=1
+                                params=backbone_params,
+                            )
+                            g_cls_n, g_ksd_n = gc['g_cls_norm'], gc['g_reg_norm']
+                            ksd_lambda_held[domain] = float(ksd_grad_ratio * g_cls_n / (g_ksd_n + 1e-12))
+                            ksd_g_cls_norm_meters[domain].update(g_cls_n, 1)
+                            ksd_g_ksd_norm_meters[domain].update(g_ksd_n, 1)
+                            ksd_g_cos_meters[domain].update(gc['g_cos'], 1)
+                            ksd_achieved_ratio_meters[domain].update(
+                                (ksd_lambda_held[domain] * g_ksd_n) / (g_cls_n + 1e-12), 1)
+
+                        lam_eff = ksd_lambda_held[domain]
+                        if lam_eff > 0.0:
+                            loss = loss + lam_eff * loss_ksd
+
+                        loss_ksd_meters[domain].update(float(loss_ksd.item()), data.size(0))
+                        ksd_lambda_meters[domain].update(lam_eff, data.size(0))
+                        ksd_bw_meters[domain].update(
+                            float(bw.item()) if torch.is_tensor(bw) else float(bw), data.size(0))
+                    except Exception as _e:
+                        print(f"[KSD][WARN] coupling failed: {_e}", flush=True)
+                    finally:
+                        for _p in diffusion_model.parameters():
+                            _p.requires_grad_(True)
+                        diffusion_model.train(prev_diff_training)
 
                 with torch.no_grad():
                     probs_clean = F.softmax(logits_clean, dim=1)
@@ -1227,22 +1426,18 @@ def run(num_domains):
             avg_test_acc_val = avg_test_acc.item() if hasattr(avg_test_acc, 'item') else float(avg_test_acc)
             print(f"Epoch {epoch}: avg_loss={avg_train_loss_val:.3f}, avg_train_acc={avg_train_acc_val:.2f}%, avg_test_acc={avg_test_acc_val:.2f}%")
 
-            # ===== V2-B-1: epoch summary for score-norm regularizer =====
-            if use_score_reg:
-                _loss_reg_avg = sum(float(loss_reg_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
-                _lambda_eff_avg = sum(float(lambda_eff_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
-                _reg_ratio_avg = sum(float(loss_reg_ratio_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+            # ===== KSD coupling: epoch summary (做動健康監控) =====
+            if use_ksd_reg:
+                _avg = lambda m: sum(float(m[d].avg) for d in domain_names) / max(1, len(domain_names))
                 _style_rate_avg = sum(float(style_aug_flag_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
-                _v2b1_msg = (
-                    f"  [V2-B-1] loss_reg={_loss_reg_avg:.4f}  lambda_eff={_lambda_eff_avg:.4f}  "
-                    f"r(reg/total)={_reg_ratio_avg*100:.1f}%  style_aug_rate={_style_rate_avg*100:.1f}%"
+                _ksd_msg = (
+                    f"  [KSD] loss_ksd={_avg(loss_ksd_meters):.4f}  lambda={_avg(ksd_lambda_meters):.4g}  "
+                    f"bw={_avg(ksd_bw_meters):.4g}  achieved_ratio={_avg(ksd_achieved_ratio_meters):.3f}  "
+                    f"style_aug_rate={_style_rate_avg*100:.1f}%"
+                    f"  | grad_cos(cls,ksd)={_avg(ksd_g_cos_meters):+.3f}  "
+                    f"||g_cls||={_avg(ksd_g_cls_norm_meters):.3f}  ||g_ksd_raw||={_avg(ksd_g_ksd_norm_meters):.4g}"
                 )
-                if bool(getattr(args, 'enable_score_reg_diag', False)):
-                    _gcos_avg = sum(float(score_reg_g_cos_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
-                    _gcls_avg = sum(float(score_reg_g_cls_norm_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
-                    _greg_avg = sum(float(score_reg_g_reg_norm_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
-                    _v2b1_msg += f"  | grad_cos(cls,reg)={_gcos_avg:+.3f}  ||g_cls||={_gcls_avg:.3f}  ||g_reg||={_greg_avg:.3f}"
-                print(_v2b1_msg, flush=True)
+                print(_ksd_msg, flush=True)
 
             # ===== 聚合診斷 D2/D3（epoch 級）=====
             if diag is not None:
@@ -1259,6 +1454,15 @@ def run(num_domains):
                     f"ce_cos={float(clean_style_ce_cos_meters[_d].avg):.4f} "
                     f"sym_kl={float(clean_style_sym_kl_meters[_d].avg):.6f}"
                 )
+            if getattr(args, 'fourier_grad_diag', False):
+                for _d in domain_names:
+                    print(
+                        f"[fourier_grad] epoch={epoch} domain={_d} "
+                        f"grad_cos_SF={float(fourier_g_cos_meters[_d].avg):+.4f} "
+                        f"g_S_norm={float(fourier_g_s_norm_meters[_d].avg):.4f} "
+                        f"g_F_norm={float(fourier_g_f_norm_meters[_d].avg):.4f} "
+                        f"acc_F={float(fourier_acc_f_dict[_d].avg):.2f}"
+                    )
             if getattr(args, "use_hard_style_adv", False):
                 for _d in domain_names:
                     print(
@@ -1307,6 +1511,16 @@ def run(num_domains):
                 # Hard-style-adv metrics (only meaningful when --use_hard_style_adv)
                 log_dict[f"{domain}/task_loss"] = float(task_loss_meters[domain].avg)
                 log_dict[f"{domain}/clean_ce"] = float(clean_ce_meters[domain].avg)
+                if use_fourier_aug:
+                    # Path F / Path S separation (R1b). clean_ce == loss_F; train_acc == Path S acc.
+                    _acc_f = fourier_acc_f_dict[domain].avg
+                    log_dict[f"{domain}/fourier_acc_F"] = _acc_f.item() if hasattr(_acc_f, 'item') else float(_acc_f)
+                    log_dict[f"{domain}/fourier_loss_S"] = float(fourier_loss_s_meters[domain].avg)
+                    log_dict[f"{domain}/fourier_loss_F"] = float(clean_ce_meters[domain].avg)
+                    if getattr(args, 'fourier_grad_diag', False):
+                        log_dict[f"{domain}/fourier_grad_cos_SF"] = float(fourier_g_cos_meters[domain].avg)
+                        log_dict[f"{domain}/fourier_g_S_norm"] = float(fourier_g_s_norm_meters[domain].avg)
+                        log_dict[f"{domain}/fourier_g_F_norm"] = float(fourier_g_f_norm_meters[domain].avg)
                 log_dict[f"{domain}/style_ce"] = float(style_ce_meters[domain].avg)
                 log_dict[f"{domain}/hard_ce"] = float(hard_ce_meters[domain].avg)
                 log_dict[f"{domain}/hard_ce_delta"] = float(hard_ce_delta_meters[domain].avg)
@@ -1336,16 +1550,16 @@ def run(num_domains):
                         log_dict[f"{domain}/grad_mu_cls_abs_per_channel_hist"] = wandb.Histogram(_v)
                 log_dict[f"{domain}/vec_hard_vs_style_delta"] = float(vec_hard_vs_style_delta_meters[domain].avg)
 
-                # V2-B-1: score-norm regularizer metrics (only meaningful when --use_score_reg)
-                if use_score_reg:
-                    log_dict[f"{domain}/loss_reg"] = float(loss_reg_meters[domain].avg)
-                    log_dict[f"{domain}/lambda_eff"] = float(lambda_eff_meters[domain].avg)
-                    log_dict[f"{domain}/loss_reg_ratio"] = float(loss_reg_ratio_meters[domain].avg)
+                # KSD coupling metrics (做動健康監控; only meaningful when --use_ksd_reg)
+                if use_ksd_reg:
+                    log_dict[f"{domain}/loss_ksd"] = float(loss_ksd_meters[domain].avg)
+                    log_dict[f"{domain}/ksd_lambda"] = float(ksd_lambda_meters[domain].avg)
+                    log_dict[f"{domain}/ksd_bw"] = float(ksd_bw_meters[domain].avg)
+                    log_dict[f"{domain}/ksd_achieved_ratio"] = float(ksd_achieved_ratio_meters[domain].avg)
                     log_dict[f"{domain}/style_aug_activated_rate"] = float(style_aug_flag_meters[domain].avg)
-                    if bool(getattr(args, 'enable_score_reg_diag', False)):
-                        log_dict[f"{domain}/score_reg_g_cls_norm"] = float(score_reg_g_cls_norm_meters[domain].avg)
-                        log_dict[f"{domain}/score_reg_g_reg_norm"] = float(score_reg_g_reg_norm_meters[domain].avg)
-                        log_dict[f"{domain}/score_reg_g_cos"] = float(score_reg_g_cos_meters[domain].avg)
+                    log_dict[f"{domain}/ksd_g_cls_norm"] = float(ksd_g_cls_norm_meters[domain].avg)
+                    log_dict[f"{domain}/ksd_g_ksd_norm"] = float(ksd_g_ksd_norm_meters[domain].avg)
+                    log_dict[f"{domain}/ksd_g_cos"] = float(ksd_g_cos_meters[domain].avg)
 
             log_grad_parts_every_ep = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
             do_log_grad_parts_ep = bool(getattr(args, "hard_adv_log_grad_parts", False)) and (
@@ -1462,6 +1676,11 @@ def run(num_domains):
             for domain in domain_names:
                 losses_dict[domain].reset()
                 top1_dict[domain].reset()
+                fourier_acc_f_dict[domain].reset()
+                fourier_loss_s_meters[domain].reset()
+                fourier_g_cos_meters[domain].reset()
+                fourier_g_s_norm_meters[domain].reset()
+                fourier_g_f_norm_meters[domain].reset()
                 style_aug_flag_meters[domain].reset()
                 task_loss_meters[domain].reset()
                 clean_ce_meters[domain].reset()
@@ -1494,13 +1713,14 @@ def run(num_domains):
                     vec_hard_vs_clean_l4_delta_meters[domain].reset()
                 if loss_diff_meters is not None:
                     loss_diff_meters[domain].reset()
-                # V2-B-1 meters
-                loss_reg_meters[domain].reset()
-                lambda_eff_meters[domain].reset()
-                loss_reg_ratio_meters[domain].reset()
-                score_reg_g_cls_norm_meters[domain].reset()
-                score_reg_g_reg_norm_meters[domain].reset()
-                score_reg_g_cos_meters[domain].reset()
+                # KSD coupling meters
+                loss_ksd_meters[domain].reset()
+                ksd_lambda_meters[domain].reset()
+                ksd_bw_meters[domain].reset()
+                ksd_g_cls_norm_meters[domain].reset()
+                ksd_g_ksd_norm_meters[domain].reset()
+                ksd_g_cos_meters[domain].reset()
+                ksd_achieved_ratio_meters[domain].reset()
             tic = time.time()
 
     # ===== Save final models (backbone + diffusion + normalization stats) =====
@@ -1603,6 +1823,57 @@ if __name__ == "__main__":
     parser.add_argument('--diag_probe_bs', type=int, default=64,
                         help='batch size of the fixed ID probe images cached for D2/D3/D4')
 
+    # ===== Fourier amplitude augmentation (Option B, Path F) =====
+    parser.add_argument('--use_fourier_aug', action='store_true',
+                        help='enable image-level Fourier amplitude augmentation (within-node partner). '
+                             'Adds Path F (fourier aug, channel-stat OFF) alongside Path S; loss = 0.5*S + 0.5*F')
+    parser.add_argument('--fourier_alpha', type=float, default=1.0,
+                        help='lambda ~ U(0, alpha) amplitude mixing range (FOOGD default 1.0)')
+    parser.add_argument('--fourier_ratio', type=float, default=1.0,
+                        help='fraction of centered low-freq band to mix (1.0 = full spectrum)')
+    parser.add_argument('--fourier_workers', type=int, default=6,
+                        help='DataLoader workers for the Fourier-aug train loader (CPU FFT parallelism). '
+                             '0 = main process (slow). Deterministic via fourier_worker_init_fn.')
+    parser.add_argument('--train_workers', type=int, default=0,
+                        help='DataLoader workers for the NON-fourier train loader. Default 0 = main '
+                             'process (baseline behavior). arm5a (pure-ERM control) sets this = '
+                             'fourier_workers so it nw-matches arm5b and arm5b-arm5a isolates fourier '
+                             '(not the nw=6-vs-0 dataloader confound).')
+    parser.add_argument('--fourier_train_bn', action='store_true',
+                        help='arm1: let Path F (fourier) forward update BN running stats (train-BN) '
+                             'instead of the default eval-BN. Tests if eval-BN handicapped fourier '
+                             '(FOOGD fourier view uses train-BN). Only effective with --use_fourier_aug.')
+    parser.add_argument('--fourier_concat_forward', action='store_true',
+                        help='arm5c (FOOGD-exact): single forward over cat([clean, fourier]) + single '
+                             'CE, so BN sees the mixed clean+fourier batch statistics (matches FOOGD '
+                             'client_fedavg data=cat([x_ori,x_s2o])+CE). Replaces arm5b two separate '
+                             'forwards (0.5*CE_clean+0.5*CE_fourier, separate BN). The only difference '
+                             'vs arm5b is the forward/BN structure (loss math is equivalent). '
+                             'Only with --use_fourier_aug; ignores --fourier_train_bn (implicit train-BN).')
+    parser.add_argument('--fourier_grad_diag', action='store_true',
+                        help='probe backbone gradient conflict cos(grad_PathS, grad_PathF) + norms '
+                             'every --fourier_grad_diag_every steps (cos<0 => paths fight).')
+    parser.add_argument('--fourier_grad_diag_every', type=int, default=50,
+                        help='step interval for the Fourier gradient-conflict probe (default 50).')
+
+    # ===== KSD Phase 0: passive diffusion-score direction diagnostic (no loss applied) =====
+    parser.add_argument('--score_diag', action='store_true',
+                        help='Phase 0: passively log the diffusion score direction on clean vs '
+                             'style-shifted features — ||score(z_clean)|| vs ||score(z_style)|| and '
+                             'cos(score(z_style), z_style - z_clean). Tests if the score is a usable '
+                             'KSD witness (points style-shifted feats back to clean density). '
+                             'Computes & logs ONLY, applies NO loss / no backward. Requires --use_ood.')
+    parser.add_argument('--score_diag_every', type=int, default=50,
+                        help='step interval for the --score_diag probe (default 50).')
+    parser.add_argument('--score_diag_t', type=str, default='10,25,50',
+                        help='comma-separated low diffusion timesteps to evaluate score at '
+                             '(sweep to find sigma~0.1; sigma printed per t).')
+    parser.add_argument('--score_diag_ksd', type=int, default=1,
+                        help='Phase 1.5: also log ratio_aug = KSD(z_aug;q)/KSD(z_clean;q) at the KSD '
+                             'witness t (ksd_score_timestep) inside the --score_diag probe — the DIRECT '
+                             'objective (did style-shifted z_aug get pulled to clean density). 1=on '
+                             '(default, follows --score_diag), 0=off (skip the extra compute_KSD cost).')
+
     # ===== Style statistics / StyleDDG-related options =====
     parser.add_argument('--use_style_stats', action='store_true',
                         help='compute style statistics from first three conv blocks in a single forward pass')
@@ -1686,28 +1957,20 @@ if __name__ == "__main__":
     parser.add_argument('--lambda_diff', type=float, default=1.0,
                         help='Weight for diffusion loss (default: 1.0)')
 
-    # ===== V2-B-1: score-norm regularizer on vec_style (opens backbone gradient path) =====
-    parser.add_argument('--use_score_reg', action='store_true',
-                        help='V2-B-1: add score-norm regularizer on vec_style (pooled 512-d after style aug). '
-                             'Forces forward_to_layer3_style + forward_from_layer3 two-step forward so '
-                             'logits and vec_style share the same z_style graph. Requires --use_ood and resnet_type=standard.')
-    parser.add_argument('--lambda_reg', type=float, default=0.05,
-                        help='V2-B-1: target weight for score-norm regularizer (default 0.05, FOOGD-SAG default).')
-    parser.add_argument('--reg_warmup_epoch', type=int, default=30,
-                        help='V2-B-1: epochs to wait before activating score-norm regularizer (default 30, '
-                             'aligns with V1 stage1 D2 stabilization point).')
-    parser.add_argument('--reg_t_probe', type=int, default=-1,
-                        help='V2-B-1: fixed diffusion timestep for score-norm regularizer (-1 => diffusion_steps//2).')
-    parser.add_argument('--reg_lambda_schedule', type=str, default='linear', choices=['off', 'linear'],
-                        help='V2-B-1: lambda schedule after warmup. linear=ramp 0->lambda_reg over 10 epochs; '
-                             'off=step-on at warmup end (default linear).')
-    parser.add_argument('--reg_lambda_ramp_epochs', type=int, default=10,
-                        help='V2-B-1: number of epochs to ramp lambda from 0 to lambda_reg after warmup (default 10).')
-    parser.add_argument('--enable_score_reg_diag', action='store_true',
-                        help='V2-B-1: enable backbone gradient-conflict diagnostic (cls vs reg cos & norms). '
-                             'Adds extra autograd.grad calls; only runs every --score_reg_diag_every steps.')
-    parser.add_argument('--score_reg_diag_every', type=int, default=50,
-                        help='V2-B-1: run gradient-conflict diagnostic every N optimizer steps (default 50).')
+    # ===== KSD generalization coupling (Phase 1; replaces V2-B-1 score-norm reg) =====
+    parser.add_argument('--use_ksd_reg', action='store_true',
+                        help='KSD coupling: pull z_aug (style-shifted penultimate) toward clean-source density '
+                             'via KSD with the FROZEN diffusion as score witness. Forces the '
+                             'forward_to_layer3_style + forward_from_layer3 two-step forward (grad-enabled z_aug). '
+                             'Requires --use_ood and resnet_type=standard.')
+    parser.add_argument('--ksd_grad_ratio', type=float, default=0.1,
+                        help='KSD gradient balancing target: set lambda so ||lam*g_ksd|| = ratio*||g_cls|| '
+                             '(default 0.1). ratio=0 => KSD-off control (same two-step forward, no KSD loss = V1).')
+    parser.add_argument('--ksd_score_timestep', type=int, default=25,
+                        help='Low diffusion timestep for the KSD score witness (default 25, sigma~0.095).')
+    parser.add_argument('--ksd_balance_every', type=int, default=20,
+                        help='Run gradient balancing (measure ||g_ksd||/||g_cls|| to set lambda) every N steps '
+                             '(default 20); lambda is held between measurements.')
 
     args = parser.parse_args()
 

@@ -609,7 +609,11 @@ def load_dataset_single_process(args):
         print('-' * 60)
         
         # Training transforms (same as MPI version)
-        transform_train = transforms.Compose([
+        # Fourier aug (Option B): drop Normalize here so the FourierAugPACSDataset
+        # wrapper can normalize both the raw and the amplitude-augmented image.
+        # Geometric augs are kept identical so Path S matches the baseline.
+        use_fourier_aug = getattr(args, 'use_fourier_aug', False)
+        _train_tf = [
             transforms.Resize((224, 224)),
             transforms.RandomApply([
                 transforms.Compose([
@@ -619,8 +623,12 @@ def load_dataset_single_process(args):
             ], p=0.5),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
+        ]
+        if not use_fourier_aug:
+            _train_tf.append(
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            )
+        transform_train = transforms.Compose(_train_tf)
         
         # Test transforms
         transform_test = transforms.Compose([
@@ -658,11 +666,23 @@ def load_dataset_single_process(args):
                 print(f'[PACS Dataset] Dataset root: {args.datasetRoot}')
                 
                 train_dataset = PACSDataset(
-                    root=args.datasetRoot, 
-                    dataset_name=domain, 
+                    root=args.datasetRoot,
+                    dataset_name=domain,
                     transform=transform_train
                 )
-                
+
+                if use_fourier_aug:
+                    from dood.fourier_aug import FourierAugPACSDataset
+                    train_dataset = FourierAugPACSDataset(
+                        train_dataset,
+                        alpha=getattr(args, 'fourier_alpha', 1.0),
+                        ratio=getattr(args, 'fourier_ratio', 1.0),
+                        seed=args.randomSeed,
+                    )
+                    print(f'[Fourier aug] Domain "{domain}": wrapped train_dataset '
+                          f'(alpha={getattr(args, "fourier_alpha", 1.0)}, '
+                          f'ratio={getattr(args, "fourier_ratio", 1.0)}, seed={args.randomSeed})')
+
                 if getattr(args, "sampler_type", "random") == "random_class":
                     train_sampler = RandomClassSampler(train_dataset, batch_size=args.bs, n_ins=args.n_ins)
                     train_loader = torch.utils.data.DataLoader(
@@ -673,13 +693,39 @@ def load_dataset_single_process(args):
                         pin_memory=True
                     )
                 else:
-                    train_loader = torch.utils.data.DataLoader(
-                        train_dataset,
+                    # Fourier aug does CPU FFT in __getitem__; parallelize with workers
+                    # (deterministic via fourier_worker_init_fn reseeding each worker's RNG).
+                    _loader_kwargs = dict(
                         batch_size=args.bs,
                         shuffle=True,
-                        pin_memory=True
+                        pin_memory=True,
                     )
-                
+                    if use_fourier_aug:
+                        from dood.fourier_aug import fourier_worker_init_fn
+                        _nw = int(getattr(args, 'fourier_workers', 6))
+                        if _nw > 0:
+                            _loader_kwargs.update(
+                                num_workers=_nw,
+                                worker_init_fn=fourier_worker_init_fn,
+                                persistent_workers=True,
+                            )
+                    else:
+                        # arm5a (pure-ERM control): optionally match the fourier path's worker
+                        # count so arm5b-arm5a isolates fourier rather than the nw=6-vs-0
+                        # dataloader confound. Default train_workers=0 preserves baseline behavior.
+                        # fourier_worker_init_fn is a no-op for the plain PACSDataset (it only
+                        # reseeds FourierAugPACSDataset.rng); per-worker transform RNG is
+                        # auto-seeded by PyTorch from the fixed base seed -> reproducible.
+                        _nw = int(getattr(args, 'train_workers', 0))
+                        if _nw > 0:
+                            from dood.fourier_aug import fourier_worker_init_fn
+                            _loader_kwargs.update(
+                                num_workers=_nw,
+                                worker_init_fn=fourier_worker_init_fn,
+                                persistent_workers=True,
+                            )
+                    train_loader = torch.utils.data.DataLoader(train_dataset, **_loader_kwargs)
+
                 print(f'[PACS Dataset] Domain "{domain}": {len(train_dataset)} training samples, {len(train_loader)} batches per epoch')
                 domain_loaders[domain] = (train_loader, test_loader)
 

@@ -260,6 +260,148 @@ def probe_p3(backbone, root, leave_out, device, bs, nw):
     return out
 
 
+# ----------------------------------------------------------------------------- P1b
+# Feature-level style SENSITIVITY (same-image counterfactual). Reuses the exact P3
+# AdaIN restyle, but instead of logit flip we measure how far the PENULTIMATE 512-d
+# vec_style moves under a channel-stat style swap. Goal: disambiguate P1 -- does the
+# 95% domain-separability come from channel-stat STYLE residual, or from CONTENT?
+#   disp_style   = mean 1-cos(vec_clean, vec_restyled)   (same image, only style swapped)
+#   disp_content = mean 1-cos(vec, vec_of_random_same-domain_image)  (calibration scale)
+#   ratio = disp_style / disp_content  (<<1 => style barely moves features => content-driven)
+# src-control (source->another source) must stay small => measurement valid (P3 logic).
+def _restyle_penultimate(b, x, style, apply_layers):
+    h = b.backbone.conv1(x); h = b.backbone.bn1(h); h = b.backbone.relu(h); h = b.backbone.maxpool(h)
+    o1 = b.backbone.layer1(h)
+    if "layer1" in apply_layers:
+        o1 = adain(o1, style["layer1"][0], style["layer1"][1])
+    o2 = b.backbone.layer2(o1)
+    if "layer2" in apply_layers:
+        o2 = adain(o2, style["layer2"][0], style["layer2"][1])
+    o3 = b.backbone.layer3(o2)
+    if "layer3" in apply_layers:
+        o3 = adain(o3, style["layer3"][0], style["layer3"][1])
+    _, vec = b.forward_from_layer3(o3)  # penultimate 512-d vec_style
+    return vec
+
+
+@torch.no_grad()
+def _disp_restyle(b, loader, style, apply_layers, device):
+    # mean (1 - cos) between clean and restyled penultimate vec, same image
+    ds = []
+    for batch in loader:
+        x = batch[0].to(device)
+        vc = _restyle_penultimate(b, x, style, [])
+        vs = _restyle_penultimate(b, x, style, apply_layers)
+        ds.append((1.0 - F.cosine_similarity(vc, vs, dim=1)).cpu())
+    return float(torch.cat(ds).mean())
+
+
+@torch.no_grad()
+def _disp_content(b, loader, device):
+    # calibration: 1-cos between each clean vec and a RANDOM same-domain image's vec.
+    # Random pairing (not adjacent) so a class-sorted dataset doesn't deflate the scale.
+    vecs = []
+    for batch in loader:
+        x = batch[0].to(device)
+        vecs.append(_restyle_penultimate(b, x, None, []).cpu())
+    V = torch.cat(vecs)
+    g = torch.Generator().manual_seed(SEED)
+    perm = torch.randperm(V.size(0), generator=g)
+    return float((1.0 - F.cosine_similarity(V, V[perm], dim=1)).mean())
+
+
+def probe_p1b(backbone, root, leave_out, device, bs, nw):
+    sources = [d for d in PACS if d != leave_out]
+    styles = {d: _domain_style(backbone, CA.make_loader(root, d, bs, nw)[0], device) for d in sources}
+    ablations = {"res1": ["layer1"], "res3": ["layer3"], "res123": P3_LAYERS}
+    out = {}
+
+    # TARGET: style displacement for each ablation, averaged over real source styles
+    for ab, layers in ablations.items():
+        ds = [_disp_restyle(backbone, CA.make_loader(root, leave_out, bs, nw)[0], styles[S], layers, device)
+              for S in sources]
+        out[f"p1b_target_dispstyle_{ab}"] = round(float(np.mean(ds)), 4)
+
+    # CONTENT calibration scale (target domain)
+    out["p1b_target_dispcontent"] = round(
+        _disp_content(backbone, CA.make_loader(root, leave_out, bs, nw)[0], device), 4)
+    out["p1b_target_ratio_res123"] = round(
+        out["p1b_target_dispstyle_res123"] / (out["p1b_target_dispcontent"] + 1e-12), 4)
+
+    # SRC-CONTROL: source content restyled to ANOTHER source style (res123) -> expect small
+    sc = []
+    for s in sources:
+        for S in [o for o in sources if o != s]:
+            sc.append(_disp_restyle(backbone, CA.make_loader(root, s, bs, nw)[0], styles[S], P3_LAYERS, device))
+    out["p1b_srcctrl_dispstyle_res123"] = round(float(np.mean(sc)), 4)
+    return out
+
+
+# ----------------------------------------------------------------------------- P1f
+# domain-probe restyle FLIP test (interventional loophole-closer, replaces P1e).
+# Train a 4-way domain probe on clean features. Then keep CONTENT fixed (same image) and
+# only swap the channel-stat style (AdaIN res123 -> a domain's mean style); feed to the
+# probe and ask whether it re-predicts the injected style's domain. Any prediction change
+# is causally attributable to style (content fixed). ΔP(S)=P(predict S|restyled to S) -
+# P(predict S|clean). ΔP≈0 -> probe ignores style -> separability content-driven -> loophole closed.
+#   Arm A: target content + source style (main). Arm B: target + own style (no-op floor,
+#   subtracts AdaIN-op artifact). Arm C: source + another source style (more on-manifold).
+def probe_p1f(backbone, root, leave_out, device, bs, nw):
+    sources = [d for d in PACS if d != leave_out]
+    dom_index = {d: i for i, d in enumerate(PACS)}
+    styles = {d: _domain_style(backbone, CA.make_loader(root, d, bs, nw)[0], device) for d in PACS}
+
+    # 1) train domain probe on clean features (4 domains), keep scaler (P1 settings)
+    feats, ys = [], []
+    for d in PACS:
+        f, _y = CA.extract_features(backbone, CA.make_loader(root, d, bs, nw)[0], device)
+        feats.append(f.numpy()); ys.append(np.full(len(f), dom_index[d]))
+    X = np.concatenate(feats); y = np.concatenate(ys)
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=SEED, stratify=y)
+    sc = StandardScaler().fit(Xtr)
+    clf = LogisticRegression(max_iter=2000, C=1.0).fit(sc.transform(Xtr), ytr)
+    out = {"p1f_domain_acc": round(float((clf.predict(sc.transform(Xte)) == yte).mean()), 4)}
+
+    def proba(v):  # [N,512] -> [N,4]; columns = classes_ = [0,1,2,3] = PACS order
+        return clf.predict_proba(sc.transform(v))
+
+    @torch.no_grad()
+    def _vecs(dom, style, apply_layers):
+        vs = []
+        for batch in CA.make_loader(root, dom, bs, nw)[0]:
+            x = batch[0].to(device)
+            vs.append(_restyle_penultimate(backbone, x, style, apply_layers).cpu().numpy())
+        return np.concatenate(vs)
+
+    # Arm A: target content + source S style
+    pc_t = proba(_vecs(leave_out, None, []))
+    dP_A, flip_A, base_A = [], [], []
+    for S in sources:
+        ps = proba(_vecs(leave_out, styles[S], P3_LAYERS)); si = dom_index[S]
+        dP_A.append(float(ps[:, si].mean() - pc_t[:, si].mean()))
+        flip_A.append(float((ps.argmax(1) == si).mean()))
+        base_A.append(float(pc_t[:, si].mean()))
+    out["p1f_A_dP_toS"] = round(float(np.mean(dP_A)), 4)
+    out["p1f_A_flip_toS"] = round(float(np.mean(flip_A)), 4)
+    out["p1f_A_baseP_S_clean"] = round(float(np.mean(base_A)), 4)
+
+    # Arm B: no-op floor (target content + target own domain-mean style)
+    argb = proba(_vecs(leave_out, styles[leave_out], P3_LAYERS)).argmax(1)
+    out["p1f_B_floor_flip"] = round(float((pc_t.argmax(1) != argb).mean()), 4)
+
+    # Arm C: source s content + another source S style (on-manifold)
+    dP_C, flip_C = [], []
+    for s in sources:
+        pc_s = proba(_vecs(s, None, []))
+        for S in [o for o in sources if o != s]:
+            ps = proba(_vecs(s, styles[S], P3_LAYERS)); si = dom_index[S]
+            dP_C.append(float(ps[:, si].mean() - pc_s[:, si].mean()))
+            flip_C.append(float((ps.argmax(1) == si).mean()))
+    out["p1f_C_dP_toS"] = round(float(np.mean(dP_C)), 4)
+    out["p1f_C_flip_toS"] = round(float(np.mean(flip_C)), 4)
+    return out
+
+
 # ----------------------------------------------------------------------------- P4
 # Image-amplitude counterfactual (FOOGD-faithful): each target image is paired with a
 # RANDOM REAL source-domain image; we swap amplitude (lambda=1 full) keeping target's
@@ -374,6 +516,8 @@ def main():
     p.add_argument("--checkpoint_dir", required=True)
     p.add_argument("--description", required=True)
     p.add_argument("--lambda_tag", required=True)
+    p.add_argument("--epoch_tag", default="final",
+                   help="'final' (default) or an epoch number e.g. 50/100/150 -> loads {desc}_{node}_epoch_{N}.pth")
     p.add_argument("--probes", default="p1,p2,p3")
     p.add_argument("--output_csv", required=True)
     p.add_argument("--datasetRoot", default="../datasets/")
@@ -387,17 +531,25 @@ def main():
     probes = [s.strip() for s in args.probes.split(",") if s.strip()]
     nodes = [d for d in PACS if d != args.leave_out]
 
+    ckpt_suffix = "final" if args.epoch_tag == "final" else f"epoch_{args.epoch_tag}"
+
     rows = []
     for node in nodes:
-        ckpt = os.path.join(args.checkpoint_dir, f"{args.description}_{node}_final.pth")
+        ckpt = os.path.join(args.checkpoint_dir, f"{args.description}_{node}_{ckpt_suffix}.pth")
         if not os.path.exists(ckpt):
             print(f"[skip] missing {ckpt}")
             continue
-        print(f"\n=== {args.leave_out} lambda={args.lambda_tag} node={node} ===")
+        print(f"\n=== {args.leave_out} lambda={args.lambda_tag} epoch={args.epoch_tag} node={node} ===")
         backbone = load_backbone(ckpt, device)
         metrics = {}
         if "p1" in probes:
             metrics.update(probe_p1(backbone, args.datasetRoot, device, args.batch_size, args.num_workers))
+        if "p1b" in probes:
+            metrics.update(probe_p1b(backbone, args.datasetRoot, args.leave_out, device,
+                                     args.batch_size, args.num_workers))
+        if "p1f" in probes:
+            metrics.update(probe_p1f(backbone, args.datasetRoot, args.leave_out, device,
+                                     args.batch_size, args.num_workers))
         if "p2" in probes:
             metrics.update(probe_p2(backbone, args.datasetRoot, args.leave_out, device,
                                     args.batch_size, args.num_workers, args.p2_cutoff))
@@ -410,7 +562,7 @@ def main():
         for k, v in metrics.items():
             print(f"  {k} = {v}")
             rows.append({"leave_out": args.leave_out, "lambda": args.lambda_tag,
-                         "node": node, "metric": k, "value": v})
+                         "epoch": args.epoch_tag, "node": node, "metric": k, "value": v})
 
     if not rows:
         print("No rows produced.")
@@ -418,7 +570,7 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
     write_header = not os.path.exists(args.output_csv)
     with open(args.output_csv, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["leave_out", "lambda", "node", "metric", "value"])
+        w = csv.DictWriter(f, fieldnames=["leave_out", "lambda", "epoch", "node", "metric", "value"])
         if write_header:
             w.writeheader()
         w.writerows(rows)
