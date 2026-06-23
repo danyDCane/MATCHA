@@ -234,7 +234,10 @@ def run(num_domains):
 
     # select neural network model for each domain
     if args.dataset == 'pacs':
-        num_classes = 7
+        # Open-Set DG: when --exclude_class is set, one PACS class is held out as the
+        # unknown (never trained), so the classifier becomes (7-1)-way. person is the
+        # last ImageFolder index (alphabetical) -> remaining labels 0..5 stay contiguous.
+        num_classes = 7 - (1 if getattr(args, 'exclude_class', None) else 0)
     elif args.dataset == 'vlcs':
         num_classes = 5
     else:
@@ -1798,6 +1801,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', default='cifar10', type=str, help='the dataset')
     parser.add_argument('--datasetRoot', type=str, help='the path of dataset')
     parser.add_argument('--leave_out', type=str, default=None, help='leave out domain for PACS dataset (art_painting, cartoon, photo, sketch)')
+    parser.add_argument('--exclude_class', type=str, default=None, help='Open-Set DG: PACS class name held out as the unknown (never trained), e.g. "person". Filtered from TRAIN sets only; test sets keep all classes for OSCR/H-score eval. Only the last-index class (person) is supported without relabel.')
     parser.add_argument('--p', '-p', action='store_true', help='partition the dataset or not')
     parser.add_argument('--savePath' ,type=str, help='save path')
     parser.add_argument('--save_every_epoch', type=int, default=50,

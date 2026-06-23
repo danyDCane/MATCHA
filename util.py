@@ -671,6 +671,29 @@ def load_dataset_single_process(args):
                     transform=transform_train
                 )
 
+                # Open-Set DG: hold out one class as the unknown (never trained).
+                # Filter from the TRAIN set only; the test_loader (loaded above) keeps
+                # all classes so the eval can split known vs unknown for OSCR/H-score.
+                _excl = getattr(args, 'exclude_class', None)
+                if _excl:
+                    if use_fourier_aug or getattr(args, "sampler_type", "random") == "random_class":
+                        raise NotImplementedError(
+                            '--exclude_class not yet supported together with fourier_aug / random_class sampler '
+                            '(Subset does not expose .targets needed by those paths).')
+                    _cls2idx = train_dataset.dataset.class_to_idx
+                    if _excl not in _cls2idx:
+                        raise ValueError(f'--exclude_class "{_excl}" not in PACS classes {list(_cls2idx)}')
+                    _ex_idx = _cls2idx[_excl]
+                    if _ex_idx != len(_cls2idx) - 1:
+                        raise NotImplementedError(
+                            f'--exclude_class only supports the last-index class (got "{_excl}"=idx {_ex_idx}); '
+                            f'excluding a non-last class needs label remap (not implemented).')
+                    _n_before = len(train_dataset)
+                    _keep = [i for i, t in enumerate(train_dataset.targets) if t != _ex_idx]
+                    train_dataset = torch.utils.data.Subset(train_dataset, _keep)
+                    print(f'[OSDG] Domain "{domain}": excluded class "{_excl}" (idx {_ex_idx}) from TRAIN '
+                          f'-> {len(_keep)}/{_n_before} samples kept')
+
                 if use_fourier_aug:
                     from dood.fourier_aug import FourierAugPACSDataset
                     train_dataset = FourierAugPACSDataset(
@@ -743,6 +766,13 @@ def load_dataset_single_process(args):
             return domain_loaders, node_to_domain
 
         # Case B: virtual-node mode (num_nodes > num_domains)
+        # Open-Set DG: same guards as Case A; the per-node TRAIN filter is applied
+        # below where each node's Subset is built (test sets keep all classes for eval).
+        if getattr(args, 'exclude_class', None):
+            if use_fourier_aug or getattr(args, "sampler_type", "random") == "random_class":
+                raise NotImplementedError(
+                    '--exclude_class not yet supported together with fourier_aug / random_class sampler '
+                    '(Subset does not expose .targets needed by those paths).')
         print(f'[PACS Dataset] Virtual-node mode: num_nodes={num_nodes}, split_mode={split_mode}')
         node_to_domain, domain_to_nodes = assign_nodes_to_domains(available_domains, num_nodes)
         print(f'[PACS Dataset] Node assignment: {node_to_domain}')
@@ -758,6 +788,20 @@ def load_dataset_single_process(args):
                 dataset_name=domain, 
                 transform=transform_train
             )
+
+        # Resolve the held-out (unknown) class index once, with the same last-index-only
+        # guard as Case A (excluding a non-last class would need a label remap).
+        _ex_idx = None
+        _excl = getattr(args, 'exclude_class', None)
+        if _excl:
+            _cls2idx = full_train_datasets[available_domains[0]].dataset.class_to_idx
+            if _excl not in _cls2idx:
+                raise ValueError(f'--exclude_class "{_excl}" not in PACS classes {list(_cls2idx)}')
+            _ex_idx = _cls2idx[_excl]
+            if _ex_idx != len(_cls2idx) - 1:
+                raise NotImplementedError(
+                    f'--exclude_class only supports the last-index class (got "{_excl}"=idx {_ex_idx}); '
+                    f'excluding a non-last class needs label remap (not implemented).')
 
         # Build node-level loaders
         node_loaders = {}
@@ -778,12 +822,20 @@ def load_dataset_single_process(args):
                 print(f'  domain_total_hist: {dict(sorted(domain_hist.items()))}')
 
             for node_name in node_names:
-                subset = Subset(full_train_datasets[domain], node_indices[node_name])
+                _idxs = node_indices[node_name]
+                if _ex_idx is not None:
+                    # Open-Set DG: drop the unknown class from this node's TRAIN split only.
+                    _targets = full_train_datasets[domain].targets
+                    _n_before = len(_idxs)
+                    _idxs = [i for i in _idxs if _targets[i] != _ex_idx]
+                    print(f'[OSDG] {node_name} <- {domain}: excluded class "{_excl}" (idx {_ex_idx}) '
+                          f'from TRAIN -> {len(_idxs)}/{_n_before} samples kept')
+                subset = Subset(full_train_datasets[domain], _idxs)
                 if len(subset) == 0:
                     raise ValueError(f"Empty subset for {node_name} in domain {domain}")
 
                 if getattr(args, "debug_topology", False):
-                    node_hist = _compute_label_histogram_for_indices(full_train_datasets[domain], node_indices[node_name])
+                    node_hist = _compute_label_histogram_for_indices(full_train_datasets[domain], _idxs)
                     has_all_classes = (len(node_hist.keys()) == len(domain_hist.keys()))
                     print(
                         f'  {node_name}: n={len(subset)}, classes={len(node_hist)} '
