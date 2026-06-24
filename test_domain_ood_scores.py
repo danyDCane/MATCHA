@@ -121,6 +121,23 @@ def parse_args():
         default=None,
         help="Root for DTD textures. Can be <datasets>/dtd or <datasets>/dtd/images (default: <datasets>/dtd next to PACS root)",
     )
+    parser.add_argument(
+        '--id_source',
+        type=str,
+        default='train_domain',
+        choices=['train_domain', 'target', 'both'],
+        help=(
+            "Which domain provides the ID set for the external-OOD AUROC: "
+            "'train_domain' (node's own train domain, default/legacy), "
+            "'target' (the leave-out/target domain, e.g. photo), "
+            "or 'both' (compute one AUROC per ID source against the same OOD)."
+        ),
+    )
+    parser.add_argument(
+        '--skip_cross_domain',
+        action='store_true',
+        help='Skip the per-(train_domain x test_domain) PACS scoring sweep (only run external-OOD AUROC).',
+    )
 
     args = parser.parse_args()
     if args.use_noise_ood:
@@ -665,31 +682,9 @@ def evaluate_domain_ood_scores(args):
         checkpoint_domain = checkpoint.get('domain', train_domain)
         print(f'Loaded checkpoint for domain: {checkpoint_domain}')
         
-        # 額外 OOD（noise / SVHN / textures）：ID = 該 train_domain 的 PACS test
+        # 額外 OOD（noise / SVHN / textures）vs ID（train_domain 或 target，由 --id_source 決定）
         if args.external_ood in ('noise', 'svhn', 'textures'):
-            print(
-                f'\n  Evaluating {args.external_ood.upper()} OOD vs ID '
-                f'(train_domain={train_domain})'
-            )
-
-            id_loader, id_num_samples = load_pacs_test_data(
-                args.datasetRoot,
-                train_domain,
-                args.batch_size,
-                args.num_workers
-            )
-            print(f'  Loaded {id_num_samples} ID samples from {train_domain}')
-
-            print('  Computing ID scores...')
-            id_scores = compute_ood_scores(
-                backbone,
-                diffusion_model,
-                id_loader,
-                diffusion_steps,
-                args.ood_eval_scores_type,
-                device
-            )
-
+            # 1) OOD 分數每個 (node, external_ood) 只需算一次，兩種 ID 共用
             if args.external_ood == 'noise':
                 print(f'  Loading {args.noise_samples} noise samples as OOD...')
                 ood_loader = get_noise_loader(
@@ -700,7 +695,7 @@ def evaluate_domain_ood_scores(args):
                 )
                 ood_name = 'noise'
                 ood_num_samples = args.noise_samples
-                ood_label, id_extra_label = 'Noise_OOD', 'ID_for_noise_ood'
+                ood_label = 'Noise_OOD'
             elif args.external_ood == 'svhn':
                 ood_loader, ood_num_samples = load_svhn_ood_loader(
                     args.datasetRoot,
@@ -709,7 +704,7 @@ def evaluate_domain_ood_scores(args):
                     args.num_workers,
                 )
                 ood_name = 'svhn'
-                ood_label, id_extra_label = 'SVHN_OOD', 'ID_for_svhn_ood'
+                ood_label = 'SVHN_OOD'
             else:
                 ood_loader, ood_num_samples = load_textures_ood_loader(
                     args.datasetRoot,
@@ -718,7 +713,7 @@ def evaluate_domain_ood_scores(args):
                     args.num_workers,
                 )
                 ood_name = 'textures'
-                ood_label, id_extra_label = 'Textures_OOD', 'ID_for_textures_ood'
+                ood_label = 'Textures_OOD'
 
             print(f'  Computing {ood_name} OOD scores...')
             ext_ood_scores = compute_ood_scores(
@@ -729,65 +724,114 @@ def evaluate_domain_ood_scores(args):
                 args.ood_eval_scores_type,
                 device
             )
+            ext_ood_appended = False  # OOD 統計列只存一次（與 id_source 無關）
 
-            print('  Computing metrics...')
-            if np.mean(id_scores) > np.mean(ext_ood_scores):
-                print(
-                    f'  Warning: ID scores are higher than {ood_name} OOD scores. Inverting scores.'
-                )
-                id_scores_for_metric = -id_scores
-                ext_ood_for_metric = -ext_ood_scores
+            # 2) 決定要評估哪些 ID 來源
+            if args.id_source == 'both':
+                id_sources = ['train_domain', 'target']
             else:
-                id_scores_for_metric = id_scores
-                ext_ood_for_metric = ext_ood_scores
+                id_sources = [args.id_source]
 
-            auroc = compute_auroc(id_scores_for_metric, ext_ood_for_metric)
-            fpr95 = compute_fpr_at_tpr(id_scores_for_metric, ext_ood_for_metric, tpr=0.95)
+            for id_src in id_sources:
+                if id_src == 'train_domain':
+                    id_domain = train_domain
+                else:  # target = leave-out 域
+                    id_domain = inferred_leave_out
+                    if not id_domain:
+                        print(
+                            '  Warning: id_source=target 但無法推得 leave_out 域，跳過此 ID 來源'
+                        )
+                        continue
 
-            print(f'\n  {args.external_ood.upper()} OOD Detection Results:')
-            print(
-                f'    ID scores: mean={np.mean(id_scores):.4f}, std={np.std(id_scores):.4f}'
-            )
-            print(
-                f'    OOD scores: mean={np.mean(ext_ood_scores):.4f}, '
-                f'std={np.std(ext_ood_scores):.4f}'
-            )
-            print(f'    AUROC: {auroc:.4f}')
-            print(f'    FPR@95%TPR: {fpr95:.4f}')
+                print(
+                    f'\n  Evaluating {ood_name.upper()} OOD vs ID '
+                    f'(id_source={id_src}, id_domain={id_domain}, node={train_domain})'
+                )
+                id_loader, id_num_samples = load_pacs_test_data(
+                    args.datasetRoot,
+                    id_domain,
+                    args.batch_size,
+                    args.num_workers
+                )
+                print(f'  Loaded {id_num_samples} ID samples from {id_domain}')
 
-            results.append({
-                'train_domain': train_domain,
-                'test_domain': ood_name,
-                'scores': ext_ood_scores,
-                'mean_score': np.mean(ext_ood_scores),
-                'std_score': np.std(ext_ood_scores),
-                'min_score': np.min(ext_ood_scores),
-                'max_score': np.max(ext_ood_scores),
-                'num_samples': ood_num_samples,
-                'score_type': args.ood_eval_scores_type,
-                'is_id': False,
-                'label': ood_label,
-                'auroc': auroc,
-                'fpr95': fpr95
-            })
+                print('  Computing ID scores...')
+                id_scores = compute_ood_scores(
+                    backbone,
+                    diffusion_model,
+                    id_loader,
+                    diffusion_steps,
+                    args.ood_eval_scores_type,
+                    device
+                )
 
-            results.append({
-                'train_domain': train_domain,
-                'test_domain': train_domain,
-                'scores': id_scores,
-                'mean_score': np.mean(id_scores),
-                'std_score': np.std(id_scores),
-                'min_score': np.min(id_scores),
-                'max_score': np.max(id_scores),
-                'num_samples': id_num_samples,
-                'score_type': args.ood_eval_scores_type,
-                'is_id': True,
-                'label': id_extra_label,
-                'auroc': auroc,
-                'fpr95': fpr95
-            })
-        
+                print('  Computing metrics...')
+                if np.mean(id_scores) > np.mean(ext_ood_scores):
+                    print(
+                        f'  Warning: ID scores are higher than {ood_name} OOD scores. Inverting scores.'
+                    )
+                    id_scores_for_metric = -id_scores
+                    ext_ood_for_metric = -ext_ood_scores
+                else:
+                    id_scores_for_metric = id_scores
+                    ext_ood_for_metric = ext_ood_scores
+
+                auroc = compute_auroc(id_scores_for_metric, ext_ood_for_metric)
+                fpr95 = compute_fpr_at_tpr(id_scores_for_metric, ext_ood_for_metric, tpr=0.95)
+
+                print(f'\n  {ood_name.upper()} OOD Detection Results (ID={id_src}:{id_domain}):')
+                print(
+                    f'    ID scores: mean={np.mean(id_scores):.4f}, std={np.std(id_scores):.4f}'
+                )
+                print(
+                    f'    OOD scores: mean={np.mean(ext_ood_scores):.4f}, '
+                    f'std={np.std(ext_ood_scores):.4f}'
+                )
+                print(f'    AUROC: {auroc:.4f}')
+                print(f'    FPR@95%TPR: {fpr95:.4f}')
+
+                if not ext_ood_appended:
+                    results.append({
+                        'train_domain': train_domain,
+                        'test_domain': ood_name,
+                        'id_source': '-',
+                        'id_domain': '-',
+                        'scores': ext_ood_scores,
+                        'mean_score': np.mean(ext_ood_scores),
+                        'std_score': np.std(ext_ood_scores),
+                        'min_score': np.min(ext_ood_scores),
+                        'max_score': np.max(ext_ood_scores),
+                        'num_samples': ood_num_samples,
+                        'score_type': args.ood_eval_scores_type,
+                        'is_id': False,
+                        'label': ood_label,
+                        'auroc': None,
+                        'fpr95': None
+                    })
+                    ext_ood_appended = True
+
+                results.append({
+                    'train_domain': train_domain,
+                    'test_domain': id_domain,
+                    'id_source': id_src,
+                    'id_domain': id_domain,
+                    'scores': id_scores,
+                    'mean_score': np.mean(id_scores),
+                    'std_score': np.std(id_scores),
+                    'min_score': np.min(id_scores),
+                    'max_score': np.max(id_scores),
+                    'num_samples': id_num_samples,
+                    'score_type': args.ood_eval_scores_type,
+                    'is_id': True,
+                    'label': f'ID_{id_src}_vs_{ood_name}',
+                    'auroc': auroc,
+                    'fpr95': fpr95
+                })
+
         # 对每个test_domain进行测试
+        if args.skip_cross_domain:
+            print('\n  [skip_cross_domain] 跳過 PACS 跨域掃描')
+            continue
         for test_domain in test_domains:
             print(f'\n  Test Domain: {test_domain}')
             
@@ -851,6 +895,8 @@ def evaluate_domain_ood_scores(args):
         csv_dict = {
             'train_domain': r['train_domain'],
             'test_domain': r['test_domain'],
+            'id_source': r.get('id_source', '-'),
+            'id_domain': r.get('id_domain', '-'),
             'mean_score': r['mean_score'],
             'std_score': r['std_score'],
             'min_score': r['min_score'],
@@ -872,7 +918,8 @@ def evaluate_domain_ood_scores(args):
         results_for_csv.append(csv_dict)
     
     df = pd.DataFrame(results_for_csv)
-    csv_path = os.path.join(args.output_dir, f'domain_ood_scores_{args.ood_eval_scores_type}.csv')
+    ext_tag = f'_{args.external_ood}' if args.external_ood != 'none' else ''
+    csv_path = os.path.join(args.output_dir, f'domain_ood_scores_{args.ood_eval_scores_type}{ext_tag}.csv')
     df.to_csv(csv_path, index=False)
     print(f'\n{"="*80}')
     print(f'Results saved to: {csv_path}')
