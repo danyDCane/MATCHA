@@ -27,7 +27,8 @@ from style_stats import (
     compute_multi_layer_style_stats,
     flatten_style_stats,
 )
-cudnn.benchmark = True
+cudnn.benchmark = False
+cudnn.deterministic = True
 
 import util
 from graph_manager import FixedProcessor, MatchaProcessor
