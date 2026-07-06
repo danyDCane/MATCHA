@@ -112,13 +112,20 @@ def main():
     p.add_argument("--id_domain", default="target", choices=["target", "train"],
                    help="'target'=unseen/leave_out domain as ID (deployment-honest); "
                         "'train'=node's own training domain as ID (old separate-eval setup)")
+    p.add_argument("--num_nodes", type=int, default=0,
+                   help="0=centralized (one model per source domain, domain-named ckpt); "
+                        ">0=P2P virtual-node (nodes=node_0..node_{N-1}, ckpt {desc}_node_{i}). "
+                        "Mirrors osdg_eval.py. id_domain=target uses leave_out as ID (P2P-safe).")
     args = p.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
     diff_steps = list(range(args.num_eval_steps))
     pis = [float(x) for x in args.pi_s.split(",") if x.strip()]
     ood_srcs = [x.strip() for x in args.ood_sources.split(",") if x.strip()]
-    nodes = [d for d in PACS if d != args.leave_out]
+    if args.num_nodes and args.num_nodes > 0:
+        nodes = [f"node_{i}" for i in range(args.num_nodes)]   # P2P virtual nodes
+    else:
+        nodes = [d for d in PACS if d != args.leave_out]       # centralized: per source domain
     rng = np.random.default_rng(args.seed)
     root = args.datasetRoot
 
