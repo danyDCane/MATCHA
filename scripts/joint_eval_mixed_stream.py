@@ -48,24 +48,67 @@ def load_backbone_diffusion(ckpt_path, device):
 
 
 @torch.no_grad()
-def score_and_predict(backbone, diffusion, loader, diff_steps, score_type, device):
-    """Returns per-sample: diffusion score, MSP, energy-confidence(logsumexp), pred, label."""
-    d_sc, msp, en, preds, labels = [], [], [], [], []
+def score_and_predict(backbone, diffusion, loader, diff_steps, score_type, device,
+                      return_proto=False, return_proto_full=False):
+    """Returns per-sample: diffusion score, MSP, energy-confidence(logsumexp), pred, label.
+
+    return_proto=True 時**額外**回傳第 6 個元素：原型角距離 S(x)=min_c arccos(z·c_c)
+    （階段 1 的檢測讀出，0803 §2.2）。預設 False ⇒ 既有 7 個呼叫點的回傳數量完全不變。
+
+    return_proto_full=True 時再**額外**回傳一個 [N, C] 的**完整角距離矩陣**（到每個類別中心）。
+    ⚠️ 為什麼需要完整矩陣：檢測分數取的是 `min_c`，它分不出「特徵散開」與「特徵跑到別的
+       類別去」。一個 cartoon 的狗若被推到馬的群附近，`min_c` 量到的是「到馬中心」的距離
+       （看起來很近、很正常），只有「到**狗**中心」的距離才會揭露它跑掉了。
+       兩者相減＝該樣本坐得對不對（0811 dany）。
+
+    ⚠️ 量到的是 **6 個類別中心**、不是 18 個原型取 min：後者會讓坐在三個小群「中間」的
+       covariate-shifted ID 到每個小群都有 r_見過 的距離，而坐在小群上的來源樣本距離≈0
+       ⇒ 分數本身就在製造畫風 AUROC 的落差（0803 §2.2 的框）。
+    """
+    centers = None
+    _need_proto = return_proto or return_proto_full
+    if _need_proto:
+        if not hasattr(backbone, 'prototypes'):
+            raise RuntimeError(
+                "return_proto/return_proto_full=True 但 checkpoint 沒有 prototypes buffer——"
+                "該 run 不是用 --use_proto_reg 訓練的。")
+        from dood.prototype import class_centers
+        centers = class_centers(backbone.prototypes, backbone.proto_count)
+    d_sc, msp, en, preds, labels, proto_sc = [], [], [], [], [], []
+    proto_all = []
     for batch in loader:
         data, y, _ = util.unpack_batch(batch)
         data = data.to(device)
-        latents = backbone.intermediate_forward(data)                 # latent fed to diffusion
-        s, _ = get_diffusion_scores(latents, diffusion, diff_steps, score_type,
-                                    normalize=True, dtype=torch.float32)
+        if diffusion is not None:
+            latents = backbone.intermediate_forward(data)             # latent fed to diffusion
+            s, _ = get_diffusion_scores(latents, diffusion, diff_steps, score_type,
+                                        normalize=True, dtype=torch.float32)
+        else:
+            # 階段 1 起 checkpoint 可能沒有 diffusion（USE_OOD=0）；填 NaN，呼叫端須忽略該欄
+            s = torch.full((data.size(0),), float('nan'))
         z3 = backbone.forward_to_layer3_style(data, communicator=None)  # clean forward
-        logits, _ = backbone.forward_from_layer3(z3)
+        logits, vec = backbone.forward_from_layer3(z3)
         d_sc.append(np.asarray(s.detach().cpu()).flatten())
         msp.append(F.softmax(logits, 1).max(1).values.cpu().numpy())
         en.append(torch.logsumexp(logits, 1).cpu().numpy())            # higher = more ID
         preds.append(logits.argmax(1).cpu().numpy())
         labels.append(np.asarray(y).flatten() if y is not None else np.full(len(data), -1))
-    return (np.concatenate(d_sc), np.concatenate(msp), np.concatenate(en),
-            np.concatenate(preds), np.concatenate(labels))
+        if _need_proto:
+            # 與 dood.prototype.detection_score 同一條式子（含相同 clamp），確保
+            # `ang.min(1)` 與 detection_score 的輸出逐位一致。
+            _cos = (backbone.project(vec) @ centers.t()).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+            _ang = torch.arccos(_cos)                                   # [B, C]
+            if return_proto:
+                proto_sc.append(_ang.min(dim=1).values.cpu().numpy())
+            if return_proto_full:
+                proto_all.append(_ang.cpu().numpy())
+    out = (np.concatenate(d_sc), np.concatenate(msp), np.concatenate(en),
+           np.concatenate(preds), np.concatenate(labels))
+    if return_proto:
+        out = out + (np.concatenate(proto_sc),)
+    if return_proto_full:
+        out = out + (np.concatenate(proto_all, axis=0),)
+    return out
 
 
 def risk_coverage(conf, err):

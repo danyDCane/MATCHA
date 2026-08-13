@@ -203,7 +203,14 @@ def run(num_domains):
     elif args.graphid == 6:
         # RGG: use virtual node count in single-process mode
         rgg_nodes = args.num_nodes if args.num_nodes is not None else num_domains
-        subGraphs = util.select_graph(6, num_nodes=rgg_nodes, radius=0.8, seed=args.randomSeed)
+        _topo_seed = args.topo_seed if args.topo_seed is not None else args.randomSeed
+        subGraphs = util.select_graph(6, num_nodes=rgg_nodes, radius=args.rgg_radius, seed=_topo_seed, topology=args.topology)
+        try:
+            _n_edges = sum(len(m) for m in subGraphs)  # subGraphs = list of matchings(邊列表)
+        except Exception:
+            _n_edges = 'n/a'
+        print(f"[TOPO] graphid6 RGG seed={_topo_seed} (topo_seed={args.topo_seed}, randomSeed={args.randomSeed}) "
+              f"edges={_n_edges}", flush=True)
     else:
         subGraphs = util.select_graph(args.graphid)
     
@@ -444,9 +451,112 @@ def run(num_domains):
             flush=True,
         )
 
+    # ===== Stage 1: prototype detection readout (0803 §2.2/§2.6; 0810 implementation plan) =====
+    use_proto_reg = bool(getattr(args, 'use_proto_reg', False))
+    proto_m = float(getattr(args, 'proto_m', 0.95))
+    proto_temp = float(getattr(args, 'proto_temp', 0.1))
+    proto_warmup_epochs = int(getattr(args, 'proto_warmup_epochs', 10))
+    proto_balance_every = max(1, int(getattr(args, 'proto_balance_every', 20)))
+    proto_rel_margin = float(getattr(args, 'proto_rel_margin', 0.0))
+    # target ratios: ||lam*g_term|| = ratio * ||g_cls||. All-zero => lambda=0 BASELINE arm.
+    proto_ratios = {
+        'comp':  float(getattr(args, 'proto_comp_ratio', 0.1)),
+        'style': float(getattr(args, 'proto_style_ratio', 0.0)),
+        'disp':  float(getattr(args, 'proto_disp_ratio', 0.1)),
+        'rel':   float(getattr(args, 'proto_rel_ratio', 0.0)),
+    }
+    # lambda held between balance measurements (same pattern as KSD).
+    proto_lambda_held = {d: {k: 0.0 for k in proto_ratios} for d in domain_names}
+
+    proto_loss_meters = {k: {d: util.AverageMeter() for d in domain_names} for k in proto_ratios}
+    proto_lambda_meters = {k: {d: util.AverageMeter() for d in domain_names} for k in proto_ratios}
+    proto_gnorm_meters = {k: {d: util.AverageMeter() for d in domain_names} for k in proto_ratios}
+    proto_gcos_meters = {k: {d: util.AverageMeter() for d in domain_names} for k in proto_ratios}
+    proto_gcls_norm_meters = {d: util.AverageMeter() for d in domain_names}
+    # ★ 觀察量①（0803 §4.1）：**同一樣本**乾淨 vs 風格擾動後的特徵夾角 —— 擾動把特徵推多遠，
+    #   同時是 L_rel 的 margin 取值依據。concat 不需要，兩次前向本來就同時有兩者。
+    proto_zangle_meters = {d: util.AverageMeter() for d in domain_names}
+    # ★ 健康檢查：原型 vs fc 權重向量的夾角 —— 高度對齊 ⇒ 投影層沒學到與分類器不同的東西。
+    proto_vs_fc_meters = {d: util.AverageMeter() for d in domain_names}
+
+    if use_proto_reg:
+        if args.model != 'res':
+            raise RuntimeError("--use_proto_reg currently supports only --model res.")
+        if getattr(args, 'resnet_type', 'simplified') != 'standard':
+            raise RuntimeError(
+                "--use_proto_reg requires --resnet_type standard "
+                "(needs forward_to_layer3_style/forward_from_layer3/project).")
+        if use_ksd_reg:
+            raise RuntimeError("--use_proto_reg is mutually exclusive with --use_ksd_reg "
+                               "(both claim the two-step style forward; keep a clean single-variable arm).")
+        if proto_ratios['style'] != 0.0:
+            # 每節點單域 ⇒ 類別中心 ≡ 該畫風原型 ⇒ L_style 與 L_comp 是同一個量（0803 §2.6.5）
+            print("[proto][WARN] proto_style_ratio != 0 but stage 1 has one domain per node: "
+                  "L_style is the SAME quantity as L_comp and will double-count. Set it to 0 "
+                  "unless prototypes are already aggregated (stage 2b).", flush=True)
+        from dood.prototype import init_prototype_buffers
+        _pdim = (512 if bool(getattr(args, 'proto_no_projection', False))
+                 else int(getattr(args, 'proj_dim', 128)))
+        # ⚠️ 原型的第二軸是「來源畫風」不是「節點」——`domain_names` 在 9 節點設定下是
+        #    ['node_0'..'node_8']（節點），真正的來源畫風要查 node_to_domain（3 個）。
+        #    初版誤用 len(domain_names) ⇒ buffer 變成 [7,9,128]、cells_filled 7/63，
+        #    由 smoke test 抓到。
+        proto_domain_list = sorted(set(node_to_domain.values())) if node_to_domain \
+            else sorted(domain_names)
+        proto_dom_index = {d: i for i, d in enumerate(proto_domain_list)}
+        for _d in domain_names:
+            init_prototype_buffers(models_dict[_d], num_classes, len(proto_domain_list), _pdim,
+                                   device=next(models_dict[_d].parameters()).device)
+        _armtag = ("lambda=0 BASELINE" if all(v == 0.0 for v in proto_ratios.values())
+                   else ("1c (no projection)" if getattr(args, 'proto_no_projection', False)
+                         else ("1b (+L_rel)" if proto_ratios['rel'] > 0 else "1a")))
+        print(f"[proto] stage-1 prototype readout enabled — arm {_armtag}. "
+              f"buffers=[{num_classes},{len(proto_domain_list)},{_pdim}] "
+              f"(第二軸＝來源畫風 {proto_domain_list}，不是節點) "
+              f"proto_m={proto_m} tau={proto_temp} "
+              f"warmup={proto_warmup_epochs}ep ratios={proto_ratios} rel_margin={proto_rel_margin}. "
+              f"Forward count = 2 (perturbed + clean, BOTH grad-enabled since 0812: "
+              f"L_disp acts on the stored prototypes via the clean-feature EMA chain).", flush=True)
+
     tic = time.time()
 
     use_fourier_aug = getattr(args, 'use_fourier_aug', False)
+
+    # ===== Async event-triggered setup (Stage 1; replaces synchronous Phase-3) =====
+    async_enabled = getattr(args, 'async_trigger', False)
+    async_diag_f = None
+    async_diag_writer = None
+    async_recv = {}   # per-sweep: domain -> list of staleness ages (from R step)
+    async_gamma_mode = getattr(args, 'trigger_gamma_mode', 'lr')
+    async_style_enabled = getattr(args, 'async_style', False)
+    if async_style_enabled and not async_enabled:
+        raise RuntimeError("--async_style requires --async_trigger (style rides on the model-broadcast event).")
+    _init_lr = args.lr
+    if async_enabled:
+        import os as _os, csv as _csv
+        communicator.async_configure(threshold=args.trigger_threshold,
+                                     max_interval=args.trigger_max_interval,
+                                     buffer_max=getattr(args, 'async_buffer_max', None),
+                                     async_style=async_style_enabled,
+                                     aggregate_bn=getattr(args, 'aggregate_bn', False))
+        communicator.async_init_snapshot(models_dict)
+        _diag_dir = _os.path.join(args.savePath, 'async_diag')
+        _os.makedirs(_diag_dir, exist_ok=True)
+        async_diag_f = open(_os.path.join(_diag_dir, 'broadcast_log.csv'), 'w', newline='')
+        async_diag_writer = _csv.writer(async_diag_f)
+        async_diag_writer.writerow(['step', 'epoch', 'domain', 'delta', 'thresh', 'gamma', 'fired', 'forced',
+                                    'n_pushed', 'n_received', 'mean_staleness', 'n_style_nb', 'mean_style_age',
+                                    'mean_style_dist'])
+        _stage = "Stage2: model+style async" if async_style_enabled else "Stage1: model-only, style stays sync"
+        print(f"[ASYNC] event-trigger enabled: tau={args.trigger_threshold}, gamma_mode={async_gamma_mode}, "
+              f"max_interval={args.trigger_max_interval} ({_stage})", flush=True)
+        # Consensus-deviation trajectory (取代 async 下被 skip 的 sync D1)：每 epoch 一列
+        async_consensus_f = open(_os.path.join(_diag_dir, 'consensus.csv'), 'w', newline='')
+        async_consensus_writer = _csv.writer(async_consensus_f)
+        async_consensus_writer.writerow(['epoch', 'consensus_rms', 'max_node_dev'])
+    else:
+        async_consensus_f = None
+        async_consensus_writer = None
 
     # ===== start training with fixed total steps K (Algorithm 1) =====
     for k in range(K):
@@ -455,6 +565,11 @@ def run(num_domains):
             model.train()
 
         start_time = time.time()
+
+        # Async delay-1：每個 k 開始把『上一輪』push 的風格 swap 進 active inbox（消同輪偷看；
+        # 本輪稍後 async C push 的風格進 pending、下一輪才可見＝staleness≥1）。只在 async_style 分支。
+        if async_enabled:
+            communicator.swap_style_buffers()
 
         # ========== 第一阶段：计算所有 domain 的风格统计量（不训练）==========
         style_vecs_dict = {}
@@ -510,9 +625,15 @@ def run(num_domains):
         
         # ========== 通信交换风格统计量 ==========
         # Exchange style statistics only (no model parameters) with neighbors
-        if style_vecs_dict:
-            d_comm_time = communicator.communicate(models_dict, style_vecs_dict=style_vecs_dict)
-            comm_time += d_comm_time
+        if style_vecs_dict and not getattr(args, 'isolated_nodes', False):
+            if async_style_enabled:
+                # Stage 2：風格不同步交換（跳過同步 barrier）。自風格改由 C 步 push 時直接夾帶
+                # style_vecs_dict[domain]（不另存 communicator 狀態）；鄰居風格由持久 style_inbox 提供
+                # （set_active_domain 即時建視圖）；空 buffer → StyleShift skip(R1)。
+                pass
+            else:
+                d_comm_time = communicator.communicate(models_dict, style_vecs_dict=style_vecs_dict)
+                comm_time += d_comm_time
 
         # ========== 第二阶段：正式训练所有 domain（使用交换到的风格统计量）==========
         use_style_stats = getattr(args, "use_style_stats", False)
@@ -524,7 +645,10 @@ def run(num_domains):
             model = models_dict[domain]
             optimizer = optimizers_dict[domain]
             criterion = nn.CrossEntropyLoss().cuda()
-            
+
+            # ===== Async R (RECEIVE) 已移到「訓練 + push 之後」（切斷同輪訓練接力；見 0717 報告 §4）=====
+            # 本輪訓練改用「上一輪融合後」的起點，不站前面節點本輪剛訓練的肩膀上 → 消除收斂假快。
+
             # ====== Restore BatchNorm state for this domain ======
             # This ensures each domain maintains independent BatchNorm statistics,
             # matching multi-process behavior where each rank has separate BatchNorm states.
@@ -535,7 +659,14 @@ def run(num_domains):
                         module.running_var.copy_(bn_states_dict[domain][name]['running_var'])
                         if bn_states_dict[domain][name]['num_batches_tracked'] is not None:
                             module.num_batches_tracked.copy_(bn_states_dict[domain][name]['num_batches_tracked'])
-            
+
+            # ⚠️ 原型「不」走 bn_states_dict 那套 save/restore（0810 plan §2.2e 原本規劃要加，
+            #    實作時查證後撤回）：`models_dict[domain]` 是**每個域各自的 model 物件**
+            #    （:262-283 逐一 select_model），原型 buffer 天生就是 per-node、沒有東西會覆蓋它。
+            #    反而**加了才危險**——BN 那套的 restore 會用 dict 快照覆蓋模型現值，正是 0730
+            #    「聚合後不寫回就靜默失效」的來源。階段 2 的原型聚合直接寫進 models_dict[domain]，
+            #    不經過 dict 中轉 ⇒ 沒有這個坑。
+
             # Reuse phase-1 batch when style stats are enabled; otherwise fetch normally.
             if domain in batch_cache:
                 if use_fourier_aug:
@@ -1025,7 +1156,7 @@ def run(num_domains):
                 # produced by the two-step forward; otherwise None. Triggered by KSD coupling OR the
                 # passive --score_diag probe (both consume the same z_aug).
                 vec_style_for_reg = None
-                if use_ksd_reg or bool(getattr(args, 'score_diag', False)):
+                if use_ksd_reg or use_proto_reg or bool(getattr(args, 'score_diag', False)):
                     # Two-step forward so logits and vec_style_for_reg share the SAME z_style graph.
                     # Avoids re-running style aug (which is stochastic) for the KSD / probe input.
                     communicator.set_active_domain(domain)
@@ -1239,6 +1370,163 @@ def run(num_domains):
                             _p.requires_grad_(True)
                         diffusion_model.train(prev_diff_training)
 
+                # ===== Stage 1: prototype detection readout (0803 §2.2/§2.6; 0810 plan §2.2) =====
+                # 參照物要乾淨、被拉的要是擾動的：原型的 EMA 只吃「未擾動」特徵（否則 (類別,畫風)
+                # 語意會被鄰居畫風污染、兩層結構與跨節點聚合全都失效）；三個損失拉的是「擾動後」
+                # 特徵（否則從未訓練過「畫風變了要回到原位」，而 target 域正是一種沒見過的擾動）。
+                if use_proto_reg and vec_style_for_reg is not None:
+                    from dood.prototype import (
+                        class_centers, comp_loss, style_loss,
+                        disp_loss, rel_loss, detection_score, ema_prototypes_live,
+                    )
+                    # ⚠️ 這是「來源畫風」的索引、不是節點索引（domain_names 是 node_0..node_8）
+                    _dom_idx = proto_dom_index[node_to_domain.get(domain, domain)]
+                    z_aug = model.project(vec_style_for_reg)          # 擾動後、grad-enabled
+
+                    # --- 乾淨前向（★ 2026-08-12 起帶梯度）---------------------------------
+                    # ⚠️ 走「同一個」forward_to_layer3_style 但傳 communicator=None：同一段程式碼、
+                    #    同一組 BN 模組、同一個 train 模式，只差風格模組沒觸發。
+                    # ⚠️⚠️ 不可改用 model.eval()（見 :672-683 的舊做法）——eval 會讓 BN 改用 running
+                    #    統計量，乾淨與擾動特徵就落在兩個不同的正規化座標系，等於在兩個座標系之間
+                    #    拉扯。這與 0805 探針抓到的病同類（denoiser 已共識、正規化座標系未共識，
+                    #    分歧差 5e6 倍）。正解是「維持 train()、暫時凍結 BN 的 momentum」。
+                    # ⚠️ 因守衛 `use_style_shift and communicator is not None` 不成立，這次前向
+                    #    完全不呼叫 random.random()、不跑任何風格模組 ⇒ 零亂數消耗
+                    #    ⇒ λ=0 控制組與其他臂的亂數流逐位相同（0810 plan §1）。
+                    # ★ 為什麼拿掉 no_grad（0812）：L_disp 必須直接作用在「存檔原型」上。原本的
+                    #   影子原型只讓梯度從 z_aug 批平均流 ⇒ 推的不是存檔原型、通道還窄 8 倍。
+                    #   代價＝乾淨前向要建計算圖（記憶體增加；bs=64 的 ResNet18 可承受）。
+                    _bn_mom = {}
+                    for _n, _m_ in model.named_modules():
+                        if isinstance(_m_, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                            _bn_mom[_n] = _m_.momentum
+                            _m_.momentum = 0.0
+                    try:
+                        _z3_clean = model.forward_to_layer3_style(
+                            data, communicator=None, debug_style_shift=False,
+                            iter_num=k + 1, rank=domain_names.index(domain),
+                        )
+                        _, _vec_clean = model.forward_from_layer3(_z3_clean)
+                        z_clean_p = model.project(_vec_clean)          # ★ 帶計算圖
+                    finally:
+                        for _n, _m_ in model.named_modules():
+                            if _n in _bn_mom:
+                                _m_.momentum = _bn_mom[_n]
+
+                    # --- 原型 EMA（逐樣本，對齊 CIDER losses.py:261-264）--------------------
+                    # ★ 回傳的 _proto_live 與存檔原型**數值完全相同**，只差有沒有帶梯度：
+                    #   存檔用 .detach()（給檢測分數、comp_loss、階段 2 聚合），
+                    #   _proto_live 給 L_disp（梯度沿 EMA 鏈流回 z_clean_p → backbone）。
+                    # ★ λ=0 baseline 也照常累積，確保程式路徑與亂數流與其他臂完全一致。
+                    _proto_live, _count_live = ema_prototypes_live(
+                        model.prototypes, model.proto_count, z_clean_p, target, _dom_idx, proto_m)
+                    with torch.no_grad():
+                        model.prototypes.copy_(_proto_live.detach())
+                        model.proto_count.copy_(_count_live)
+
+                    with torch.no_grad():
+                        # 觀察量①：**同一個樣本**在「乾淨」與「風格擾動後」的特徵夾角
+                        # （不是「同類不同樣本」之間的夾角——量的是擾動把特徵推多遠，
+                        #   這才是 L_rel margin 的取值依據，也才能對照 §3.5 的張力）
+                        _cos = (z_aug.detach() * z_clean_p).sum(dim=1).clamp(-1 + 1e-7, 1 - 1e-7)
+                        proto_zangle_meters[domain].update(
+                            float(torch.arccos(_cos).mean().item()), data.size(0))
+
+                    # --- 三個原型損失 + 相對約束 -------------------------------------------
+                    # warmup：訓練初期特徵近乎隨機 ⇒ 原型也近乎隨機 ⇒ 拉向隨機目標＝注入噪聲。
+                    # 原型在 warmup 期間照常累積，只是不產生損失。
+                    _warm_done = (epoch_i_1based > proto_warmup_epochs)
+                    _centers = class_centers(model.prototypes, model.proto_count)
+                    _terms = {}
+                    if _warm_done:
+                        if proto_ratios['comp'] > 0:
+                            _terms['comp'] = comp_loss(z_aug, target, model.prototypes,
+                                                       model.proto_count, proto_temp)
+                        if proto_ratios['style'] > 0:
+                            _terms['style'] = style_loss(z_aug, target, _centers)
+                        if proto_ratios['disp'] > 0:
+                            # ★ 直接作用在「存檔原型的帶梯度版本」上（_proto_live 與 model.prototypes
+                            #   數值相同、只差有沒有梯度）⇒ 推的就是部署時量到的那組中心。
+                            # ⚠️ 不可改用 _centers（來自 buffer、對參數是常數）⇒ 梯度恆為 0、該項純裝飾
+                            #    ＝V2B1 失效模式（0810 smoke test 實測 ||g_disp||=0、lam=0）。
+                            _terms['disp'] = disp_loss(
+                                class_centers(_proto_live, _count_live), _count_live, proto_temp)
+                        if proto_ratios['rel'] > 0:
+                            _s_aug = detection_score(z_aug, _centers)
+                            # ⚠️⚠️ 必須 detach：z_clean_p 自 0812 起帶梯度，若不切斷，
+                            #    relu(s_aug - s_clean - margin) 可以靠「**把 s_clean 拉高**」降到 0
+                            #    （讓原圖看起來更像 OOD），s_aug 完全不用動 ⇒ 退化解，
+                            #    而且損失曲線照樣在降，是最難察覺的那種失效。
+                            _s_cln = detection_score(z_clean_p.detach(), _centers)
+                            _terms['rel'] = rel_loss(_s_aug, _s_cln, proto_rel_margin)
+
+                    # --- 梯度範數平衡 -------------------------------------------------------
+                    # ⚠️ g_cls 只算一次、各輔助項各算一次（不要對每項都呼叫 compute_grad_conflict
+                    #    那種成對介面、會重複算 g_cls）。
+                    # ⚠️ 每 N 步才量一次，lambda 在量測之間保持不變（階梯式，與 KSD 同樣式）。
+                    # λ=0 臂也量 ||g_cls||（不需平衡，但跨臂要能比梯度尺度）。
+                    # autograd.grad 不消耗亂數 ⇒ 不影響「λ=0 與其他臂亂數流逐位相同」。
+                    #
+                    # ★ 0812 修正：範數只在**兩股梯度共享的參數**上算（backbone，排除 fc 與 proj_head）。
+                    #   CE 走不到 proj_head、原型損失走不到 fc，allow_unused 會把走不到的補零 ⇒ 舊寫法
+                    #   等於「‖g_cls‖ 含 fc」對上「‖g_term‖ 含 proj_head」，兩個範數在不同的參數集合上
+                    #   算，比值被各自獨有的 head 稀釋 ⇒ ratio=0.1 不等於「在共享 backbone 上佔 10%」。
+                    _shared_params = [p for _pn, p in model.named_parameters()
+                                      if p.requires_grad
+                                      and not _pn.startswith('proj_head')
+                                      and not _pn.startswith('backbone.fc')
+                                      and not _pn.startswith('diffusion_model.')]
+
+                    def _gnorm_flat(_loss, _params):
+                        _g = torch.autograd.grad(_loss, _params, retain_graph=True,
+                                                 create_graph=False, allow_unused=True)
+                        return torch.cat([(g.detach().flatten() if g is not None
+                                           else p.new_zeros(p.numel()))
+                                          for g, p in zip(_g, _params)])
+
+                    if (not _terms) and use_proto_reg and (k % proto_balance_every == 0):
+                        try:
+                            proto_gcls_norm_meters[domain].update(
+                                float(_gnorm_flat(loss_cls, _shared_params).norm().item()), 1)
+                        except Exception:
+                            pass
+                    if _terms and (k % proto_balance_every == 0):
+                        try:
+                            _f_cls = _gnorm_flat(loss_cls, _shared_params)
+                            _gcls_n = float(_f_cls.norm().item())
+                            proto_gcls_norm_meters[domain].update(_gcls_n, 1)
+                            for _name, _t in _terms.items():
+                                _f = _gnorm_flat(_t, _shared_params)
+                                _gn = float(_f.norm().item())
+                                proto_gnorm_meters[_name][domain].update(_gn, 1)
+                                proto_lambda_held[domain][_name] = (
+                                    (proto_ratios[_name] * _gcls_n / _gn) if _gn > 1e-12 else 0.0)
+                                # ★ 0812 新增：梯度方向衝突。範數對了但方向相反的話，輔助損失
+                                #   是在抵銷分類（0730 V2B1 只看範數沒看方向的教訓）。
+                                _den = _gcls_n * _gn
+                                proto_gcos_meters[_name][domain].update(
+                                    float((_f_cls @ _f).item() / _den) if _den > 1e-12 else 0.0, 1)
+                        except Exception as _e:
+                            print(f"[proto][WARN] gradient balancing failed: {_e}", flush=True)
+
+                    for _name, _t in _terms.items():
+                        _lam = proto_lambda_held[domain][_name]
+                        loss = loss + _lam * _t
+                        proto_loss_meters[_name][domain].update(float(_t.item()), data.size(0))
+                        proto_lambda_meters[_name][domain].update(_lam, data.size(0))
+
+                    # --- 健康檢查：原型 vs fc 權重向量的夾角 --------------------------------
+                    # 高度對齊 ⇒ 投影層沒學到與分類器不同的東西、檢測模組沒提供額外資訊。
+                    # ⚠️ 僅在無投影層時維度才對得上（1c）；有投影層時 128 vs 512 不可直接比。
+                    if (k % proto_balance_every == 0) and bool(getattr(args, 'proto_no_projection', False)):
+                        with torch.no_grad():
+                            _w = F.normalize(model.backbone.fc.weight, dim=1)      # [C, 512]
+                            _alive = (model.proto_count > 0).any(dim=1)
+                            if _alive.any():
+                                _ang = torch.arccos(
+                                    (_centers[_alive] * _w[_alive]).sum(dim=1).clamp(-1 + 1e-7, 1 - 1e-7))
+                                proto_vs_fc_meters[domain].update(float(_ang.mean().item()), 1)
+
                 with torch.no_grad():
                     probs_clean = F.softmax(logits_clean, dim=1)
                     probs_style = F.softmax(output, dim=1)
@@ -1349,14 +1637,64 @@ def run(num_domains):
                     bn_states_dict[domain][name]['running_var'] = module.running_var.clone()
                     if hasattr(module, 'num_batches_tracked'):
                         bn_states_dict[domain][name]['num_batches_tracked'] = module.num_batches_tracked.clone()
-        
+
+            # ===== Async C (CHECK): event-trigger broadcast after this node finishes training =====
+            if async_enabled:
+                if async_gamma_mode == 'lr':
+                    _cur_lr = optimizers_dict[domain].param_groups[0]['lr']
+                    _gamma = (_cur_lr / _init_lr) if _init_lr > 0 else 1.0
+                else:
+                    _gamma = 1.0
+                fired, delta, forced, _thresh = communicator.should_broadcast(domain, model, k, gamma=_gamma)
+                n_pushed = communicator.push_to_neighbors(
+                    domain, model, k,
+                    style_vec=(style_vecs_dict.get(domain) if async_style_enabled else None)
+                ) if fired else 0
+                # ===== Async R (RECEIVE): 融合移到「訓練 + push 之後」（切斷訓練接力；0717 報告 §4）=====
+                # push 推的是「本輪訓練後、未融合」的自身成果；receive 後模型才含鄰居（下一輪訓練才用 → staleness≥1）。
+                async_recv[domain] = communicator.receive_and_aggregate(domain, model, k)
+                # ⚠️ aggregate_bn：把 receive 融合後的 BN 寫回 bn_states_dict。不做的話，下一輪
+                # Phase-2 的 restore（本檔上方「Restore BatchNorm state for this domain」）會用
+                # 「聚合前」的舊值覆蓋掉，聚合等於沒發生——且不會報錯（靜默失敗）。
+                if getattr(args, 'aggregate_bn', False):
+                    for _bn_name, _bn_mod in model.named_modules():
+                        if isinstance(_bn_mod, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)) \
+                                and _bn_name in bn_states_dict[domain]:
+                            bn_states_dict[domain][_bn_name]['running_mean'] = _bn_mod.running_mean.clone()
+                            bn_states_dict[domain][_bn_name]['running_var'] = _bn_mod.running_var.clone()
+                _ages = async_recv.get(domain, [])
+                _mean_stale = (sum(_ages) / len(_ages)) if _ages else 0.0
+                if async_style_enabled:
+                    _n_style_nb, _mean_style_age = communicator.style_buffer_age(domain, k)
+                    _mean_style_dist = communicator.style_buffer_dist(domain)
+                else:
+                    _n_style_nb, _mean_style_age, _mean_style_dist = 0, 0.0, 0.0
+                async_diag_writer.writerow([k, (k // STEPS_PER_EPOCH) + 1, domain,
+                                            f"{delta:.6e}", f"{_thresh:.6e}", f"{_gamma:.4f}",
+                                            int(bool(fired)), int(bool(forced)),
+                                            n_pushed, len(_ages), f"{_mean_stale:.2f}",
+                                            _n_style_nb, f"{_mean_style_age:.2f}", f"{_mean_style_dist:.4f}"])
+                if (k + 1) % STEPS_PER_EPOCH == 0:
+                    async_diag_f.flush()
+
         # ========== 第三阶段：交换训练后的模型参数 ==========
         # Exchange updated model parameters after training step
         # Note: style_vecs_dict is None here since we only exchange model parameters (not style stats)
-        # 更新診斷 epoch 標記（聚合 hook 會在 communicate 內讀取）
-        communicator.diag_epoch = (k // STEPS_PER_EPOCH) + 1
-        d_comm_time_after = communicator.communicate(models_dict, style_vecs_dict=None)
-        comm_time += d_comm_time_after
+        if async_enabled:
+            # Async mode: model aggregation已由 per-node R/C(inbox)處理；跳過同步 Phase-3。
+            # 仍推進 communicator.iter 以維持風格交換(Phase1)的 active_flags 排程。
+            communicator.iter += 1
+            d_comm_time_after = 0.0  # 佔位（下方 progress print 會引用）；async 無同步聚合通訊時間
+        elif getattr(args, 'isolated_nodes', False):
+            # Isolated ablation: 跳過 Phase-3 模型聚合，各節點獨立訓練（風格交換也已在上方 skip）。
+            # 仍推進 iter 保持 communicator 內部排程一致（風格已停用故不影響行為）。
+            communicator.iter += 1
+            d_comm_time_after = 0.0
+        else:
+            # 更新診斷 epoch 標記（聚合 hook 會在 communicate 內讀取）
+            communicator.diag_epoch = (k // STEPS_PER_EPOCH) + 1
+            d_comm_time_after = communicator.communicate(models_dict, style_vecs_dict=None)
+            comm_time += d_comm_time_after
         
         # 检查通信后的参数一致性（每epoch检查一次，只在不一致时打印）
         if (k + 1) % STEPS_PER_EPOCH == 0:
@@ -1369,6 +1707,28 @@ def run(num_domains):
             param_set = set([round(first_params[d], 4) for d in domain_names])
             if len(param_set) > 1:
                 print(f"⚠ WARNING: Parameters INCONSISTENT after comm iter {k+1}: {param_set}")
+
+            # BN 跨節點分歧診斷（0628 定義 mean‖v−μ‖/‖μ‖；keep-local 於 ep200 為 0.341）。
+            # aggregate_bn 開啟時此值應明顯低於 keep-local；若持平 ⇒ 聚合被 Phase-2 restore
+            # 覆蓋掉（靜默失敗），必須在 dry-run 就抓出來。
+            if getattr(args, 'aggregate_bn', False) or getattr(args, 'bn_div_diag', False):
+                with torch.no_grad():
+                    _vecs = []
+                    for _d in domain_names:
+                        _bd = dict(models_dict[_d].named_buffers())
+                        _vecs.append(torch.cat([_bd[_n].flatten().float() for _n in sorted(_bd)
+                                                if _n.endswith(("running_mean", "running_var"))]))
+                    _V = torch.stack(_vecs, 0)
+                    _mu = _V.mean(0)
+                    _div = (torch.norm(_V - _mu, dim=1).mean() / (torch.norm(_mu) + 1e-12)).item()
+                    print(f"[BN-DIV] epoch={(k+1)//STEPS_PER_EPOCH} cross-node BN divergence={_div:.6f}", flush=True)
+
+            # Async consensus-deviation 診斷（每 epoch）：看 const/高τ 末期是否 drift
+            if async_enabled and async_consensus_writer is not None:
+                _cons_rms, _cons_max = communicator.consensus_deviation(models_dict)
+                async_consensus_writer.writerow([(k // STEPS_PER_EPOCH) + 1,
+                                                 f"{_cons_rms:.6e}", f"{_cons_max:.6e}"])
+                async_consensus_f.flush()
         
         end_time = time.time()
         d_comp_time = (end_time - start_time - (record_end - record_start))
@@ -1378,13 +1738,16 @@ def run(num_domains):
         if (k + 1) % 20 == 0:
             torch.cuda.empty_cache()
 
-        # Print progress (average across domains)
-        avg_loss = sum(losses_dict[d].avg for d in domain_names) / len(domain_names)
-        avg_acc = sum(top1_dict[d].avg for d in domain_names) / len(domain_names)
-        avg_loss_val = avg_loss.item() if hasattr(avg_loss, 'item') else float(avg_loss)
-        avg_acc_val = avg_acc.item() if hasattr(avg_acc, 'item') else float(avg_acc)
-        print("iter: %d/%d, comp_time: %.3f, comm_time: %.3f, total time: %.3f, avg_loss: %.3f, avg_acc: %.3f"
-              % (k+1, K, d_comp_time, d_comm_time_after, comp_time + comm_time, avg_loss_val, avg_acc_val), end='\r')
+        # Print progress (average across domains).
+        # 只在 TTY(互動終端)顯示自我覆蓋(\r)的 per-step 進度條；重導到 log 檔時(isatty=False)不印，
+        # 避免 K 步進度行灌爆 log(每 epoch 的 `Epoch N:` 摘要才是分析主軸)。不動 RNG、不影響決定論。
+        if sys.stdout.isatty():
+            avg_loss = sum(losses_dict[d].avg for d in domain_names) / len(domain_names)
+            avg_acc = sum(top1_dict[d].avg for d in domain_names) / len(domain_names)
+            avg_loss_val = avg_loss.item() if hasattr(avg_loss, 'item') else float(avg_loss)
+            avg_acc_val = avg_acc.item() if hasattr(avg_acc, 'item') else float(avg_acc)
+            print("iter: %d/%d, comp_time: %.3f, comm_time: %.3f, total time: %.3f, avg_loss: %.3f, avg_acc: %.3f"
+                  % (k+1, K, d_comp_time, d_comm_time_after, comp_time + comm_time, avg_loss_val, avg_acc_val), end='\r')
 
         # measure and log after each pseudo-epoch
         if (k + 1) % STEPS_PER_EPOCH == 0:
@@ -1441,6 +1804,35 @@ def run(num_domains):
                     f"||g_cls||={_avg(ksd_g_cls_norm_meters):.3f}  ||g_ksd_raw||={_avg(ksd_g_ksd_norm_meters):.4g}"
                 )
                 print(_ksd_msg, flush=True)
+
+            # ===== 階段 1 原型讀出：epoch 摘要（0810 plan §4.1/§4.3 的觀察量）=====
+            if use_proto_reg:
+                _pavg = lambda m: sum(float(m[d].avg) for d in domain_names) / max(1, len(domain_names))
+                _srate = sum(float(style_aug_flag_meters[d].avg) for d in domain_names) / max(1, len(domain_names))
+                _gcls = _pavg(proto_gcls_norm_meters)
+                # ★ 觀察量②：三項梯度範數「分開」記 —— 不要只記合併值，否則泛化掉時無法歸因
+                #    （只有拉緊項跟 MixStyle 對打；推開項作用在類別中心、與畫風無關）。
+                #    ⚠️ V2B1 教訓：當時 ||g_reg|| 僅 ||g_cls|| 的 0.1%、grad_cos≈0 ⇒ 根本沒動 backbone。
+                _gterms = "  ".join(
+                    f"{n}:L={_pavg(proto_loss_meters[n]):.4f}/lam={_pavg(proto_lambda_meters[n]):.3g}"
+                    f"/||g||={_pavg(proto_gnorm_meters[n]):.4g}"
+                    f"/ratio={(_pavg(proto_lambda_meters[n]) * _pavg(proto_gnorm_meters[n]) / _gcls if _gcls > 1e-12 else 0.0):.3f}"
+                    f"/cos={_pavg(proto_gcos_meters[n]):+.3f}"
+                    for n in ('comp', 'style', 'disp', 'rel') if proto_ratios[n] > 0
+                )
+                _warm = "WARMUP(losses off)" if epoch <= proto_warmup_epochs else "active"
+                _filled = int((models_dict[domain_names[0]].proto_count > 0).sum().item())
+                print(
+                    f"  [proto] {_warm}  ||g_cls||={_gcls:.3f}  style_aug_rate={_srate*100:.1f}%  "
+                    f"cells_filled={_filled}/{models_dict[domain_names[0]].proto_count.numel()}  "
+                    # ★ 觀察量①：同類樣本 z 與 z~ 的夾角 —— 被壓小 ⇒ 拉緊項在抵銷風格增強；
+                    #   同時是 L_rel margin 的取值依據（0803 §4.1-R）。
+                    f"angle(z,z~)={_pavg(proto_zangle_meters):.4f}rad"
+                    + (f"  angle(proto,fc_w)={_pavg(proto_vs_fc_meters):.4f}rad"
+                       if getattr(args, 'proto_no_projection', False) else "")
+                    + (f"\n         {_gterms}" if _gterms else "  [lambda=0 BASELINE: 原型照常累積、無損失]"),
+                    flush=True,
+                )
 
             # ===== 聚合診斷 D2/D3（epoch 級）=====
             if diag is not None:
@@ -1563,6 +1955,18 @@ def run(num_domains):
                     log_dict[f"{domain}/ksd_g_cls_norm"] = float(ksd_g_cls_norm_meters[domain].avg)
                     log_dict[f"{domain}/ksd_g_ksd_norm"] = float(ksd_g_ksd_norm_meters[domain].avg)
                     log_dict[f"{domain}/ksd_g_cos"] = float(ksd_g_cos_meters[domain].avg)
+                if use_proto_reg:
+                    # ★ 三項梯度範數分開記（觀察量②）＋ 夾角軌跡（觀察量①）
+                    for _k in proto_ratios:
+                        log_dict[f"{domain}/proto_loss_{_k}"] = float(proto_loss_meters[_k][domain].avg)
+                        log_dict[f"{domain}/proto_lambda_{_k}"] = float(proto_lambda_meters[_k][domain].avg)
+                        log_dict[f"{domain}/proto_gnorm_{_k}"] = float(proto_gnorm_meters[_k][domain].avg)
+                        log_dict[f"{domain}/proto_gcos_{_k}"] = float(proto_gcos_meters[_k][domain].avg)
+                    log_dict[f"{domain}/proto_g_cls_norm"] = float(proto_gcls_norm_meters[domain].avg)
+                    log_dict[f"{domain}/proto_angle_z_zaug"] = float(proto_zangle_meters[domain].avg)
+                    log_dict[f"{domain}/proto_angle_vs_fc"] = float(proto_vs_fc_meters[domain].avg)
+                    log_dict[f"{domain}/proto_cells_filled"] = int(
+                        (models_dict[domain].proto_count > 0).sum().item())
 
             log_grad_parts_every_ep = int(getattr(args, "hard_adv_log_grad_parts_every", 10))
             do_log_grad_parts_ep = bool(getattr(args, "hard_adv_log_grad_parts", False)) and (
@@ -1724,6 +2128,16 @@ def run(num_domains):
                 ksd_g_ksd_norm_meters[domain].reset()
                 ksd_g_cos_meters[domain].reset()
                 ksd_achieved_ratio_meters[domain].reset()
+                # Stage-1 prototype meters
+                if use_proto_reg:
+                    for _k in proto_ratios:
+                        proto_loss_meters[_k][domain].reset()
+                        proto_lambda_meters[_k][domain].reset()
+                        proto_gnorm_meters[_k][domain].reset()
+                        proto_gcos_meters[_k][domain].reset()
+                    proto_gcls_norm_meters[domain].reset()
+                    proto_zangle_meters[domain].reset()
+                    proto_vs_fc_meters[domain].reset()
             tic = time.time()
 
     # ===== Save final models (backbone + diffusion + normalization stats) =====
@@ -1797,7 +2211,10 @@ if __name__ == "__main__":
     parser.add_argument('--matcha', action='store_true', help='use MATCHA or not')
     parser.add_argument('--budget', type=float, help='comm budget')
     parser.add_argument('--graphid', default=0, type=int, help='the idx of base graph')
-    
+    parser.add_argument('--rgg_radius', default=0.8, type=float, help='RGG connection radius for graphid=6 (default 0.8=dense; lower=sparser, 1-hop may miss domains)')
+    parser.add_argument('--topology', default='rgg', choices=['rgg', 'ring'], help='graphid=6 topology: rgg (random geometric, default) or ring (9-node cycle, degree 2, most-sparse connected)')
+    parser.add_argument('--isolated_nodes', action='store_true', help='ablation: each node trains fully independently. Skips BOTH Phase-1 style exchange and Phase-3 model aggregation, so no neighbor style is received (StyleShift skips on empty buffer) and no model averaging happens. Functionally equals a disconnected topology; topology object stays valid (dense) but its aggregation is never invoked. sync-only.')
+
     parser.add_argument('--dataset', default='cifar10', type=str, help='the dataset')
     parser.add_argument('--datasetRoot', type=str, help='the path of dataset')
     parser.add_argument('--leave_out', type=str, default=None, help='leave out domain for PACS dataset (art_painting, cartoon, photo, sketch)')
@@ -1810,6 +2227,9 @@ if __name__ == "__main__":
     parser.add_argument('--compress', action='store_true', help='use chocoSGD or not')    
     parser.add_argument('--consensus_lr', default=0.1, type=float, help='consensus_lr')
     parser.add_argument('--randomSeed', type=int, help='random seed')
+    parser.add_argument('--topo_seed', type=int, default=None,
+                        help='拓樸生成專用 seed（RGG）；不設則退回用 randomSeed（向後相容）。'
+                             '設此可固定拓樸、只讓 randomSeed 變訓練 RNG（拆 topo/train seed 混淆）。')
     parser.add_argument('--total_iter', type=int, help='total training iterations (if not set, uses epoch * max_steps_per_epoch)')
     parser.add_argument('--wandb_project', default='MATCHA', type=str, help='wandb project name')
 
@@ -1975,6 +2395,79 @@ if __name__ == "__main__":
     parser.add_argument('--ksd_balance_every', type=int, default=20,
                         help='Run gradient balancing (measure ||g_ksd||/||g_cls|| to set lambda) every N steps '
                              '(default 20); lambda is held between measurements.')
+
+    # ===== Stage 1: prototype detection readout (0803 §2.2/§2.6, 0810 plan) =====
+    # Projection head (512->512->128, parallel to fc) + (class, domain) prototype buffers +
+    # angular detection score to the 6 CLASS CENTERS. Forces the same two-step style forward as
+    # KSD (grad-enabled perturbed feature) PLUS a second no-grad CLEAN forward for the prototype
+    # EMA. proto_comp_ratio=0 => prototype-off control (same two forwards, no prototype loss).
+    parser.add_argument('--use_proto_reg', action='store_true',
+                        help='Stage 1: enable projection head + prototype losses + angular readout. '
+                             'Requires resnet_type=standard.')
+    parser.add_argument('--proj_dim', type=int, default=128,
+                        help='Projection head output dim (default 128 = CIDER/PALM source-verified).')
+    parser.add_argument('--proto_no_projection', action='store_true',
+                        help='Arm 1c: skip the projection head, apply prototype losses directly on the '
+                             '512-d penultimate (control for inter-set interference, 0803 §2.3.1).')
+    parser.add_argument('--proto_m', type=float, default=0.95,
+                        help='Prototype EMA memory (CIDER proto_m). NOTE there is no single "CIDER value": '
+                             'CIFAR-100 uses 0.5, CIFAR-10/ImageNet-100 use 0.95. Update is PER-SAMPLE, so the '
+                             'effective window is ~1/(1-m) SAMPLES (~2 batches at 0.95), not batches.')
+    parser.add_argument('--proto_temp', type=float, default=0.1,
+                        help='Temperature for comp/disp losses (CIDER tau=0.1).')
+    parser.add_argument('--proto_comp_ratio', type=float, default=0.1,
+                        help='Gradient balancing target for L_comp: set lambda so ||lam*g_comp||=ratio*||g_cls||. '
+                             'ratio=0 => that term off. Set comp=disp=rel=0 for the lambda=0 BASELINE arm '
+                             '(same two forwards, prototypes still accumulate => identical RNG stream to 1a).')
+    parser.add_argument('--proto_disp_ratio', type=float, default=0.1,
+                        help='Gradient balancing target for L_disp (class centers pushed apart).')
+    parser.add_argument('--proto_style_ratio', type=float, default=0.0,
+                        help='Gradient balancing target for L_style (styles pulled to class center). '
+                             'MUST stay 0 in stage 1: with one domain per node the class center IS that '
+                             'domain prototype, so L_style is the same quantity as L_comp (0803 §2.6.5).')
+    parser.add_argument('--proto_rel_ratio', type=float, default=0.0,
+                        help='Gradient balancing target for L_rel (arm 1b). 0 => arm 1a.')
+    parser.add_argument('--proto_rel_margin', type=float, default=0.0,
+                        help='Margin for L_rel. Start at 0 (pure one-sided suppression). GorD appendix values '
+                             '([0.7,0.5,0.2] / [10,5,5]) are energy-scale and differ 25x => NOT transferable; '
+                             'our score is arccos with range [0, pi].')
+    parser.add_argument('--proto_warmup_epochs', type=int, default=10,
+                        help='Epochs during which prototype losses are disabled (prototypes still accumulate). '
+                             'Early features are near-random, so pulling toward a near-random prototype injects '
+                             'noise; the EMA window is only ~20 samples so this matters more than it looks.')
+    parser.add_argument('--proto_balance_every', type=int, default=20,
+                        help='Run prototype gradient balancing every N steps (default 20); lambdas held between.')
+
+    # ===== Async event-triggered communication (Stage 1 baseline) =====
+    parser.add_argument('--async_trigger', action='store_true',
+                        help='Enable event-triggered ASYNC decentralized training: each node broadcasts its '
+                             'model only when (1/sqrt(n))||w_i - w_hat_i|| >= threshold (PersonalizedET Eq.3); '
+                             'neighbors receive via a dedup buffer and aggregate on their own schedule. '
+                             'Removes the synchronous per-round Phase-3 model aggregation.')
+    parser.add_argument('--trigger_threshold', type=float, default=0.0,
+                        help='Broadcast trigger threshold tau (r*rho*gamma, rho=gamma=1 in Stage 1). '
+                             '0 => always broadcast (~synchronous, sanity control).')
+    parser.add_argument('--trigger_max_interval', type=int, default=50,
+                        help='Bounded-staleness safety valve: force a broadcast if a node has not broadcast for '
+                             'B consecutive sweeps (PersonalizedET B2-connectivity). Guarantees consensus.')
+    parser.add_argument('--async_buffer_max', type=int, default=None,
+                        help='Optional cap on inbox size per node (naturally bounded by #neighbors).')
+    parser.add_argument('--trigger_gamma_mode', type=str, default='lr', choices=['lr', 'const'],
+                        help="Time-varying threshold decay gamma^(k) (PersonalizedET-faithful). "
+                             "'lr' (default): threshold = tau * lr(k)/lr(0), decays with the cosine LR "
+                             "so it stays sensitive as the model converges. 'const': gamma=1 (constant tau).")
+    parser.add_argument('--aggregate_bn', action='store_true',
+                        help='aggregate BN running_mean/var together with model parameters (same MH weights). '
+                             'Default OFF = current SiloBN-style keep-local. Payload +0.086%%. '
+                             'Rationale: research/bn_fusion/0729_bn_consensus_first_principles.md')
+    parser.add_argument('--bn_div_diag', action='store_true',
+                        help='print cross-node BN divergence each epoch (auto-on when --aggregate_bn)')
+    parser.add_argument('--async_style', action='store_true',
+                        help='Stage 2: also event-trigger the style-statistics exchange (Phase 1). Style rides on '
+                             'the SAME model-broadcast event (bundled); neighbors keep a persistent style buffer '
+                             '(keep-latest per sender, NOT consumed) and StyleShift reuses the last-received style '
+                             'until a newer one arrives. No cold-start seed: empty buffer => StyleShift skips (R1). '
+                             'Requires --async_trigger. Removes the synchronous per-sweep style barrier entirely.')
 
     args = parser.parse_args()
 

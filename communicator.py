@@ -1,5 +1,6 @@
 import numpy as np
 import time
+import math
 import torch
 from mpi4py import MPI
 from compressors import get_top_k
@@ -578,7 +579,21 @@ class SingleProcessCommunicator(object):
         
         # Build adjacency list for domains based on topology
         self._build_domain_adjacency()
-    
+
+        # ===== Async event-triggered state (Stage 1；預設關、由 train.py 開) =====
+        self.async_enabled = False
+        self.async_threshold = 0.0
+        self.async_max_interval = 50
+        self.async_buffer_max = None
+        self.last_broadcast_params = {}   # ŵ_i：{domain: {name: tensor}}
+        self.last_broadcast_step = {}     # {domain: int}
+        self.inbox = {}                   # {domain: {sender: {'backbone':{},'diffusion':{}|None,'push_step':int}}}
+        # ===== Stage 2：風格也 event-trigger（預設關；只在 --async_style 開）=====
+        # 風格 buffer 與模型 inbox 分離：持久、keep-latest per sender、不 consume（StyleShift 每 sweep 重複讀）。
+        self.async_style_enabled = False
+        self.style_inbox = {}             # {domain: {sender: {'style_vec':tensor,'push_step':int}}} 持久、覆蓋式
+        # 註：節點自風格不另存 communicator 狀態；C 步 push 時由 train.py 直接傳入 style_vecs_dict[domain]。
+
     def _build_domain_adjacency(self):
         """Build adjacency list for domains based on topology structure."""
         self.domain_adj = {domain: [] for domain in self.domain_to_idx.keys()}
@@ -669,8 +684,26 @@ class SingleProcessCommunicator(object):
         This mimics MPI semantics where each rank only sees its own neighbors.
         """
         self.active_domain = domain_name
-        self.neighbor_style_vecs = dict(self.neighbor_style_vecs_by_domain.get(domain_name, {}))
-        self.neighbor_style_stats = dict(self.neighbor_style_stats_by_domain.get(domain_name, {}))
+        if self.async_style_enabled:
+            # Stage 2：鄰居風格從持久 style_inbox 建（delay-1：只含『上輪已 swap』的 push；本輪 push 在 pending、尚未 swap＝消同輪偷看、staleness≥1）。
+            # 空 buffer → 空 dict → StyleShift 自然 skip（R1、不墊檔）。sorted key 保決定論。
+            box = self.style_inbox.get(domain_name, {})
+            vecs, stats = {}, {}
+            if box and self.channels_per_layer is not None:
+                for sender in sorted(box.keys()):
+                    sv = box[sender]['style_vec']
+                    vecs[sender] = sv
+                    try:
+                        stats[sender] = unflatten_style_stats(
+                            sv, layer_order=["layer1", "layer2", "layer3"],
+                            channels_per_layer=self.channels_per_layer)
+                    except Exception:
+                        pass
+            self.neighbor_style_vecs = vecs
+            self.neighbor_style_stats = stats
+        else:
+            self.neighbor_style_vecs = dict(self.neighbor_style_vecs_by_domain.get(domain_name, {}))
+            self.neighbor_style_stats = dict(self.neighbor_style_stats_by_domain.get(domain_name, {}))
     
     def _aggregate_models(self, models_dict, active_flags):
         """
@@ -859,5 +892,213 @@ class SingleProcessCommunicator(object):
             # Exchange model parameters only
             self.iter += 1
             self._aggregate_models(models_dict, active_flags)
-        
+
         return 0.0  # No communication time for single process
+
+    # ==================================================================
+    # Async event-triggered communication (Stage 1)
+    # PersonalizedET 式(3) 觸發 + PushCen dedup buffer + SPARQ x̂ 語意。
+    # 取代 Phase3 同步 _aggregate_models：train.py 逐節點 R(receive)→T(train)→C(check) 呼叫。
+    # ==================================================================
+    def async_configure(self, threshold=0.0, max_interval=50, buffer_max=None, async_style=False,
+                        aggregate_bn=False):
+        """由 train.py 從 args 注入 async 超參並啟用。
+        async_style=True → Stage 2：風格也綁模型觸發、持久 buffer（見 push_to_neighbors/set_active_domain）。
+        aggregate_bn=True → BN running 統計隨模型一起 push/融合（走同一組 MH 權重，故自動繼承
+        event-trigger 語意）。payload 增量 +0.086%（9,600 個數字 vs backbone 11.18M）。"""
+        self.async_enabled = True
+        self.aggregate_bn = bool(aggregate_bn)
+        self.async_threshold = float(threshold)
+        self.async_max_interval = int(max_interval)
+        self.async_buffer_max = buffer_max
+        self.last_broadcast_step = {d: 0 for d in self.domain_to_idx}
+        self.inbox = {d: {} for d in self.domain_to_idx}
+        self.async_style_enabled = bool(async_style)
+        self.style_inbox = {d: {} for d in self.domain_to_idx}
+        self.style_no_delay = __import__('os').environ.get('STYLE_NO_DELAY', '0') == '1'  # [PROBE對照] 1=退回無delay(postfuse偷看行為)
+        self.style_delay = int(__import__('os').environ.get('STYLE_DELAY', '1'))  # 風格 staleness 深度(step為單位；1 epoch=STEPS_PER_EPOCH steps)；1=原 delay-1
+        from collections import deque as _deque
+        _kd = max(self.style_delay, 1)
+        # 深度 k 管線：push 進 pipeline[0]，每個 k 開始把 pipeline[-1](k 輪前 push)搬進 inbox 後右推一格
+        self.style_pipeline = _deque([{d: {} for d in self.domain_to_idx} for _ in range(_kd)], maxlen=_kd)
+        self.style_latest = {}  # sender -> 最新已 push 的自風格向量（供 style_buffer_dist 量 staleness 造成的風格值偏離）
+
+    def async_init_snapshot(self, models_dict):
+        """ŵ_i = 目前 backbone 參數（訓練開始前呼叫一次，建立觸發比對基準）。"""
+        self.last_broadcast_params = {}
+        for domain, model in models_dict.items():
+            self.last_broadcast_params[domain] = {
+                name: p.data.clone() for name, p in model.named_parameters()
+            }
+
+    def _param_delta(self, domain, model):
+        """(1/sqrt(n))·||w_i − ŵ_i||_2 over BACKBONE params（PersonalizedET 式(3) 左式）。
+        ⚠️ 只算 backbone：diffusion_model 是註冊 submodule 故會出現在 named_parameters()
+        (前綴 'diffusion_model.')，但它每步大幅漂移、不是 DG 決策模型；觸發只看 backbone
+        才乾淨可解釋。push/receive 仍照常廣播/聚合 backbone+diffusion（見那兩個方法）。"""
+        ref = self.last_broadcast_params.get(domain)
+        if ref is None:
+            return float('inf')
+        sq = 0.0
+        n = 0
+        for name, p in model.named_parameters():
+            if name.startswith('diffusion_model.'):
+                continue  # 排除 diffusion；觸發只依 backbone 漂移
+            if name in ref:
+                d = p.data - ref[name]
+                sq += float((d * d).sum().item())
+                n += d.numel()
+        return math.sqrt(sq / max(n, 1))
+
+    def should_broadcast(self, domain, model, step, gamma=1.0):
+        """觸發判斷（PersonalizedET 式3）：delta ≥ τ_base·γ^(k)  OR  安全閥（連續 max_interval 未廣播）。
+        gamma = 時變衰減因子，由 train.py 傳入 lr(k)/lr(0)（對齊 PersonalizedET γ^(k)=step size；
+        訓練後期 lr↓→門檻↓→維持敏感度、避免收斂期低通訊漂散）。gamma=1 即常數門檻。
+        回 (fired, delta, forced, thresh)。"""
+        delta = self._param_delta(domain, model)
+        thresh = self.async_threshold * gamma
+        forced = (step - self.last_broadcast_step.get(domain, 0)) >= self.async_max_interval
+        fired = (delta >= thresh) or forced
+        return fired, delta, forced, thresh
+
+    def push_to_neighbors(self, domain, model, step, style_vec=None):
+        """觸發後把當下 w_i(backbone+diffusion denoiser) 立即寫進每個鄰居 inbox(dedup 覆蓋);更新 ŵ_i。
+        Stage 2(async_style)：同一事件夾帶呼叫端傳入的當下自風格 style_vec(=style_vecs_dict[domain]) →
+        寫進鄰居持久 style_inbox(keep-latest、不 consume)。自風格不另存 communicator 狀態、免造輪子。"""
+        backbone = {name: p.data.clone() for name, p in model.named_parameters()}
+        diffusion = None
+        if hasattr(model, 'diffusion_model') and model.diffusion_model is not None:
+            diffusion = {name: p.data.clone() for name, p in model.diffusion_model.named_parameters()}
+        # aggregate_bn：BN running 統計一併廣播。只送 running_mean/var——num_batches_tracked
+        # 在 eval 模式下不參與正規化，送了只會多一個變因。
+        bn_buf = None
+        if getattr(self, 'aggregate_bn', False):
+            bn_buf = {n: b.data.clone() for n, b in model.named_buffers()
+                      if n.endswith(("running_mean", "running_var"))}
+        msg = {'backbone': backbone, 'diffusion': diffusion, 'bn': bn_buf, 'push_step': step}
+        neighbors = self.domain_adj.get(domain, [])
+        style_msg = None
+        if self.async_style_enabled and style_vec is not None:
+            style_msg = {'style_vec': style_vec.detach().clone(), 'push_step': step}
+            self.style_latest[domain] = style_vec.detach().clone()  # 記自風格最新值（供 style_buffer_dist）
+        for nb in neighbors:
+            self.inbox[nb][domain] = msg  # dedup by sender（保留最新）；#鄰居有界故 inbox 天然 bounded
+            if style_msg is not None:
+                # STYLE_NO_DELAY=1 直接寫 inbox(偷看對照)；否則寫管線頭、經 style_delay 輪 swap 才進 inbox
+                (self.style_inbox[nb] if self.style_no_delay else self.style_pipeline[0][nb])[domain] = style_msg
+        self.last_broadcast_params[domain] = {name: v.clone() for name, v in backbone.items()}
+        self.last_broadcast_step[domain] = step
+        return len(neighbors)  # 推送數（供通訊量診斷）
+
+    def swap_style_buffers(self):
+        """每個 k 開始呼叫：把 style_delay 輪前 push 的風格(管線尾)搬進 active style_inbox。
+        keep-latest 覆蓋（未觸發的 sender 保留 inbox 舊值）；本輪稍後 push 的進管線頭、經 style_delay 輪才可見(staleness=style_delay)。"""
+        if not self.async_style_enabled or self.style_no_delay:
+            return
+        oldest = self.style_pipeline[-1]  # style_delay 輪前 push 的
+        for nb, box in oldest.items():
+            if box:
+                self.style_inbox.setdefault(nb, {}).update(box)
+        self.style_pipeline.appendleft({d: {} for d in self.domain_to_idx})  # 新空格進頭；maxlen 自動擠掉剛讀完的尾格
+
+    def style_buffer_age(self, domain, step):
+        """診斷：該節點目前持有的鄰居風格 buffer 的 (數量, 平均 age=step−push_step)。age-blind 但記 age。"""
+        box = self.style_inbox.get(domain, {})
+        if not box:
+            return 0, 0.0
+        ages = [step - v['push_step'] for v in box.values()]
+        return len(ages), sum(ages) / len(ages)
+
+    def style_buffer_dist(self, domain):
+        """診斷：該節點 inbox 持有的鄰居風格 vs 該 sender『最新已 push 風格』的平均 L2。
+        = staleness 造成的風格值偏離；delay 越大→風格漂移越多→此值越大。
+        防呆：若此值≈0 代表 delay 沒拉開風格差、『DG 沒掉』無檢驗力（非二元斷裂）。"""
+        box = self.style_inbox.get(domain, {})
+        if not box:
+            return 0.0
+        ds = []
+        for sender, msg in box.items():
+            latest = self.style_latest.get(sender)
+            if latest is not None:
+                ds.append(float(torch.norm(msg['style_vec'].to(latest.device) - latest).item()))
+        return (sum(ds) / len(ds)) if ds else 0.0
+
+    def receive_and_aggregate(self, domain, model, step):
+        """inbox 有未消費鄰居模型則 MH(static-degree 權重、只對投遞邊)融合 backbone+diffusion denoiser;
+        清 inbox;回 staleness ages list。無到達回 []。"""
+        box = self.inbox.get(domain, {})
+        if not box:
+            return []
+        senders = sorted(box.keys())  # 決定論
+        deg_i = len(self.domain_adj.get(domain, []))
+        ages = []
+        with torch.no_grad():
+            param_dict = dict(model.named_parameters())
+            orig = {name: p.data.clone() for name, p in param_dict.items()}
+            acc = {name: torch.zeros_like(orig[name]) for name in param_dict}
+            has_diff = hasattr(model, 'diffusion_model') and model.diffusion_model is not None
+            if has_diff:
+                diff_dict = dict(model.diffusion_model.named_parameters())
+                diff_orig = {name: p.data.clone() for name, p in diff_dict.items()}
+                diff_acc = {name: torch.zeros_like(diff_orig[name]) for name in diff_dict}
+            agg_bn = getattr(self, 'aggregate_bn', False)
+            if agg_bn:
+                buf_dict = {n: b for n, b in model.named_buffers()
+                            if n.endswith(("running_mean", "running_var"))}
+                buf_orig = {n: b.data.clone() for n, b in buf_dict.items()}
+                buf_acc = {n: torch.zeros_like(buf_orig[n]) for n in buf_dict}
+            w_sum = 0.0
+            for s in senders:
+                deg_j = len(self.domain_adj.get(s, []))
+                w_ij = 1.0 / (1.0 + max(deg_i, deg_j))  # MH edge weight（static degree）
+                msg = box[s]
+                for name in param_dict:
+                    if name in msg['backbone']:
+                        acc[name] += w_ij * msg['backbone'][name]
+                if has_diff and msg['diffusion'] is not None:
+                    for name in diff_dict:
+                        if name in msg['diffusion']:
+                            diff_acc[name] += w_ij * msg['diffusion'][name]
+                if agg_bn and msg.get('bn'):
+                    for name in buf_dict:
+                        if name in msg['bn']:
+                            buf_acc[name] += w_ij * msg['bn'][name]
+                w_sum += w_ij
+                ages.append(step - msg['push_step'])
+            selfw = 1.0 - w_sum  # MH self weight（deg_i 上限保證 >0）
+            for name, p in param_dict.items():
+                p.data.copy_(selfw * orig[name] + acc[name])
+            if has_diff:
+                for name, p in diff_dict.items():
+                    p.data.copy_(selfw * diff_orig[name] + diff_acc[name])
+            if agg_bn:
+                for name, b in buf_dict.items():
+                    b.data.copy_(selfw * buf_orig[name] + buf_acc[name])
+            box.clear()  # 消費（consume-on-read）
+        return ages
+
+    def consensus_deviation(self, models_dict):
+        """跨節點 backbone 參數的共識偏差診斷（取代 async 下被 skip 的 sync D1）。
+        rms = 所有 backbone 參數對『節點平均』的 RMS per-param 偏差（越小越一致）；
+        max_node = 偏離平均最遠的那個節點的 RMS 偏差。只算 backbone（排除 diffusion）。
+        回 (rms, max_node)。"""
+        with torch.no_grad():
+            domains = sorted(models_dict.keys())
+            N = len(domains)
+            pdicts = {d: {n: p.data for n, p in models_dict[d].named_parameters()
+                          if not n.startswith('diffusion_model.')} for d in domains}
+            names = list(pdicts[domains[0]].keys())
+            total_sq = 0.0
+            total_n = 0
+            node_sq = {d: 0.0 for d in domains}
+            for name in names:
+                stack = torch.stack([pdicts[d][name] for d in domains], dim=0)  # [N, ...]
+                mean = stack.mean(dim=0, keepdim=True)
+                diff = stack - mean
+                total_sq += float((diff * diff).sum().item())
+                total_n += pdicts[domains[0]][name].numel()
+                for i, d in enumerate(domains):
+                    node_sq[d] += float((diff[i] * diff[i]).sum().item())
+            rms = math.sqrt(total_sq / max(N * total_n, 1))
+            max_node = math.sqrt(max(node_sq.values()) / max(total_n, 1))
+            return rms, max_node

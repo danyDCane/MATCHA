@@ -299,7 +299,8 @@ class StandardResNetWrapper(nn.Module):
     This allows extracting intermediate features from layer1, layer2, layer3.
     """
     def __init__(self, depth, num_classes, use_style_shift=False, style_shift_prob=0.5, style_shift_ratio=0.5,
-                 style_explore_alpha=3.0, style_explore_ratio=0.5, mixstyle_alpha=0.1, pretrained=False):
+                 style_explore_alpha=3.0, style_explore_ratio=0.5, mixstyle_alpha=0.1, pretrained=False,
+                 use_proj_head=False, proj_dim=128, proj_hidden=None):
         super(StandardResNetWrapper, self).__init__()
         from torchvision.models import resnet18, resnet34, resnet50, resnet101, resnet152
         self.style_shift_prob = style_shift_prob  # 保存为实例属性
@@ -357,7 +358,36 @@ class StandardResNetWrapper(nn.Module):
             self.mixstyle1 = MixStyle(alpha=mixstyle_alpha)
             self.mixstyle2 = MixStyle(alpha=mixstyle_alpha)
             self.mixstyle3 = MixStyle(alpha=mixstyle_alpha)
-    
+
+        # ===== 檢測用投影層：與 fc 並聯（不是串在 fc 前面），見 0803 §2.2 =====
+        # 形狀 512→512→128 已由原始碼核實與 CIDER (models/resnet.py:213-217) 及
+        # PALM (models/resnet.py:176-180) 逐字相同：中間層 = 輸入維度、輸出 128、--head 預設 mlp。
+        # ⚠️ 條件式建構：不開 --use_proto_reg 的既有 run 完全不建這個模組，權重初始化的
+        #    亂數消耗與過去一致 ⇒ 既有 baseline 仍可逐位重現。
+        self.use_proj_head = use_proj_head
+        if use_proj_head:
+            _in = self.backbone.fc.in_features
+            _hid = _in if proj_hidden is None else proj_hidden
+            self.proj_head = nn.Sequential(
+                nn.Linear(_in, _hid),
+                nn.ReLU(inplace=True),
+                nn.Linear(_hid, proj_dim),
+            )
+
+    def project(self, vec):
+        """把 pooled 特徵映到單位球，供原型角距離使用。
+
+        Args:
+            vec: [B, 512] 未正規化的 penultimate 特徵（fc 吃的是同一個 vec 的未正規化版本）
+        Returns:
+            z: [B, proj_dim] L2 正規化後、位於單位球上
+
+        ⚠️ use_proj_head=False 時退化為「直接對 512 維做 L2 正規化」——這是階段 1c
+           （無投影層對照臂）要的行為，用來補「互擾」的自有證據（0803 §2.3.1）。
+        """
+        z = self.proj_head(vec) if self.use_proj_head else vec
+        return F.normalize(z, dim=1)
+
     def intermediate_forward(self, x):
         """
         Extract intermediate features, returning 512-dim feature vector (before fc layer).

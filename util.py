@@ -1177,7 +1177,14 @@ def select_model(num_class, args):
     mixstyle_alpha = getattr(args, 'mixstyle_alpha', 0.1)
     # Get pretrained parameter
     pretrained = getattr(args, 'pretrained', False)
-    
+    # ===== 檢測用投影層（0803 §2.2）=====
+    # ⚠️ 只在 --use_proto_reg 且未指定 --proto_no_projection 時建構。不開的 run 完全不建，
+    #    權重初始化的亂數消耗與過去一致 ⇒ 既有 baseline 仍可逐位重現。
+    use_proj_head = (bool(getattr(args, 'use_proto_reg', False))
+                     and not bool(getattr(args, 'proto_no_projection', False)))
+    proj_dim = int(getattr(args, 'proj_dim', 128))
+
+
     if args.model == 'VGG':
         model = vggnet.VGG(16, num_class)
     elif args.model == 'res':
@@ -1213,7 +1220,9 @@ def select_model(num_class, args):
                                              style_explore_alpha=style_explore_alpha,
                                              style_explore_ratio=style_explore_ratio,
                                              mixstyle_alpha=mixstyle_alpha,
-                                             pretrained=pretrained)
+                                             pretrained=pretrained,
+                                             use_proj_head=use_proj_head,
+                                             proj_dim=proj_dim)
             else:
                 model = resnet.ResNet(18, num_class,
                                      use_style_shift=use_style_shift,
@@ -1231,7 +1240,7 @@ def select_model(num_class, args):
             model = MLP.MNIST_MLP(47)
     return model
 
-def select_graph(graphid, num_nodes=None, radius=None, seed=None):
+def select_graph(graphid, num_nodes=None, radius=None, seed=None, topology='rgg'):
     """
     根據 graphid 選擇圖形拓撲結構。
     
@@ -1261,21 +1270,26 @@ def select_graph(graphid, num_nodes=None, radius=None, seed=None):
     # 特殊情況：graphid == 6 為隨機幾何圖（Random Geometric Graph, RGG）
     if graphid == 6:
         num_nodes = num_nodes or 9
-        radius = radius or 0.8
-        seed = seed or 42  # 預設種子以確保可重現性
-        
-        # 生成 RGG，確保連通性
-        max_attempts = 100
-        G = None
-        for attempt in range(max_attempts):
-            try:
-                G = nx.random_geometric_graph(num_nodes, radius, seed=seed + attempt)
-                if nx.is_connected(G):
-                    break
-            except:
-                continue
+        if topology == 'ring':
+            # 環狀拓樸：n 節點 cycle、每節點 degree 2、直徑 n//2、恆連通（最極端稀疏連通對照）
+            # blocked 域排列下(同域相鄰)中間節點只看得到自己的域＝最強風格缺口
+            G = nx.cycle_graph(num_nodes)
         else:
-            raise RuntimeError(f"在 {max_attempts} 次嘗試後仍無法生成連通的 RGG，參數：num_nodes={num_nodes}, radius={radius}")
+            radius = radius or 0.8
+            seed = seed or 42  # 預設種子以確保可重現性
+
+            # 生成 RGG，確保連通性
+            max_attempts = 100
+            G = None
+            for attempt in range(max_attempts):
+                try:
+                    G = nx.random_geometric_graph(num_nodes, radius, seed=seed + attempt)
+                    if nx.is_connected(G):
+                        break
+                except:
+                    continue
+            else:
+                raise RuntimeError(f"在 {max_attempts} 次嘗試後仍無法生成連通的 RGG，參數：num_nodes={num_nodes}, radius={radius}")
         
         # 將 NetworkX 圖轉換為 matchings 格式
         # matching 是一組不相交的邊（沒有共享節點）

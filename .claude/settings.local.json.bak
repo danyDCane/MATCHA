@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"exit: $?\")"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "c=$(jq -r '.tool_input.command // empty' 2>/dev/null); case \"$c\" in *start_v1_baseline.sh*|*\"train.py --wandb\"*) printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"[TaskBoard 輪替提醒] 要啟動新實驗——先確認『上一個已完成的實驗』是否已(1)更新進行中狀態(2)輪替到最近完成(3)findings進真相區§F(4)寫報告(若需)。別讓完成的實驗漏更新。\"}}' ;; esac"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"[plan→research 慣例提醒] 剛離開 plan 模式：若剛核准了 plan，依 master.md 必須 (1) 把 plan 寫進 research/<track>/NNNN_<name>_plan.md (dated 前綴) (2) research/TaskBoard.md「進行中」加條目連到該 plan 檔，別只留在 ~/.claude/plans/。若本次非核准新 plan(僅退出或研究型 plan) 則忽略。\"},\"systemMessage\":\"提醒：plan 核准後要同步寫進 research/<track>/ + TaskBoard 連結\"}'"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // .tool_response.filePath // empty' 2>/dev/null); case \"$f\" in *research*TaskBoard.md) : ;; *research*.md) printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"[TaskBoard 維護提醒] 剛寫/改 research 報告：確認 TaskBoard 是否需 (1)更新「進行中」該實驗狀態 (2)完成實驗輪替到「最近完成」(一行+link、別讓進行中變 changelog) (3)持久 findings 進「現行真相 §F」。\"}}' ;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

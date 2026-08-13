@@ -40,14 +40,83 @@ PACS = CA.PACS
 
 
 def load_backbone_diffusion(ckpt_path, num_classes, device):
-    backbone = util.select_model(num_classes, CA.build_backbone_args()).to(device)
-    diffusion = CA.get_diffusion_model(
-        ft_size=512, denoiser_type="unet0d",
-        diffusion_denoiser_channels=512, num_diffusion_steps=1000,
-    ).to(device)
-    CA.load_checkpoint(ckpt_path, backbone, diffusion, device)
-    backbone.eval(); diffusion.eval()
+    """載入 backbone（＋diffusion，若 checkpoint 有的話）。
+
+    ⚠️ 階段 1 起 checkpoint 可能**沒有 diffusion**（`USE_OOD=0`）也可能**有投影層與原型 buffer**
+       （`--use_proto_reg`）。兩者都要能自動偵測，否則：
+       ① 沒 diffusion → `load_checkpoint` 直接拋 ValueError
+       ② 模型沒建投影層 → `proj_head.*` / `prototypes` 會被當成「Unexpected keys」丟掉，
+          角距離分數就算不出來（且不會報錯，是靜默失效）。
+    """
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    _sd = raw
+    for _w in ("state_dict", "backbone_state"):
+        if isinstance(_sd, dict) and _w in _sd:
+            _sd = _sd[_w]
+    has_proto = isinstance(_sd, dict) and any(k.startswith("proj_head") or k == "prototypes"
+                                              for k in _sd)
+    has_diff = isinstance(raw, dict) and any(
+        k in raw for k in ("diffusion_state", "diffusion_state_dict"))
+
+    _args = CA.build_backbone_args()
+    if has_proto:
+        # 讓 util.select_model 建出投影層（維度由 checkpoint 決定，不寫死）
+        _args.use_proto_reg = True
+        _args.proto_no_projection = not any(k.startswith("proj_head") for k in _sd)
+        if "proj_head.2.weight" in _sd:
+            _args.proj_dim = int(_sd["proj_head.2.weight"].shape[0])
+    backbone = util.select_model(num_classes, _args).to(device)
+    if has_proto and "prototypes" in _sd:
+        from dood.prototype import init_prototype_buffers
+        _c, _d, _p = _sd["prototypes"].shape
+        init_prototype_buffers(backbone, _c, _d, _p, device=device)
+
+    diffusion = None
+    if has_diff:
+        diffusion = CA.get_diffusion_model(
+            ft_size=512, denoiser_type="unet0d",
+            diffusion_denoiser_channels=512, num_diffusion_steps=1000,
+        ).to(device)
+        CA.load_checkpoint(ckpt_path, backbone, diffusion, device)
+        diffusion.eval()
+    else:
+        missing, unexpected = backbone.load_state_dict(_sd, strict=False)
+        _crit = [k for k in missing if k.startswith(("proj_head", "prototypes", "proto_count"))]
+        if _crit:
+            raise RuntimeError(f"投影層/原型未載入（會靜默失效）：{_crit}")
+        print(f"  [no-diffusion ckpt] backbone loaded; proto={has_proto} "
+              f"missing={len(missing)} unexpected={len(unexpected)}")
+    backbone.eval()
     return backbone, diffusion
+
+
+def compute_avg_bn_buffers(ckpt_paths, num_classes, device):
+    """Average BN running_mean/running_var across all node checkpoints (offline global fusion).
+
+    Only running stats are averaged; num_batches_tracked is left alone (it does not participate
+    in eval-mode normalization). Mirrors the all-avg candidate in scripts/bn_signal_gating.py.
+    """
+    acc, n = None, 0
+    for p in ckpt_paths:
+        if not os.path.exists(p):
+            continue
+        bb, _ = load_backbone_diffusion(p, num_classes, device)
+        cur = {k: v.detach().clone().float()
+               for k, v in bb.named_buffers()
+               if k.endswith(("running_mean", "running_var"))}
+        if acc is None:
+            acc = cur
+        else:
+            for k in acc:
+                acc[k] += cur[k]
+        n += 1
+        del bb
+    if acc is None or n == 0:
+        raise RuntimeError("compute_avg_bn_buffers: no checkpoint loaded")
+    for k in acc:
+        acc[k] /= n
+    print(f"[avg_bn] averaged {len(acc)} BN buffers over {n} nodes")
+    return acc
 
 
 def compute_oscr(reject_score, pred, label, unknown_idx):
@@ -111,6 +180,10 @@ def main():
     p.add_argument("--ood_eval_scores_type", default="eps_mse")
     p.add_argument("--device", default="cuda")
     p.add_argument("--output_csv", required=True)
+    p.add_argument("--avg_bn", action="store_true",
+                   help="offline global BN fusion: average running_mean/var across ALL nodes, "
+                        "write back into every node before eval. topo gets an '_avgbn' suffix so "
+                        "rows never collide with the keep-local baseline. Post-hoc only, no retrain.")
     p.add_argument("--num_nodes", type=int, default=0,
                    help="0=centralized (nodes=source domains, ckpt {desc}_{domain}); "
                         ">0=P2P virtual-node (nodes=node_0..node_{N-1}, ckpt {desc}_node_{i})")
@@ -132,6 +205,15 @@ def main():
         topo = "centralized"
     suffix = "final" if str(args.ckpt_epoch) == "final" else f"epoch_{args.ckpt_epoch}"
 
+    # Offline global BN fusion (post-hoc,零重訓). Computed once over all nodes, then written into
+    # every node's backbone before eval. topo gets a suffix so rows never collide with baseline.
+    avg_bn = None
+    if args.avg_bn:
+        avg_bn = compute_avg_bn_buffers(
+            [os.path.join(args.checkpoint_dir, f"{args.description}_{n}_{suffix}.pth")
+             for n in node_keys], args.num_classes, device)
+        topo = f"{topo}_avgbn"
+
     rows = []
     for node in node_keys:
         ckpt = os.path.join(args.checkpoint_dir, f"{args.description}_{node}_{suffix}.pth")
@@ -140,6 +222,12 @@ def main():
         print(f"\n=== leave_out={args.leave_out} node={node} ({topo}, ckpt={suffix}, "
               f"6-way OSDG, unknown=idx{args.unknown_idx}) ===")
         backbone, diffusion = load_backbone_diffusion(ckpt, args.num_classes, device)
+
+        if avg_bn is not None:
+            bd = dict(backbone.named_buffers())
+            for k, v in avg_bn.items():
+                bd[k].copy_(v)
+            backbone.eval()
 
         # Test set = unseen/leave_out domain, FULL (all 7 classes incl. person=unknown).
         loader = TD.load_pacs_test_data(root, args.leave_out, args.batch_size, args.num_workers)[0]
@@ -160,6 +248,9 @@ def main():
             det_aupr = float(average_precision_score(unk.astype(int), rej))  # imbalance-aware
             fpr95 = compute_fpr_at_tpr(rej, unk, 0.95)               # lower=better
             rows.append(dict(
+                # run=description 唯一標識這批 checkpoint（含 _aggbn/_async/_seed 等訓練側差異）。
+                # topo 只記拓樸，區分不出「訓練時是否聚合 BN」——故必須另存 run。
+                run=args.description,
                 leave_out=args.leave_out, topo=topo, ckpt=suffix, node=node,
                 unknown_idx=args.unknown_idx, score_fn=name,
                 oscr=round(oscr, 4), h_best=round(hbest, 4),
