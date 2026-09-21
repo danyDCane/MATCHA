@@ -1063,6 +1063,9 @@ class SingleProcessCommunicator(object):
                     for name in buf_dict:
                         if name in msg['bn']:
                             buf_acc[name] += w_ij * msg['bn'][name]
+                if getattr(self, 'edge_diag_on', False):
+                    self._log_edge_div(domain, s, w_ij, orig,
+                                       (buf_orig if agg_bn else None), msg, step)
                 w_sum += w_ij
                 ages.append(step - msg['push_step'])
             selfw = 1.0 - w_sum  # MH self weight（deg_i 上限保證 >0）
@@ -1076,6 +1079,45 @@ class SingleProcessCommunicator(object):
                     b.data.copy_(selfw * buf_orig[name] + buf_acc[name])
             box.clear()  # 消費（consume-on-read）
         return ages
+
+    def _log_edge_div(self, recv, sender, w_ij, orig, buf_orig, msg, step):
+        """聚合【前】的逐邊偏離診斷（--edge_div_diag）。
+
+        回答的問題：兩個節點之間的模型偏離，**同畫風邊與跨畫風邊分不分得開**。
+        分得開 ⇒ 模型側有畫風結構、可拿來調權重；分不開 ⇒ 只能建在風格統計量上。
+
+        ⚠️ 本函式**唯讀**：只讀 orig/buf_orig/msg，不寫模型、不碰亂數、不改任何 communicator 狀態
+            ⇒ 開關前後的訓練軌跡必須逐位相同（這就是驗收條件）。
+        ⚠️ 只在 train.py 把 edge_diag_on 設為 True 的那些 step 才會進來（預設每 epoch 一次），
+            否則逐 iter 對 11M 參數算範數會拖垮訓練。
+        """
+        with torch.no_grad():
+            num = den = 0.0
+            for name, v in orig.items():
+                if name.startswith('diffusion_model.'):
+                    continue                      # 只看 backbone，diffusion 另有聚合路徑
+                o = msg['backbone'].get(name)
+                if o is None:
+                    continue
+                num += float(((v - o) ** 2).sum().item())
+                den += float((v * v).sum().item())
+            d_conv = (num ** 0.5) / ((den ** 0.5) + 1e-12)
+            d_bn = None
+            if buf_orig is not None and msg.get('bn'):
+                n2 = d2 = 0.0
+                for name, v in buf_orig.items():
+                    o = msg['bn'].get(name)
+                    if o is None:
+                        continue
+                    n2 += float(((v - o) ** 2).sum().item())
+                    d2 += float((v * v).sum().item())
+                d_bn = (n2 ** 0.5) / ((d2 ** 0.5) + 1e-12)
+            n2d = getattr(self, 'node_to_domain', None) or {}
+            same = int(n2d.get(recv, recv) == n2d.get(sender, sender))
+            if not hasattr(self, 'edge_diag_rows'):
+                self.edge_diag_rows = []
+            self.edge_diag_rows.append([step, recv, sender, same, f"{w_ij:.6f}",
+                                        f"{d_conv:.6e}", "" if d_bn is None else f"{d_bn:.6e}"])
 
     def consensus_deviation(self, models_dict):
         """跨節點 backbone 參數的共識偏差診斷（取代 async 下被 skip 的 sync D1）。

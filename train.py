@@ -456,6 +456,7 @@ def run(num_domains):
     proto_m = float(getattr(args, 'proto_m', 0.95))
     proto_temp = float(getattr(args, 'proto_temp', 0.1))
     proto_warmup_epochs = int(getattr(args, 'proto_warmup_epochs', 10))
+    proto_pair_margin = float(getattr(args, 'proto_pair_margin', 0.92))
     proto_balance_every = max(1, int(getattr(args, 'proto_balance_every', 20)))
     proto_rel_margin = float(getattr(args, 'proto_rel_margin', 0.0))
     # target ratios: ||lam*g_term|| = ratio * ||g_cls||. All-zero => lambda=0 BASELINE arm.
@@ -464,6 +465,7 @@ def run(num_domains):
         'style': float(getattr(args, 'proto_style_ratio', 0.0)),
         'disp':  float(getattr(args, 'proto_disp_ratio', 0.1)),
         'rel':   float(getattr(args, 'proto_rel_ratio', 0.0)),
+        'pair':  float(getattr(args, 'proto_pair_ratio', 0.0)),
     }
     # lambda held between balance measurements (same pattern as KSD).
     proto_lambda_held = {d: {k: 0.0 for k in proto_ratios} for d in domain_names}
@@ -472,6 +474,9 @@ def run(num_domains):
     proto_lambda_meters = {k: {d: util.AverageMeter() for d in domain_names} for k in proto_ratios}
     proto_gnorm_meters = {k: {d: util.AverageMeter() for d in domain_names} for k in proto_ratios}
     proto_gcos_meters = {k: {d: util.AverageMeter() for d in domain_names} for k in proto_ratios}
+    proto_pair_active_meters = {d: util.AverageMeter() for d in domain_names}   # hinge 還在約束的樣本比例
+    proto_angle512_meters = {d: util.AverageMeter() for d in domain_names}      # 512 維 penultimate 的 z vs z~
+    proto_intra_meters = {d: util.AverageMeter() for d in domain_names}         # 同類樣本兩兩夾角（塌縮檢測）
     proto_gcls_norm_meters = {d: util.AverageMeter() for d in domain_names}
     # ★ 觀察量①（0803 §4.1）：**同一樣本**乾淨 vs 風格擾動後的特徵夾角 —— 擾動把特徵推多遠，
     #   同時是 L_rel 的 margin 取值依據。concat 不需要，兩次前向本來就同時有兩者。
@@ -509,14 +514,20 @@ def run(num_domains):
                                    device=next(models_dict[_d].parameters()).device)
         _armtag = ("lambda=0 BASELINE" if all(v == 0.0 for v in proto_ratios.values())
                    else ("1c (no projection)" if getattr(args, 'proto_no_projection', False)
-                         else ("1b (+L_rel)" if proto_ratios['rel'] > 0 else "1a")))
+                         else ("1b (+L_rel)" if proto_ratios['rel'] > 0
+                               else ("1ap (+L_pair)" if proto_ratios['pair'] > 0 else "1a"))))
         print(f"[proto] stage-1 prototype readout enabled — arm {_armtag}. "
               f"buffers=[{num_classes},{len(proto_domain_list)},{_pdim}] "
               f"(第二軸＝來源畫風 {proto_domain_list}，不是節點) "
               f"proto_m={proto_m} tau={proto_temp} "
-              f"warmup={proto_warmup_epochs}ep ratios={proto_ratios} rel_margin={proto_rel_margin}. "
+              f"warmup={proto_warmup_epochs}ep ratios={proto_ratios} rel_margin={proto_rel_margin} "
+              f"pair_margin={proto_pair_margin}. "
               f"Forward count = 2 (perturbed + clean, BOTH grad-enabled since 0812: "
-              f"L_disp acts on the stored prototypes via the clean-feature EMA chain).", flush=True)
+              f"L_disp acts on the stored prototypes via the clean-feature EMA chain)."
+              + (f" ★ L_pair active: hinge on cos(z_aug, z_clean) with margin={proto_pair_margin}"
+                 f" ({np.degrees(np.arccos(min(1.0, proto_pair_margin))):.1f} deg);"
+                 f" the ONLY term constraining angle(z,z~)."
+                 if proto_ratios['pair'] > 0 else ""), flush=True)
 
     tic = time.time()
 
@@ -558,11 +569,35 @@ def run(num_domains):
         async_consensus_f = None
         async_consensus_writer = None
 
+    # ===== [唯讀診斷] 聚合前的逐邊偏離（--edge_div_diag）=====
+    edge_div_on = bool(getattr(args, 'edge_div_diag', False))
+    edge_f = pair_f = None
+    if edge_div_on:
+        import os as _os2, csv as _csv2
+        if not async_enabled:
+            print("[EDGE-DIV][WARN] 診斷掛點在 async 聚合路徑（receive_and_aggregate）；"
+                  "非 async 模式下 edges.csv 會是空的，pairs.csv 仍有效。", flush=True)
+        communicator.node_to_domain = node_to_domain      # 用來標同畫風 / 跨畫風
+        _ed = _os2.path.join(args.savePath, 'edge_div')
+        _os2.makedirs(_ed, exist_ok=True)
+        edge_f = open(_os2.path.join(_ed, 'edges.csv'), 'w', newline='')
+        edge_writer = _csv2.writer(edge_f)
+        edge_writer.writerow(['step', 'epoch', 'recv', 'sender', 'same_style', 'w_ij', 'd_conv', 'd_bn'])
+        # 原型與風格統計量【從來不跨節點聚合】⇒ 取任何時間點的快照都等價，不必掛在通訊層
+        pair_f = open(_os2.path.join(_ed, 'pairs.csv'), 'w', newline='')
+        pair_writer = _csv2.writer(pair_f)
+        pair_writer.writerow(['epoch', 'node_i', 'node_j', 'same_style', 'd_proto_deg', 'd_style'])
+        print(f"[EDGE-DIV] enabled -> {_ed}", flush=True)
+
     # ===== start training with fixed total steps K (Algorithm 1) =====
     for k in range(K):
         # Set all models to training mode
         for model in models_dict.values():
             model.train()
+
+        # [唯讀診斷] 只在 epoch 邊界那個 iter 打開逐邊偏離記錄
+        if edge_div_on:
+            communicator.edge_diag_on = ((k + 1) % STEPS_PER_EPOCH == 0)
 
         start_time = time.time()
 
@@ -1377,7 +1412,7 @@ def run(num_domains):
                 if use_proto_reg and vec_style_for_reg is not None:
                     from dood.prototype import (
                         class_centers, comp_loss, style_loss,
-                        disp_loss, rel_loss, detection_score, ema_prototypes_live,
+                        disp_loss, rel_loss, detection_score, ema_prototypes_live, pair_loss,
                     )
                     # ⚠️ 這是「來源畫風」的索引、不是節點索引（domain_names 是 node_0..node_8）
                     _dom_idx = proto_dom_index[node_to_domain.get(domain, domain)]
@@ -1432,6 +1467,31 @@ def run(num_domains):
                         proto_zangle_meters[domain].update(
                             float(torch.arccos(_cos).mean().item()), data.size(0))
 
+                        # ★ 觀察量④（0814）：hinge 還在約束多少樣本 ⇒ **區分「該調 ratio」還是「該調 margin」**
+                        #   比例→0 但 angle 未達目標 ⇒ margin 太鬆、應調**大**（cos 目標值變大＝更緊）
+                        #   比例停在 100% 但 angle 不動 ⇒ 力道不足、應調大 proto_pair_ratio
+                        proto_pair_active_meters[domain].update(
+                            float((_cos < proto_pair_margin).float().mean().item()), data.size(0))
+
+                        # ★ 觀察量⑤（0814）：**512 維 penultimate** 上的同一個夾角。
+                        #   ⚠️ 這是回答「約束該做在 128 維投影層還是 512 維 backbone」的唯一直接證據：
+                        #      1a 的前例是 L_comp 只作用在 128 維時 energy 四軸完全不動（512 維沒被碰）。
+                        #      若本臂 128 維降、512 維不降 ⇒ 只有投影空間變乾淨、backbone 沒學到不變性。
+                        _c512 = (F.normalize(vec_style_for_reg.detach(), dim=1)
+                                 * F.normalize(_vec_clean.detach(), dim=1)).sum(dim=1).clamp(-1 + 1e-7, 1 - 1e-7)
+                        proto_angle512_meters[domain].update(
+                            float(torch.arccos(_c512).mean().item()), data.size(0))
+
+                        # ★ 觀察量⑥（0814）：batch 內**同類別樣本兩兩**的夾角 ⇒ **塌縮的直接檢測**。
+                        #   FOOGD 警告嚴格對齊會造成表徵塌縮；1a-fix 的 post-hoc 實測基準 40.26°，
+                        #   趨近 0° 即為塌縮。用乾淨特徵量（原型的來源、也是錨點）。
+                        _same = (target.view(-1, 1) == target.view(1, -1))
+                        _same.fill_diagonal_(False)
+                        if _same.any():
+                            _cc = (z_clean_p.detach() @ z_clean_p.detach().t()).clamp(-1 + 1e-7, 1 - 1e-7)
+                            proto_intra_meters[domain].update(
+                                float(torch.arccos(_cc[_same]).mean().item()), int(_same.sum()))
+
                     # --- 三個原型損失 + 相對約束 -------------------------------------------
                     # warmup：訓練初期特徵近乎隨機 ⇒ 原型也近乎隨機 ⇒ 拉向隨機目標＝注入噪聲。
                     # 原型在 warmup 期間照常累積，只是不產生損失。
@@ -1444,6 +1504,10 @@ def run(num_domains):
                                                        model.proto_count, proto_temp)
                         if proto_ratios['style'] > 0:
                             _terms['style'] = style_loss(z_aug, target, _centers)
+                        if proto_ratios['pair'] > 0:
+                            # ★ 唯一直接約束 angle(z,z~) 的項。z_clean_p 在 pair_loss 內強制 detach
+                            #   ⇒「擾動版向乾淨版靠」，乾淨版維持錨點（保住原型只吃乾淨特徵的前提）。
+                            _terms['pair'] = pair_loss(z_aug, z_clean_p, proto_pair_margin)
                         if proto_ratios['disp'] > 0:
                             # ★ 直接作用在「存檔原型的帶梯度版本」上（_proto_live 與 model.prototypes
                             #   數值相同、只差有沒有梯度）⇒ 推的就是部署時量到的那組中心。
@@ -1729,6 +1793,47 @@ def run(num_domains):
                 async_consensus_writer.writerow([(k // STEPS_PER_EPOCH) + 1,
                                                  f"{_cons_rms:.6e}", f"{_cons_max:.6e}"])
                 async_consensus_f.flush()
+
+            # ===== [唯讀診斷] 落盤本 epoch 的逐邊偏離 + 原型/風格的逐對距離 =====
+            if edge_div_on:
+                _ep = (k + 1) // STEPS_PER_EPOCH
+                for _row in getattr(communicator, 'edge_diag_rows', []):
+                    edge_writer.writerow([_row[0], _ep] + _row[1:])
+                communicator.edge_diag_rows = []
+                edge_f.flush()
+                with torch.no_grad():
+                    # 原型：用與 dood.prototype.class_centers 相同的遮罩平均（只算有值的畫風格）
+                    _cen = {}
+                    for _d in domain_names:
+                        _m = models_dict[_d]
+                        if not hasattr(_m, 'prototypes'):
+                            continue
+                        _mask = (_m.proto_count > 0).float().unsqueeze(-1)
+                        _sum = (_m.prototypes * _mask).sum(dim=1)
+                        _cnt = _mask.sum(dim=1).clamp(min=1e-8)
+                        _cen[_d] = torch.nn.functional.normalize(_sum / _cnt, dim=1)
+                    _sty = {}
+                    try:
+                        for _d in domain_names:
+                            _v = style_vecs_dict.get(_d) if style_vecs_dict else None
+                            if _v is not None:
+                                _sty[_d] = _v.detach().float().flatten()
+                    except NameError:
+                        pass
+                    for _i in range(len(domain_names)):
+                        for _j in range(_i + 1, len(domain_names)):
+                            _a, _b = domain_names[_i], domain_names[_j]
+                            _same = int(node_to_domain.get(_a, _a) == node_to_domain.get(_b, _b))
+                            _dp = ''
+                            if _a in _cen and _b in _cen:
+                                _cos = (_cen[_a] * _cen[_b]).sum(dim=1).clamp(-1.0, 1.0)
+                                _dp = f"{float(torch.rad2deg(torch.acos(_cos)).mean().item()):.4f}"
+                            _ds = ''
+                            if _a in _sty and _b in _sty:
+                                _na = torch.norm(_sty[_a]); _nb = torch.norm(_sty[_b])
+                                _ds = f"{float((torch.norm(_sty[_a] - _sty[_b]) / (0.5 * (_na + _nb) + 1e-12)).item()):.6f}"
+                            pair_writer.writerow([_ep, _a, _b, _same, _dp, _ds])
+                    pair_f.flush()
         
         end_time = time.time()
         d_comp_time = (end_time - start_time - (record_end - record_start))
@@ -1818,7 +1923,7 @@ def run(num_domains):
                     f"/||g||={_pavg(proto_gnorm_meters[n]):.4g}"
                     f"/ratio={(_pavg(proto_lambda_meters[n]) * _pavg(proto_gnorm_meters[n]) / _gcls if _gcls > 1e-12 else 0.0):.3f}"
                     f"/cos={_pavg(proto_gcos_meters[n]):+.3f}"
-                    for n in ('comp', 'style', 'disp', 'rel') if proto_ratios[n] > 0
+                    for n in ('comp', 'style', 'pair', 'disp', 'rel') if proto_ratios[n] > 0
                 )
                 _warm = "WARMUP(losses off)" if epoch <= proto_warmup_epochs else "active"
                 _filled = int((models_dict[domain_names[0]].proto_count > 0).sum().item())
@@ -1828,6 +1933,10 @@ def run(num_domains):
                     # ★ 觀察量①：同類樣本 z 與 z~ 的夾角 —— 被壓小 ⇒ 拉緊項在抵銷風格增強；
                     #   同時是 L_rel margin 的取值依據（0803 §4.1-R）。
                     f"angle(z,z~)={_pavg(proto_zangle_meters):.4f}rad"
+                    f"|512d={_pavg(proto_angle512_meters):.4f}rad"
+                    f"|intra={_pavg(proto_intra_meters):.4f}rad"
+                    + (f"|pair_act={_pavg(proto_pair_active_meters)*100:.0f}%"
+                       if proto_ratios['pair'] > 0 else "")
                     + (f"  angle(proto,fc_w)={_pavg(proto_vs_fc_meters):.4f}rad"
                        if getattr(args, 'proto_no_projection', False) else "")
                     + (f"\n         {_gterms}" if _gterms else "  [lambda=0 BASELINE: 原型照常累積、無損失]"),
@@ -1963,6 +2072,9 @@ def run(num_domains):
                         log_dict[f"{domain}/proto_gnorm_{_k}"] = float(proto_gnorm_meters[_k][domain].avg)
                         log_dict[f"{domain}/proto_gcos_{_k}"] = float(proto_gcos_meters[_k][domain].avg)
                     log_dict[f"{domain}/proto_g_cls_norm"] = float(proto_gcls_norm_meters[domain].avg)
+                    log_dict[f"{domain}/proto_angle512"] = float(proto_angle512_meters[domain].avg)
+                    log_dict[f"{domain}/proto_intra_angle"] = float(proto_intra_meters[domain].avg)
+                    log_dict[f"{domain}/proto_pair_active_frac"] = float(proto_pair_active_meters[domain].avg)
                     log_dict[f"{domain}/proto_angle_z_zaug"] = float(proto_zangle_meters[domain].avg)
                     log_dict[f"{domain}/proto_angle_vs_fc"] = float(proto_vs_fc_meters[domain].avg)
                     log_dict[f"{domain}/proto_cells_filled"] = int(
@@ -2136,9 +2248,68 @@ def run(num_domains):
                         proto_gnorm_meters[_k][domain].reset()
                         proto_gcos_meters[_k][domain].reset()
                     proto_gcls_norm_meters[domain].reset()
+                    proto_pair_active_meters[domain].reset()
+                    proto_angle512_meters[domain].reset()
+                    proto_intra_meters[domain].reset()
                     proto_zangle_meters[domain].reset()
                     proto_vs_fc_meters[domain].reset()
             tic = time.time()
+
+    # ===== 方法元件：訓練收尾的全域 BN 聚合（final BN merge）=====
+    # 定位：這**不是**評估技巧、也不是雙方都套的協定，而是**我方方法元件**（TaskBoard §BN 匯聚協定，
+    #       2026-09-10 dany 裁定）。StyleDDG baseline 沒有這一步（其啟動腳本不帶 AGG_BN）。
+    #
+    # 為什麼放在這裡而不是評估端：`--aggregate_bn` 在訓練中每輪把 receive 融合後的 BN 寫回，
+    # 但**最後一輪之後沒有再融合一次** ⇒ 存下的 9 個 checkpoint 仍各自帶著自己節點的 BN 統計量。
+    # 本段補上那最後一次聚合，讓「BN 聚合」這個機制在模型交付時是完整的。
+    # ⇒ 交付的模型自帶合併後的 BN，評估端**不需要**再加 `--avg_bn`。
+    #
+    # ⚠️ 數值上與評估端 `scripts/osdg_eval.py --avg_bn --avg_bn_var merged` 是**同一個運算**
+    #    （B 法合併變異數，逐位相同）⇒ **既有四折結果不因本段改變、不需要重訓**。
+    #    差別只在「這一步屬於訓練還是屬於評估」——而它屬於訓練，因為它是我方的貢獻。
+    #
+    # ⚠️ 診斷例外：要看「節點之間不一致」的分析（逐節點誤拒率、跨節點門檻離散度）**不可**用
+    #    合併後的 checkpoint，否則量到的離散度恆為 0。那類分析請用 --no_final_bn_merge 另存一份。
+    _do_bn_merge = (getattr(args, 'aggregate_bn', False)
+                    and not getattr(args, 'no_final_bn_merge', False))
+    if _do_bn_merge and len(domain_names) > 1:
+        with torch.no_grad():
+            # 逐節點收集 BN running 統計量
+            _per_node = []
+            for _d in domain_names:
+                _per_node.append({k: v.detach().clone().float()
+                                  for k, v in models_dict[_d].named_buffers()
+                                  if k.endswith(("running_mean", "running_var"))})
+            # ⚠️ running_mean 用「逐節點累加再除」而非 stack().mean(0)——兩者數學相同，
+            #    但 float32 累加順序不同會差 ~2e-07。刻意對齊 scripts/osdg_eval.py 的順序，
+            #    使本段與既有評估結果**逐位相同**（驗證：40 個 buffer 最大差 0.0）。
+            _merged = {}
+            for _k in _per_node[0]:
+                if _k.endswith("running_mean"):
+                    _acc = _per_node[0][_k].clone()
+                    for _d_ in _per_node[1:]:
+                        _acc += _d_[_k]
+                    _acc /= len(_per_node)
+                    _merged[_k] = _acc
+            for _k in _per_node[0]:
+                if not _k.endswith("running_var"):
+                    continue
+                _mk = _k.replace("running_var", "running_mean")
+                _mi = torch.stack([d[_mk] for d in _per_node])      # [N, C]
+                _vi = torch.stack([d[_k] for d in _per_node])
+                # B 法合併變異數：把 9 份資料視為一個大批次
+                #   mean(var_i + mean_i²) − mean(mean_i)²
+                # ⚠️ 不可用 A 樸素平均 mean(var_i)——它忽略節點間均值離散度、系統性低估。
+                _merged[_k] = (_vi + _mi ** 2).mean(0) - _mi.mean(0) ** 2
+            # 寫回每個節點（num_batches_tracked 不動）
+            for _d in domain_names:
+                _bufs = dict(models_dict[_d].named_buffers())
+                for _k, _v in _merged.items():
+                    _bufs[_k].copy_(_v.to(_bufs[_k].dtype))
+        print(f"[final_bn_merge] merged {len(_merged)} BN buffers over {len(domain_names)} nodes "
+              f"(var_mode=merged/B) → written into every node's checkpoint")
+    elif getattr(args, 'no_final_bn_merge', False):
+        print("[final_bn_merge] SKIPPED by --no_final_bn_merge (各節點保留自己的 BN 統計量)")
 
     # ===== Save final models (backbone + diffusion + normalization stats) =====
     # We save one checkpoint per domain so that:
@@ -2409,6 +2580,20 @@ if __name__ == "__main__":
     parser.add_argument('--proto_no_projection', action='store_true',
                         help='Arm 1c: skip the projection head, apply prototype losses directly on the '
                              '512-d penultimate (control for inter-set interference, 0803 §2.3.1).')
+    parser.add_argument('--proto_pair_ratio', type=float, default=0.0,
+                        help='Arm 1ap: gradient-norm share for L_pair = mean(relu(margin - cos(z_aug, '
+                             'z_clean.detach()))). Targets angle(z,z~), which NO existing loss constrains '
+                             '(measured 27.91 deg = 27.5%% of the inter-class distance, flat over 200 epochs). '
+                             'NOT a softmax/contrastive term on purpose: L_disp pushed the class centres to '
+                             '101.44 deg, so the L_comp softmax is saturated (neg_sum=2.2e-04) and any '
+                             'positive added there gets a ~1e-4 gradient. A hinge on the raw cosine has a '
+                             'non-vanishing gradient. 0 disables.')
+    parser.add_argument('--proto_pair_margin', type=float, default=0.92,
+                        help='Target cosine for L_pair; a sample stops contributing once cos >= margin. '
+                             '0.92 -> 23.1 deg, 0.95 -> 18.2 deg (current: 0.884 = 27.91 deg). '
+                             'margin=1.0 degenerates to FedAlign-style strict alignment, which is what FOOGD '
+                             'warns about ("vital feature information is inevitably lost due to strictly '
+                             'invariant constraints") -- keep it a swept knob, not a fixed bet.')
     parser.add_argument('--proto_m', type=float, default=0.95,
                         help='Prototype EMA memory (CIDER proto_m). NOTE there is no single "CIDER value": '
                              'CIFAR-100 uses 0.5, CIFAR-10/ImageNet-100 use 0.95. Update is PER-SAMPLE, so the '
@@ -2456,12 +2641,19 @@ if __name__ == "__main__":
                         help="Time-varying threshold decay gamma^(k) (PersonalizedET-faithful). "
                              "'lr' (default): threshold = tau * lr(k)/lr(0), decays with the cosine LR "
                              "so it stays sensitive as the model converges. 'const': gamma=1 (constant tau).")
+    parser.add_argument('--no_final_bn_merge', action='store_true',
+                        help='關閉「訓練收尾的全域 BN 聚合」（預設在 --aggregate_bn 開啟時執行）。'
+                             '用於：①重現 2026-09-10 之前的 checkpoint ②需要看節點間 BN 離散度的診斷。')
     parser.add_argument('--aggregate_bn', action='store_true',
                         help='aggregate BN running_mean/var together with model parameters (same MH weights). '
                              'Default OFF = current SiloBN-style keep-local. Payload +0.086%%. '
                              'Rationale: research/bn_fusion/0729_bn_consensus_first_principles.md')
     parser.add_argument('--bn_div_diag', action='store_true',
                         help='print cross-node BN divergence each epoch (auto-on when --aggregate_bn)')
+    parser.add_argument('--edge_div_diag', action='store_true',
+                        help='[唯讀診斷] 每 epoch 記錄「聚合前」的逐邊偏離，並標記該邊是同畫風或跨畫風。'
+                             '回答：模型參數側有沒有畫風結構可以拿來調混合權重。不改訓練行為 ⇒ '
+                             '開關前後準確率軌跡必須逐位相同（驗收條件）。目前只掛在 async 聚合路徑。')
     parser.add_argument('--async_style', action='store_true',
                         help='Stage 2: also event-trigger the style-statistics exchange (Phase 1). Style rides on '
                              'the SAME model-broadcast event (bundled); neighbors keep a persistent style buffer '

@@ -95,6 +95,15 @@ def comp_loss(z, labels, prototypes, proto_count, temperature=0.1):
     ★ 正樣本遮罩＝「同類別、任一畫風」：
       階段 1（只有 6 格有值）⇒ 每樣本一個正樣本 ⇒ 與 CIDER 原形等價
       階段 2b（18 格有值）  ⇒ 每樣本三個正樣本 ⇒ **不會把同類別的三個畫風原型推開**
+
+    ⛔ 2026-08-14 試過並否決的一條路：把「樣本自己的乾淨版本」加進本函式的候選＋正樣本集，
+       想藉此壓低 `angle(z, z̃)`。**單元測試證明無效（實測差值 1e-4）**，原因不是實作錯，
+       是形式選錯——softmax 衡量的是「正樣本有沒有贏過負樣本」（相對排名），
+       而 `L_disp` 已把類別中心推到 101.44° ⇒ 負樣本 logit −1.54 vs 正樣本 8.84
+       ⇒ `neg_sum = 2.2e-04` ⇒ **整個 softmax 飽和，任何加進來的正樣本梯度都被壓到 1e-4**。
+       我們要壓的 27.91° 是**絕對距離**，softmax 不量這個。⇒ 改用獨立的 `pair_loss`（見下）。
+       ⚠️ 連帶結論：FedCCRL 的純 SupCon 配對對齊**不可直接搬**——它沒有 `L_disp`，
+          負樣本沒被推開所以還有梯度；同一形式在本架構上死掉。
     """
     C, D, _ = prototypes.shape
     filled = (proto_count > 0).view(-1)                              # [C*D]
@@ -106,11 +115,56 @@ def comp_loss(z, labels, prototypes, proto_count, temperature=0.1):
 
     logits = (z @ flat.t()) / temperature                            # [B, F]
     logits = logits - logits.max(dim=1, keepdim=True).values.detach()  # 數值穩定
-    log_prob = logits - torch.log(torch.exp(logits).sum(dim=1, keepdim=True))
-
     pos = (labels.view(-1, 1) == proxy_cls.view(1, -1)).float()      # [B, F] 同類別即正樣本
+
+    # 每個正樣本的分母＝「它自己 ＋ 所有負樣本」，不含其他正樣本 ⇒ 正樣本之間不互相競爭。
+    # ✅ 階段 1（每樣本恰 1 個正樣本）⇒ 「自己＋全部負樣本」＝全部候選 ⇒ 與 CIDER 原形逐位相同。
+    # ★ 階段 2b（3 個正樣本）才會與共用分母版本不同，且本版才是正確的——共用分母會讓
+    #   同類別的三個畫風原型互相競爭，與 0803 §2.6.2「不可推開同類別的三個畫風原型」相反。
+    exp_logits = torch.exp(logits)
+    neg_sum = (exp_logits * (1.0 - pos)).sum(dim=1, keepdim=True)     # [B, 1] 只加負樣本
+    log_prob = logits - torch.log(exp_logits + neg_sum)               # [B, F]
+
     n_pos = pos.sum(dim=1).clamp_min(1.0)
     return -((pos * log_prob).sum(dim=1) / n_pos).mean()
+
+
+def pair_loss(z, z_clean, margin=0.92):
+    """L_pair：同一張圖的「擾動版」與「乾淨版」，特徵方向要夠接近（單邊 hinge）。
+
+        L_pair = mean( relu( margin − cos(z, z_clean.detach()) ) )
+
+    ★ 要解決什麼：1a／1a-fix 實測 `angle(z, z̃)` 停在 **27.91°**（＝類間距離的 27.5%）、
+      200 epoch 末段斜率 ≈ 0——**現有三個損失沒有任何一項在管「同一張圖的兩個風格版本要一致」**
+      （CE 只要各自分對類；L_comp 只要各自靠近原型，允許兩版本落在原型周圍的不同位置；
+      L_disp 與此無關）。這是「風格成分沒被去除」的直接原因（0813 診斷）。
+
+    ★ 為什麼不用 softmax／對比形式：見 `comp_loss` 的 ⛔ 段。softmax 量「相對排名」，
+      而 L_disp 已讓排名遙遙領先 ⇒ 飽和；我們要壓的是**絕對距離** ⇒ 需要梯度不飽和的形式。
+
+    ★ 為什麼有 margin：`1 − cos` 的最小值 0 對應「兩版本完全相同」，正是 FOOGD 警告的
+      *"strictly invariant constraints"*（會損失特徵豐富度）。hinge 把目標改成
+      「**至少要這麼近**」——`cos ≥ margin` 時損失為 0、不再施力 ⇒ 「要壓多緊」成為可控旋鈕。
+      ⚠️ margin=1.0 即退化為 FedAlign 的嚴格對齊（其 `L_RC` 是最終表徵上的 MSE；
+         在單位球上 ‖a−b‖² = 2(1−cos) ⇒ 與本式同型）。
+      現況 cos=0.884(27.91°)；0.92→23.1°、0.95→18.2°。
+
+    ⚠️⚠️ `z_clean` **必須 detach**（本函式內強制執行）：它自 0812 起帶梯度（L_disp 經它回流
+      backbone）。若不切斷，損失可靠「把 z_clean 拉向 z_aug」下降而 z_aug 不動 ⇒ 乾淨特徵被
+      擾動特徵污染 ⇒ **破壞「原型只吃乾淨特徵」這個階段 2 聚合的前提**。detach 後語意是
+      「擾動版向乾淨版靠」，乾淨版維持錨點角色。
+
+    ⚠️ 塌縮風險的可觀測指標（採用時必須同時記錄）：同類樣本兩兩夾角（1a-fix 實測 40.26°，
+       塌縮會趨近 0°）、train_acc（分類能力受損的直接訊號）。
+       架構上的緩衝：L_disp（類間 101.44°）＋ CE，兩者都要求表徵保留足夠資訊。
+
+    Args:
+        z:        [B, P] 擾動後、已 L2 正規化的投影特徵（帶梯度）
+        z_clean:  [B, P] 同一批**同一張圖**的未擾動投影特徵（函式內 detach）
+        margin:   目標餘弦相似度；cos ≥ margin 時該樣本不產生損失
+    """
+    cos = (z * z_clean.detach()).sum(dim=1)                          # [B] 兩者皆已 L2 正規化
+    return F.relu(margin - cos).mean()
 
 
 def style_loss(z, labels, centers):
@@ -247,6 +301,31 @@ def rel_loss(score_aug, score_clean, margin=0.0):
 # --------------------------------------------------------------------------- #
 # 檢測分數
 # --------------------------------------------------------------------------- #
+def residual_projector(centers):
+    """六個**類別中心張成子空間**的正交投影算子 P（[P, P]），供「面讀出」使用。
+
+    ⚠️ 六個中心**彼此不正交**（同一顆骨幹學出來的類別方向本來就有夾角）⇒ 不可用
+       `centers.t() @ centers` 直接當投影算子，必須走 pinv：
+           P = Cᵀ (C Cᵀ)⁻ C
+       否則量到的不是「到這個面的距離」，而是被中心夾角扭曲過的量。
+    """
+    return centers.t() @ torch.linalg.pinv(centers @ centers.t()) @ centers
+
+
+def residual_score(z, proj):
+    """S(x) = ‖z − P z‖：**面讀出**——z 離開「六個類別中心張成的面」有多遠。值域 [0, 1]
+    （z 在單位球上），越大越像 OOD。
+
+    與 `detection_score`（點讀出）的差別：
+      點＝到**最近一個**中心的角距離 ⇒ 問「像不像某一類」
+      面＝到**六個中心張成的整個子空間**的殘差 ⇒ 問「這張圖能不能用已知類別的方向組合表達」
+    ⇒ 一張坐在兩類「中間」的圖，點讀出看起來很遠（不像任何一類），面讀出卻很近（仍在面內）。
+
+    ⚠️ 呼叫端必須確保 z 已 L2 正規化（`backbone.project` 已內建正規化）。
+    """
+    return (z - z @ proj).norm(dim=1)
+
+
 def detection_score(z, centers):
     """S(x) = min_c arccos(z · c_c)：到最近**類別中心**的角距離。值域 [0, π]，越大越像 OOD。
 
