@@ -28,7 +28,6 @@ covariate shift to detect OOD samples」——這在 MATCHA 的 PACS/OSDG 設定
 """
 import os
 import sys
-import csv
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +39,7 @@ from sklearn.metrics import roc_auc_score
 import test_domain_ood_scores as TD
 from osdg_eval import load_backbone_diffusion
 from joint_eval_mixed_stream import score_and_predict
+from probe_io import write_csv
 
 PACS = ["art_painting", "cartoon", "photo", "sketch"]
 
@@ -176,7 +176,8 @@ def main():
             tpr_sem, _ = fpr_at_tpr(A, C, 0.95)       # ③ 的正確拒絕率（同一門檻）
 
             rows.append(dict(
-                run=args.description, leave_out=args.leave_out, node=node, own_src=own,
+                run=args.description, ckpt_epoch=str(args.ckpt_epoch),
+                leave_out=args.leave_out, node=node, own_src=own,
                 score_fn=name,
                 auroc_style_1v2=round(au_style, 4),
                 auroc_semantic_1v3=round(au_sem, 4),
@@ -216,13 +217,7 @@ def main():
               f"正確拒絕={mean('tpr_semantic_at_src95'):.4f}")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
-    write_header = not os.path.exists(args.output_csv)
-    with open(args.output_csv, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        if write_header:
-            w.writeheader()
-        w.writerows(rows)
-    print(f"\nAppended {len(rows)} rows to {args.output_csv}")
+    write_csv(args.output_csv, list(rows[0].keys()), rows)
 
 
 if __name__ == "__main__":

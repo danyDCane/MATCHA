@@ -49,13 +49,17 @@ def load_backbone_diffusion(ckpt_path, device):
 
 @torch.no_grad()
 def score_and_predict(backbone, diffusion, loader, diff_steps, score_type, device,
-                      return_proto=False, return_proto_full=False):
+                      return_proto=False, return_proto_full=False, return_zperp=False):
     """Returns per-sample: diffusion score, MSP, energy-confidence(logsumexp), pred, label.
 
     return_proto=True 時**額外**回傳第 6 個元素：原型角距離 S(x)=min_c arccos(z·c_c)
     （階段 1 的檢測讀出，0803 §2.2）。預設 False ⇒ 既有 7 個呼叫點的回傳數量完全不變。
 
     return_proto_full=True 時再**額外**回傳一個 [N, C] 的**完整角距離矩陣**（到每個類別中心）。
+
+    return_zperp=True 時再**額外**回傳「面讀出」`‖z⊥‖`＝`dood.prototype.residual_score`
+    （z 到六個類別中心張成子空間的殘差範數）。與 `return_proto` 的「點」是同一顆骨幹、同一次
+    前向、同一個 z ⇒ **換讀出是單一變因比較**。
     ⚠️ 為什麼需要完整矩陣：檢測分數取的是 `min_c`，它分不出「特徵散開」與「特徵跑到別的
        類別去」。一個 cartoon 的狗若被推到馬的群附近，`min_c` 量到的是「到馬中心」的距離
        （看起來很近、很正常），只有「到**狗**中心」的距離才會揭露它跑掉了。
@@ -65,17 +69,20 @@ def score_and_predict(backbone, diffusion, loader, diff_steps, score_type, devic
        covariate-shifted ID 到每個小群都有 r_見過 的距離，而坐在小群上的來源樣本距離≈0
        ⇒ 分數本身就在製造畫風 AUROC 的落差（0803 §2.2 的框）。
     """
-    centers = None
-    _need_proto = return_proto or return_proto_full
+    centers = proj = None
+    _need_proto = return_proto or return_proto_full or return_zperp
     if _need_proto:
         if not hasattr(backbone, 'prototypes'):
             raise RuntimeError(
                 "return_proto/return_proto_full=True 但 checkpoint 沒有 prototypes buffer——"
                 "該 run 不是用 --use_proto_reg 訓練的。")
-        from dood.prototype import class_centers
+        from dood.prototype import class_centers, residual_projector, residual_score
         centers = class_centers(backbone.prototypes, backbone.proto_count)
+        if return_zperp:
+            proj = residual_projector(centers)
     d_sc, msp, en, preds, labels, proto_sc = [], [], [], [], [], []
     proto_all = []
+    zperp_sc = []
     for batch in loader:
         data, y, _ = util.unpack_batch(batch)
         data = data.to(device)
@@ -96,8 +103,11 @@ def score_and_predict(backbone, diffusion, loader, diff_steps, score_type, devic
         if _need_proto:
             # 與 dood.prototype.detection_score 同一條式子（含相同 clamp），確保
             # `ang.min(1)` 與 detection_score 的輸出逐位一致。
-            _cos = (backbone.project(vec) @ centers.t()).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+            _z = backbone.project(vec)                                  # 已 L2 正規化
+            _cos = (_z @ centers.t()).clamp(-1.0 + 1e-7, 1.0 - 1e-7)
             _ang = torch.arccos(_cos)                                   # [B, C]
+            if return_zperp:
+                zperp_sc.append(residual_score(_z, proj).cpu().numpy())
             if return_proto:
                 proto_sc.append(_ang.min(dim=1).values.cpu().numpy())
             if return_proto_full:
@@ -108,6 +118,8 @@ def score_and_predict(backbone, diffusion, loader, diff_steps, score_type, devic
         out = out + (np.concatenate(proto_sc),)
     if return_proto_full:
         out = out + (np.concatenate(proto_all, axis=0),)
+    if return_zperp:
+        out = out + (np.concatenate(zperp_sc),)
     return out
 
 

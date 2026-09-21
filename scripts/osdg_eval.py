@@ -90,13 +90,18 @@ def load_backbone_diffusion(ckpt_path, num_classes, device):
     return backbone, diffusion
 
 
-def compute_avg_bn_buffers(ckpt_paths, num_classes, device):
+def compute_avg_bn_buffers(ckpt_paths, num_classes, device, var_mode="merged"):
     """Average BN running_mean/running_var across all node checkpoints (offline global fusion).
 
     Only running stats are averaged; num_batches_tracked is left alone (it does not participate
     in eval-mode normalization). Mirrors the all-avg candidate in scripts/bn_signal_gating.py.
     """
+    # ⚠️ 兩種變體（0819b §0.2，引用時必須標明）：
+    #   A 樸素平均      mean(running_var)            ← 低估（忽略節點間均值離散度）
+    #   B 合併變異數    mean(var_i+mean_i²)−mean(mean_i)²  ← 「9 份資料視為一個大批次」的正確值
+    # 既有報告一律以 B 為主，故預設 B；--avg_bn_var naive 可退回 A 重現舊行為。
     acc, n = None, 0
+    per_node = []
     for p in ckpt_paths:
         if not os.path.exists(p):
             continue
@@ -104,8 +109,13 @@ def compute_avg_bn_buffers(ckpt_paths, num_classes, device):
         cur = {k: v.detach().clone().float()
                for k, v in bb.named_buffers()
                if k.endswith(("running_mean", "running_var"))}
+        per_node.append(cur)
         if acc is None:
-            acc = cur
+            # ⚠️ 必須 clone：`acc = cur` 會讓 acc 與 per_node[0] 共用張量，後面的 in-place
+            #    `acc[k] += ...` / `acc[k] /= n` 會把 per_node[0] 改成「全節點平均」，
+            #    導致下方 merged 變異數公式的第 0 項用錯值（2026-09-04 實測：running_var
+            #    最大逐元素差 0.79、部署 AUROC 偏移 ~0.003、closed_acc 偏移 ~0.36pp）。
+            acc = {k: v.clone() for k, v in cur.items()}
         else:
             for k in acc:
                 acc[k] += cur[k]
@@ -115,7 +125,16 @@ def compute_avg_bn_buffers(ckpt_paths, num_classes, device):
         raise RuntimeError("compute_avg_bn_buffers: no checkpoint loaded")
     for k in acc:
         acc[k] /= n
-    print(f"[avg_bn] averaged {len(acc)} BN buffers over {n} nodes")
+    if var_mode == "merged" and per_node:
+        for k in list(acc):
+            if not k.endswith("running_var"):
+                continue
+            mk = k.replace("running_var", "running_mean")
+            import torch as _t
+            mi = _t.stack([d[mk] for d in per_node])          # [N, C]
+            vi = _t.stack([d[k] for d in per_node])
+            acc[k] = (vi + mi ** 2).mean(0) - mi.mean(0) ** 2  # B：合併變異數
+    print(f"[avg_bn] averaged {len(acc)} BN buffers over {n} nodes (var_mode={var_mode})")
     return acc
 
 
@@ -184,6 +203,9 @@ def main():
                    help="offline global BN fusion: average running_mean/var across ALL nodes, "
                         "write back into every node before eval. topo gets an '_avgbn' suffix so "
                         "rows never collide with the keep-local baseline. Post-hoc only, no retrain.")
+    p.add_argument("--avg_bn_var", default="merged", choices=["merged", "naive"],
+                   help="--avg_bn 的變異數合併法（0819b §0.2）：merged=B 合併變異數"
+                        "（mean(var+mean^2)-mean(mean)^2，既有報告主用）；naive=A 樸素平均。")
     p.add_argument("--num_nodes", type=int, default=0,
                    help="0=centralized (nodes=source domains, ckpt {desc}_{domain}); "
                         ">0=P2P virtual-node (nodes=node_0..node_{N-1}, ckpt {desc}_node_{i})")
@@ -211,8 +233,8 @@ def main():
     if args.avg_bn:
         avg_bn = compute_avg_bn_buffers(
             [os.path.join(args.checkpoint_dir, f"{args.description}_{n}_{suffix}.pth")
-             for n in node_keys], args.num_classes, device)
-        topo = f"{topo}_avgbn"
+             for n in node_keys], args.num_classes, device, var_mode=args.avg_bn_var)
+        topo = f"{topo}_avgbn" if args.avg_bn_var == "merged" else f"{topo}_avgbnA"
 
     rows = []
     for node in node_keys:
@@ -231,8 +253,17 @@ def main():
 
         # Test set = unseen/leave_out domain, FULL (all 7 classes incl. person=unknown).
         loader = TD.load_pacs_test_data(root, args.leave_out, args.batch_size, args.num_workers)[0]
-        d_sc, msp, en, pred, lab = score_and_predict(
-            backbone, diffusion, loader, diff_steps, args.ood_eval_scores_type, device)
+        # 階段 1 起：checkpoint 若含 prototypes buffer，多算角距離讀出 S(x)=min_c arccos(z·c_c)
+        # （0803 §2.2）。同模型上與 msp/energy 並排 ⇒ 換讀出是單一變因比較。
+        # 2026-09-09 起同時算「面」讀出 zperp＝‖z−Pz‖（dood.prototype.residual_score）。
+        # ⚠️ 只是**多量一個讀出**，proto_angle 一列原樣保留 ⇒ 既有 OSCR 數字不受影響。
+        _has_proto = hasattr(backbone, "prototypes")
+        _o = score_and_predict(
+            backbone, diffusion, loader, diff_steps, args.ood_eval_scores_type, device,
+            return_proto=_has_proto, return_zperp=_has_proto)
+        d_sc, msp, en, pred, lab = _o[:5]
+        proto = _o[5] if _has_proto else None
+        zperp = _o[6] if _has_proto else None
 
         known = lab != args.unknown_idx
         unk = ~known
@@ -241,7 +272,17 @@ def main():
               f"closed-set 6-way known acc (no reject) = {closed_acc:.4f}")
 
         # reject_score: HIGHER = more OOD. diffusion already higher=OOD; MSP/energy higher=ID -> negate.
-        for name, rej in [("diffusion", d_sc), ("msp", -msp), ("energy", -en)]:
+        # checkpoint 可能沒有 diffusion（USE_OOD=0，載入端第 42 行已支援）⇒ d_sc 全 NaN、
+        # roc_auc_score 會拋 ValueError。有 diffusion 時順序與行為完全不變。
+        # reject score: 高 = 越像 OOD。角距離與 diffusion 本來就是；msp/energy 取負號。
+        _scores = [("msp", -msp), ("energy", -en)]
+        if diffusion is not None:
+            _scores.insert(0, ("diffusion", d_sc))
+        if proto is not None:
+            _scores.append(("proto_angle", proto))          # 點：到最近類別中心的角距離
+        if zperp is not None:
+            _scores.append(("zperp", zperp))                # 面：到六中心張成子空間的殘差
+        for name, rej in _scores:
             oscr = compute_oscr(rej, pred, lab, args.unknown_idx)
             hbest, accK, accU = compute_hscore_best(rej, pred, lab, args.unknown_idx)
             det_auroc = float(roc_auc_score(unk.astype(int), rej))   # unknown=positive=OOD

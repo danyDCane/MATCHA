@@ -137,15 +137,38 @@ def main():
         del backbone
 
     pairs = list(itertools.combinations(range(args.num_nodes), 2))
+
+    # ---- 階段 2a 的聚合訊噪比（0813 dany）------------------------------------
+    # 訊號 = 聚合把類別中心從「本地畫風」移到「中立」的距離（用全部樣本算，無窗口噪聲）
+    # 噪聲 = 用 k 個樣本算出的聚合中心，離「全部樣本算出的聚合中心」有多遠
+    # ⇒ 訊噪比決定「拉向中立中心」這個訓練目標，指的方向有多少是真的、多少是亂飄。
+    def aggregate(Pd):
+        """模擬 MH 共識收斂後的全域平均（9 節點同類別原型平均後再正規化）。"""
+        S = np.stack([Pd[f"node_{i}"] for i in range(args.num_nodes)])   # [N, C, P]
+        G = np.nanmean(S, axis=0)
+        return G / np.clip(np.linalg.norm(G, axis=1, keepdims=True), 1e-12, None)
+
+    _rng0 = np.random.default_rng(args.probe_seed)
+    P_true = {f"node_{i}": protos_from_subsample(*feats[f"node_{i}"], C, 0, _rng0)
+              for i in range(args.num_nodes)}
+    G_true = aggregate(P_true)
+    signal = float(np.nanmean([angle_deg(G_true[c], P_true[f"node_{i}"][c])
+                               for i in range(args.num_nodes) for c in range(C)]))
+    print(f"\n[聚合訊號] 全域中立中心 vs 各節點本地中心的夾角 = {signal:.2f}° "
+          f"（用全部樣本算，不含窗口噪聲）")
+
     rows = []
-    print(f"\n{'k(等效樣本)':>12}{'proto_m':>9}{'同畫風對':>10}{'跨畫風對':>10}{'畫風超額':>10}   (度)")
+    print(f"\n{'k(等效樣本)':>12}{'proto_m':>9}{'同畫風對':>10}{'跨畫風對':>10}{'畫風超額':>10}"
+          f"{'聚合後噪聲':>12}{'聚合訊噪比':>12}   (度)")
     for k in ks:
         rng = np.random.default_rng(args.probe_seed)
-        within_r, cross_r = [], []
+        within_r, cross_r, agg_noise_r = [], [], []
         percls = {c: [] for c in range(C)}
         for _ in range(args.repeats):
             P = {f"node_{i}": protos_from_subsample(*feats[f"node_{i}"], C, k, rng)
                  for i in range(args.num_nodes)}
+            G_k = aggregate(P)
+            agg_noise_r.append(float(np.nanmean([angle_deg(G_k[c], G_true[c]) for c in range(C)])))
             for i, j in pairs:
                 a, b = P[f"node_{i}"], P[f"node_{j}"]
                 angs = [angle_deg(a[c], b[c]) for c in range(C)]
@@ -156,12 +179,16 @@ def main():
                         if not np.isnan(angs[c]):
                             percls[c].append(angs[c])
         w, x = float(np.mean(within_r)), float(np.mean(cross_r))
+        an = float(np.mean(agg_noise_r))
+        snr = signal / an if an > 1e-9 else float('inf')
         tag = f"{k}" if k > 0 else "全部"
         mtag = f"{m_of_k[k]:.3f}" if k in m_of_k else ("—" if k <= 0 else "—")
-        print(f"{tag:>12}{mtag:>9}{w:>10.2f}{x:>10.2f}{x - w:>10.2f}")
+        print(f"{tag:>12}{mtag:>9}{w:>10.2f}{x:>10.2f}{x - w:>10.2f}{an:>12.2f}{snr:>12.2f}")
         rows.append(dict(run=args.description, k=tag, proto_m_equiv=mtag,
                          within_domain_deg=round(w, 4), cross_domain_deg=round(x, 4),
-                         style_excess_deg=round(x - w, 4), repeats=args.repeats,
+                         style_excess_deg=round(x - w, 4),
+                         agg_signal_deg=round(signal, 4), agg_noise_deg=round(an, 4),
+                         agg_snr=round(snr, 3), repeats=args.repeats,
                          **{f"within_cls{c}_deg": round(float(np.mean(percls[c])), 4)
                             for c in range(C) if percls[c]}))
 

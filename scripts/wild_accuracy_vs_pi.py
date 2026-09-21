@@ -1,4 +1,11 @@
 """
+⚠️ 2026-09-08 命名更正：本檔算的量已更名為 **開集準確率 OSA(π)**（見
+   `scripts/open_set_accuracy.py` 的血緣說明：SCOD ICLR'24 ＋ AUGRC NeurIPS'24）。
+   「wild accuracy」一詞停用——文獻中 wild data 指訓練用的無標籤混合資料（SCONE ICML'23），
+   與本指標無關。檔名保留僅為不破壞既有引用。
+   ⚠️ 本檔與 open_set_accuracy.py 的差別：本檔的 OOD 源是 far-OOD（textures/svhn/noise）、
+   門檻定在**目標域**分數上；後者的 OOD 源是同域未知類別（person）、門檻定在**來源域**上。
+
 Wild-accuracy vs OOD-contamination (pi) — intuitive "value of having OOD detection".
 
 Story: a DG model deployed on a WILD stream = (1-pi)*ID(target domain) + pi*far-OOD.

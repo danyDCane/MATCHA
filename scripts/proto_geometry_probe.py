@@ -31,7 +31,6 @@
 """
 import os
 import sys
-import csv
 import argparse
 import itertools
 
@@ -42,6 +41,7 @@ import numpy as np
 import torch
 
 from prototype_drift_probe import angle_deg, relative_divergence
+from probe_io import write_csv
 
 PACS = ["art_painting", "cartoon", "photo", "sketch"]
 
@@ -171,15 +171,11 @@ def main():
                          value=v, detail=f"n_tensor={len(keys)}"))
 
     os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)
-    new = not os.path.exists(args.output_csv)
-    with open(args.output_csv, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["run", "metric", "node", "own_src", "value", "detail"])
-        if new:
-            w.writeheader()
-        for r in rows:
-            r["run"] = args.description
-            w.writerow(r)
-    print(f"\nAppended {len(rows)} rows to {args.output_csv}")
+    for r in rows:
+        r["run"] = args.description
+        r["ckpt_epoch"] = str(args.ckpt_epoch)
+    write_csv(args.output_csv,
+              ["run", "ckpt_epoch", "metric", "node", "own_src", "value", "detail"], rows)
 
 
 if __name__ == "__main__":
