@@ -1,0 +1,72 @@
+########################
+# Python ignores
+########################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.Python
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+
+########################
+# Virtual environment for MATCHA
+########################
+venv_matcha/
+env/
+venv/
+.venv/
+
+########################
+# Editor / OS files
+########################
+.vscode/
+.idea/
+*.swp
+*.swo
+*.DS_Store
+wandb/
+*.sh
+**/ExpDescription
+expdescription
+
+########################
+# MATCHA run artifacts
+########################
+*.log
+*.out
+*.err
+*.txt
+
+# Large result checkpoints (do not track in git)
+# 所有實驗結果資料夾中的模型權重，不進 git
+exp_result*/**/*.pth
+exp_result*/**/*.pt
+exp_result*/**/*.ckpt
+
+results/
+*.csv
+*.npz
+*.npy
+*.pkl
+*.json
+*.png
+*.pdf
+*.svg
+*.eps
+*.tiff
+*.webp
+*.ico
+*.bmp
+*.gif
+*.jp
+
+research/
+
