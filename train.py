@@ -558,6 +558,29 @@ def run(num_domains):
         async_diag_writer.writerow(['step', 'epoch', 'domain', 'delta', 'thresh', 'gamma', 'fired', 'forced',
                                     'n_pushed', 'n_received', 'mean_staleness', 'n_style_nb', 'mean_style_age',
                                     'mean_style_dist'])
+        # ===== [plan 1001 階段一] 原型交換＋影子記錄（預設關閉；開啟不改任何決策）=====
+        shadow_on = bool(getattr(args, 'shadow_signals', False))
+        shadow_f = shadow_writer = None
+        shadow_max_deg = 0
+        if shadow_on:
+            if not bool(getattr(args, 'use_proto_reg', False)):
+                raise RuntimeError("--shadow_signals requires --use_proto_reg (needs model.prototypes).")
+            communicator.proto_configure(
+                own_col={_d: proto_dom_index[node_to_domain.get(_d, _d)] for _d in domain_names},
+                n_cls=num_classes, n_sty=len(proto_domain_list), proto_dim=_pdim)
+            shadow_max_deg = max((len(v) for v in communicator.domain_adj.values()), default=0)
+            shadow_f = open(_os.path.join(_diag_dir, 'shadow_signals.csv'), 'w', newline='')
+            shadow_writer = _csv.writer(shadow_f)
+            shadow_writer.writerow(
+                ['step', 'epoch', 'domain', 'is_warm', 'sig_r0', 'sig_r1', 'fired', 'forced',
+                 'n_pushed', 'n_received', 'cells_filled', 'age_mean', 'age_max', 'proto_bytes',
+                 'ns_0', 'ns_1', 'ns_2']
+                + [f'r2c_e{j}' for j in range(shadow_max_deg)]
+                + [f'r2cC_e{j}' for j in range(shadow_max_deg)]
+                + [f'ncom_e{j}' for j in range(shadow_max_deg)])
+            print(f"[SHADOW] prototype exchange + 3-signal shadow logging ON. "
+                  f"store=[{num_classes},{len(domain_names)},{_pdim}] max_deg={shadow_max_deg} "
+                  f"⇒ decisions UNCHANGED (rule 0 only); scores must be bit-identical.", flush=True)
         _stage = "Stage2: model+style async" if async_style_enabled else "Stage1: model-only, style stays sync"
         print(f"[ASYNC] event-trigger enabled: tau={args.trigger_threshold}, gamma_mode={async_gamma_mode}, "
               f"max_interval={args.trigger_max_interval} ({_stage})", flush=True)
@@ -1710,6 +1733,10 @@ def run(num_domains):
                 else:
                     _gamma = 1.0
                 fired, delta, forced, _thresh = communicator.should_broadcast(domain, model, k, gamma=_gamma)
+                # ★ 影子訊號必須在 push／receive **之前**算——與規則 0 同一個決策點
+                #   （規則 0 的 _param_delta 讀的是 push 時才更新的 last_broadcast_params）
+                _shadow = (communicator.shadow_signals(domain, model, k)
+                           if shadow_on and hasattr(model, 'prototypes') else None)
                 n_pushed = communicator.push_to_neighbors(
                     domain, model, k,
                     style_vec=(style_vecs_dict.get(domain) if async_style_enabled else None)
@@ -1738,8 +1765,26 @@ def run(num_domains):
                                             int(bool(fired)), int(bool(forced)),
                                             n_pushed, len(_ages), f"{_mean_stale:.2f}",
                                             _n_style_nb, f"{_mean_style_age:.2f}", f"{_mean_style_dist:.4f}"])
+                if _shadow is not None:
+                    _ep = (k // STEPS_PER_EPOCH) + 1
+                    _pad = lambda L: list(L) + [None] * (shadow_max_deg - len(L))
+                    _f4 = lambda L: [('' if v is None else f"{v:.4f}") for v in _pad(L)]
+                    _fi = lambda L: [('' if v is None else int(v)) for v in _pad(L)]
+                    shadow_writer.writerow(
+                        [k, _ep, domain,
+                         int(_ep <= int(getattr(args, 'proto_warmup_epochs', 10))),
+                         f"{delta:.6e}",
+                         ('' if _shadow['sig_r1'] == float('inf') else f"{_shadow['sig_r1']:.4f}"),
+                         int(bool(fired)), int(bool(forced)), n_pushed, len(_ages),
+                         _shadow['cells_filled'], f"{_shadow['age_mean']:.2f}",
+                         f"{_shadow['age_max']:.2f}", _shadow['proto_bytes']]
+                        + list(_shadow['ns'])
+                        + _f4(_shadow['r2c']) + _f4(_shadow['r2c_common'])
+                        + _fi(_shadow['n_common']))
                 if (k + 1) % STEPS_PER_EPOCH == 0:
                     async_diag_f.flush()
+                    if shadow_f is not None:
+                        shadow_f.flush()
 
         # ========== 第三阶段：交换训练后的模型参数 ==========
         # Exchange updated model parameters after training step
@@ -2616,6 +2661,12 @@ if __name__ == "__main__":
                         help='Margin for L_rel. Start at 0 (pure one-sided suppression). GorD appendix values '
                              '([0.7,0.5,0.2] / [10,5,5]) are energy-scale and differ 25x => NOT transferable; '
                              'our score is arccos with range [0, pi].')
+    parser.add_argument('--shadow_signals', action='store_true',
+                        help='[plan 1001 階段一] 原型跨節點交換＋三訊號影子記錄。'
+                             '⚠️ 只記錄、**不改任何決策**：觸發仍由 _param_delta（規則 0）決定。'
+                             '原型表住 communicator、不進 checkpoint、不碰 model.prototypes ⇒ '
+                             '開啟後成績應與未開啟時**逐位相同**（plan R1 主判準）。'
+                             '需要 --use_proto_reg 與 --async_trigger。')
     parser.add_argument('--proto_warmup_epochs', type=int, default=10,
                         help='Epochs during which prototype losses are disabled (prototypes still accumulate). '
                              'Early features are near-random, so pulling toward a near-random prototype injects '

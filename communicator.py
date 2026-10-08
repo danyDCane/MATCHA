@@ -2,6 +2,7 @@ import numpy as np
 import time
 import math
 import torch
+import torch.nn.functional as F
 from mpi4py import MPI
 from compressors import get_top_k
 from typing import Dict
@@ -923,6 +924,150 @@ class SingleProcessCommunicator(object):
         self.style_pipeline = _deque([{d: {} for d in self.domain_to_idx} for _ in range(_kd)], maxlen=_kd)
         self.style_latest = {}  # sender -> 最新已 push 的自風格向量（供 style_buffer_dist 量 staleness 造成的風格值偏離）
 
+    def proto_configure(self, own_col, n_cls=6, n_sty=3, proto_dim=128):
+        """原型共識觸發器 階段一：建立原型表與影子訊號的狀態（plan 1001 §5.1）。
+
+        ⚠️ **本方法完全不影響訓練**：原型表住在 communicator、不進 checkpoint、不碰
+           `model.prototypes`／`proto_count`（plan D2／D7）。只有 `--shadow_signals` 開啟時呼叫。
+
+        Args:
+            own_col: {domain: int}  該節點的來源畫風索引（0..n_sty-1），由 train.py 的
+                     `proto_dom_index[node_to_domain[domain]]` 提供——**不可由 proto_count argmax
+                     推導**，因為 step 0 時所有格都是 0、argmax 會給出錯的欄。
+        """
+        self.proto_enabled = True
+        self.proto_own_col = dict(own_col)
+        self.proto_n_cls, self.proto_dim = int(n_cls), int(proto_dim)
+        self.proto_n_sty = int(n_sty)
+        doms = sorted(self.domain_to_idx.keys(), key=lambda d: self.domain_to_idx[d])
+        self.proto_n_node = len(doms)
+        dev = None
+        # store[類別, 產出者節點, 維度]：每格＝我手上「該節點產出」的最新原型（plan D1）
+        self.proto_store = {d: torch.zeros(self.proto_n_cls, self.proto_n_node, self.proto_dim)
+                            for d in doms}
+        # stamp[類別, 產出者節點]：該格的值是「**產出者的**第幾步」產生的；0 ＝ 從未收到（plan §5.3）
+        self.proto_stamp = {d: torch.zeros(self.proto_n_cls, self.proto_n_node, dtype=torch.long)
+                            for d in doms}
+        self.proto_cnt = {d: torch.zeros(self.proto_n_cls, self.proto_n_node) for d in doms}
+        self.proto_ref = {d: None for d in doms}    # 規則 1：我上次廣播時的自有類別中心 [C, P]
+        # 規則 2c：存**對方當時的 store+stamp**，不只存導出的 G。
+        # 🚨 為什麼要存原始表（matcha-6a 2026-10-01 指出的「可見集合」零點問題）：
+        #    ∠(G_i, G_j) 的差有兩個來源 (a) 值真的不同（要的）(b) **兩邊看得到的 owner 集合不同**（不要的）。
+        #    node_8 沒有 art 鄰居 ⇒ art 轉傳到達前它的 G 是「兩個畫風的平均」、別人是三個
+        #    ⇒ **一階偏差、不是雜訊** ⇒ 訊號又會編碼圖結構。
+        #    存原始 stamp ⇒ 本地就能算「共同可見集合」⇒ 零點天生是 0。**不需要改通訊協定**。
+        self.proto_gj = {d: {} for d in doms}       # {sender: (store, stamp)}
+        self.proto_last_bytes = {d: 0 for d in doms}
+
+    @staticmethod
+    def _own_centers(model):
+        """model.prototypes/proto_count → [C, P] 類別中心（＝部署讀出用的那組）。"""
+        from dood.prototype import class_centers
+        return class_centers(model.prototypes.detach(), model.proto_count.detach())
+
+    def _proto_sync_own(self, domain, model, step):
+        """把自己那欄同步成當下原型、stamp 設為當下 step（回傳 temp 副本，不改 self）。
+
+        ⚠️ 回傳副本而非就地改：`shadow_signals` 要在**決策點**算「我當下的估計」，
+           但 self.proto_store 的自有欄只在真的 push 時才更新（才是鄰居看到的值）。
+        """
+        i = self.domain_to_idx[domain]
+        col = self.proto_own_col[domain]
+        st = self.proto_store[domain].clone()
+        sp = self.proto_stamp[domain].clone()
+        cn = self.proto_cnt[domain].clone()
+        own = model.prototypes.detach()[:, col, :].to(st.device, st.dtype)
+        has = (model.proto_count.detach()[:, col] > 0).to(st.device)
+        st[:, i, :] = own
+        sp[:, i] = torch.where(has, torch.full_like(sp[:, i], int(step)), sp[:, i])
+        cn[:, i] = model.proto_count.detach()[:, col].to(cn.device, cn.dtype)
+        return st, sp, cn
+
+    def _global_centers(self, store, stamp, only=None):
+        """全域類別中心：**兩層平均**——先同畫風三節點、再跨三畫風（plan D6）。
+
+        Args:
+            only: **[n_cls, n_node] bool**，若給則只採計這些格（供「共同可見集合」口徑用）。
+                  ⚠️ 2026-10-02 由 [n_node] 改為逐類別：`matcha-02` 指出原本的 `only` 是
+                  「對類別 OR 過」的節點級遮罩，而本函式內部是**逐類別**過濾 `stamp[c,k]>0`
+                  ⇒ 粒度不一致 ⇒ 若某 owner 的某幾類我看得到、鄰居看不到（原型表是
+                  `update_prototypes_` 逐 (類別,畫風) 格 EMA 填的，稀疏拓撲下是常態），
+                  共同可見口徑**完全沒修到**（實測仍與原始口徑同為 19.93°）。
+
+        為什麼兩層：一個畫風有 n_node/n_sty 個節點。若所有格一視同仁平均，而我只聽到
+        1 個該畫風的節點，那個畫風的權重就會變成 1/(聽到的總格數) 而不是 1/n_sty。
+        兩層讓**畫風權重與「我聽到幾個該畫風的節點」無關**——部分可見性不均勻時正是要害。
+        """
+        per = self.proto_n_node // self.proto_n_sty
+        out = []
+        for c in range(self.proto_n_cls):
+            ms = []
+            for sty in range(self.proto_n_sty):
+                ks = [k for k in range(sty * per, (sty + 1) * per)
+                      if stamp[c, k] > 0 and (only is None or bool(only[c, k]))]
+                if ks:
+                    ms.append(F.normalize(store[c, ks].mean(0), dim=0))
+            out.append(F.normalize(torch.stack(ms).mean(0), dim=0) if ms
+                       else torch.zeros(self.proto_dim, dtype=store.dtype, device=store.device))
+        return torch.stack(out)
+
+    @torch.no_grad()
+    def shadow_signals(self, domain, model, step):
+        """三個觸發訊號（plan §5.5）。**只記錄、不影響任何決策**；規則 0 仍是唯一真的動作。
+
+        回傳 dict：
+          sig_r1   規則 1＝自有類別中心 vs **我上次廣播時**的自有中心（逐類別平均夾角，度）
+          r2c      規則 2c＝我的全域估計 vs **每個鄰居上次連絡時**的全域估計 —— **逐條邊的 list**
+                   ⚠️ 刻意不在 run 內合併（plan D11）：度數 2–8 ⇒ mean 讓高度數節點少觸發、
+                      max 讓它多觸發，兩者都讓訊號編碼圖結構而非學習狀態。記原始值 ⇒ 離線任選。
+          cells_filled / age_mean / age_max  原型表狀態（age 不含自有欄）
+        """
+        st, sp, cn = self._proto_sync_own(domain, model, step)
+        i = self.domain_to_idx[domain]
+        C = self._own_centers(model).to(st.device, st.dtype)          # [C, P]
+        ref = self.proto_ref.get(domain)
+        if ref is None:
+            sig_r1 = float('inf')
+        else:
+            cos = (F.normalize(C, dim=1) * F.normalize(ref.to(C.device, C.dtype), dim=1)).sum(1)
+            sig_r1 = float(torch.rad2deg(torch.arccos(cos.clamp(-1 + 1e-7, 1 - 1e-7))).mean())
+        G = self._global_centers(st, sp)
+        _ang = lambda A, B: float(torch.rad2deg(torch.arccos(
+            ((F.normalize(A, dim=1) * F.normalize(B, dim=1)).sum(1)).clamp(-1 + 1e-7, 1 - 1e-7))).mean())
+        vis_i = (sp > 0).any(0)                       # [n_node] 我看得到哪些 owner（**對類別 OR**，只供 ns 診斷用）
+        vis_ic = (sp > 0)                             # [n_cls, n_node] 逐格可見性（共同可見口徑用這個）
+        r2c, r2c_common, n_common = [], [], []
+        for nb in sorted(self.domain_adj.get(domain, [])):
+            gj = self.proto_gj[domain].get(nb)
+            if gj is None:
+                r2c.append(None); r2c_common.append(None); n_common.append(None)
+                continue
+            Sj, Pj = gj
+            # ① 原始口徑：兩邊各用自己看得到的全部 owner ⇒ **含「可見集合不同」的汙染**
+            r2c.append(_ang(G, self._global_centers(Sj, Pj).to(G.device, G.dtype)))
+            # ② 共同可見口徑：只採計雙方都看得到的 owner ⇒ **零點天生是 0**
+            # ⚠️ 必須逐格 AND（不可對類別先 OR）—— 見 _global_centers 的 only 說明
+            comm = vis_ic & (Pj > 0).to(vis_ic.device)            # [n_cls, n_node]
+            # ncom 記「六類全部都共同可見」的 owner 數：粒度一致時等於舊語意，
+            # 不一致時會掉下來 ⇒ 本身就是「粒度錯配正在發生」的診斷訊號
+            n_common.append(int(comm.all(0).sum()))
+            if comm.any():
+                r2c_common.append(_ang(self._global_centers(st, sp, only=comm),
+                                       self._global_centers(Sj, Pj, only=comm).to(G.device, G.dtype)))
+            else:
+                r2c_common.append(None)
+        # 每個畫風聽到幾個 owner（偏差診斷：n_s=0 ⇒ G 少一個畫風 ⇒ 一階偏差、與變異無關）
+        _per = self.proto_n_node // self.proto_n_sty
+        ns = [int(vis_i[sty * _per:(sty + 1) * _per].sum()) for sty in range(self.proto_n_sty)]
+        mask = sp > 0
+        mask[:, i] = False                      # age 不含自有欄（自有欄恆為當下 step）
+        ages = (int(step) - sp[mask]).float() if mask.any() else torch.zeros(1)
+        return {'sig_r1': sig_r1, 'r2c': r2c, 'r2c_common': r2c_common,
+                'n_common': n_common, 'ns': ns,
+                'cells_filled': int((sp > 0).sum()),
+                'age_mean': float(ages.mean()), 'age_max': float(ages.max()),
+                'proto_bytes': self.proto_last_bytes.get(domain, 0)}
+
     def async_init_snapshot(self, models_dict):
         """ŵ_i = 目前 backbone 參數（訓練開始前呼叫一次，建立觸發比對基準）。"""
         self.last_broadcast_params = {}
@@ -976,6 +1121,27 @@ class SingleProcessCommunicator(object):
             bn_buf = {n: b.data.clone() for n, b in model.named_buffers()
                       if n.endswith(("running_mean", "running_var"))}
         msg = {'backbone': backbone, 'diffusion': diffusion, 'bn': bn_buf, 'push_step': step}
+        # 原型表（plan §5.2）：搭現有廣播事件的便車、**不新增通訊事件**。整張表送出才支援轉傳
+        # ——實測 node_8 沒有 art 鄰居，只送自有欄它永遠拿不到 art。28.3 KB／46.1 MB ＝ 0.061%。
+        if getattr(self, 'proto_enabled', False) and hasattr(model, 'prototypes'):
+            i = self.domain_to_idx[domain]
+            col = self.proto_own_col[domain]
+            _own = model.prototypes.detach()[:, col, :]
+            _has = (model.proto_count.detach()[:, col] > 0)
+            self.proto_store[domain][:, i, :] = _own.to(self.proto_store[domain].device,
+                                                        self.proto_store[domain].dtype)
+            _sp = self.proto_stamp[domain][:, i]
+            self.proto_stamp[domain][:, i] = torch.where(
+                _has.to(_sp.device), torch.full_like(_sp, int(step)), _sp)
+            self.proto_cnt[domain][:, i] = model.proto_count.detach()[:, col].to(
+                self.proto_cnt[domain].device, self.proto_cnt[domain].dtype)
+            msg['proto'] = {'store': self.proto_store[domain].clone(),
+                            'stamp': self.proto_stamp[domain].clone(),
+                            'cnt': self.proto_cnt[domain].clone()}
+            self.proto_last_bytes[domain] = (msg['proto']['store'].numel() * msg['proto']['store'].element_size()
+                                             + msg['proto']['stamp'].numel() * msg['proto']['stamp'].element_size()
+                                             + msg['proto']['cnt'].numel() * msg['proto']['cnt'].element_size())
+            self.proto_ref[domain] = self._own_centers(model).clone()   # 規則 1 的參照物
         neighbors = self.domain_adj.get(domain, [])
         style_msg = None
         if self.async_style_enabled and style_vec is not None:
@@ -1068,6 +1234,27 @@ class SingleProcessCommunicator(object):
                                        (buf_orig if agg_bn else None), msg, step)
                 w_sum += w_ij
                 ages.append(step - msg['push_step'])
+                # ── 原型合併（plan §5.3）：逐格比 stamp、新蓋舊、**自己那欄永不被覆蓋**。
+                #    ⛔ 刻意**不走上面的 MH 平均**：若 A 的值經兩條路徑到我，平均會讓 A 權重變 2。
+                #       取最新 ⇒ 每個產出者恰好被算一次 ⇒ 兩個資訊相同的節點算出相同的全域估計。
+                #    語意沿用既有 style_inbox（持久、覆蓋式、不 consume），不是 inbox 的 consume-on-read。
+                if getattr(self, 'proto_enabled', False) and msg.get('proto') is not None:
+                    _me = self.domain_to_idx[domain]
+                    _ps, _pp, _pc = (msg['proto']['store'], msg['proto']['stamp'], msg['proto']['cnt'])
+                    _newer = _pp.to(self.proto_stamp[domain].device) > self.proto_stamp[domain]
+                    _newer[:, _me] = False                      # plan D5
+                    if _newer.any():
+                        _idx = _newer.nonzero(as_tuple=True)
+                        self.proto_store[domain][_idx] = _ps.to(
+                            self.proto_store[domain].device, self.proto_store[domain].dtype)[_idx]
+                        self.proto_stamp[domain][_idx] = _pp.to(self.proto_stamp[domain].device)[_idx]
+                        self.proto_cnt[domain][_idx] = _pc.to(
+                            self.proto_cnt[domain].device, self.proto_cnt[domain].dtype)[_idx]
+                    # 規則 2c 的參照物：存**對方當時的整張表**（不只導出的 G），
+                    # 這樣訊號時才算得出「共同可見集合」口徑（見 proto_configure 的註解）。
+                    self.proto_gj[domain][s] = (
+                        _ps.to(self.proto_store[domain].device, self.proto_store[domain].dtype).clone(),
+                        _pp.to(self.proto_stamp[domain].device).clone())
             selfw = 1.0 - w_sum  # MH self weight（deg_i 上限保證 >0）
             for name, p in param_dict.items():
                 p.data.copy_(selfw * orig[name] + acc[name])
