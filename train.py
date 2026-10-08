@@ -550,6 +550,11 @@ def run(num_domains):
                                      buffer_max=getattr(args, 'async_buffer_max', None),
                                      async_style=async_style_enabled,
                                      aggregate_bn=getattr(args, 'aggregate_bn', False))
+        if getattr(args, 'trigger_mode', 'param') == 'periodic':
+            communicator.periodic_configure(args.trigger_period, getattr(args, 'trigger_phase_seed', 0))
+            print(f"[ASYNC] trigger_mode=periodic (local clock): period={args.trigger_period} steps, "
+                  f"phase_seed={args.trigger_phase_seed}, phases="
+                  + ", ".join(f"{d}:{u:.3f}" for d, u in communicator.trigger_phase.items()), flush=True)
         communicator.async_init_snapshot(models_dict)
         _diag_dir = _os.path.join(args.savePath, 'async_diag')
         _os.makedirs(_diag_dir, exist_ok=True)
@@ -2686,6 +2691,14 @@ if __name__ == "__main__":
     parser.add_argument('--trigger_max_interval', type=int, default=50,
                         help='Bounded-staleness safety valve: force a broadcast if a node has not broadcast for '
                              'B consecutive sweeps (PersonalizedET B2-connectivity). Guarantees consensus.')
+    parser.add_argument('--trigger_mode', type=str, default='param', choices=['param', 'periodic'],
+                        help="[plan 1007] 'param'(default)=PersonalizedET Eq.3 parameter-drift trigger (unchanged). "
+                             "'periodic'=local-clock fixed period: each node broadcasts every --trigger_period of its "
+                             "own steps, random phase per node (no global clock). delta still logged.")
+    parser.add_argument('--trigger_period', type=float, default=0.0,
+                        help='periodic mode: broadcast period in local steps (real-valued).')
+    parser.add_argument('--trigger_phase_seed', type=int, default=0,
+                        help='periodic mode: seed of the per-node phase draw (separate RNG, no global RNG use).')
     parser.add_argument('--async_buffer_max', type=int, default=None,
                         help='Optional cap on inbox size per node (naturally bounded by #neighbors).')
     parser.add_argument('--trigger_gamma_mode', type=str, default='lr', choices=['lr', 'const'],

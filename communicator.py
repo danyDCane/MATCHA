@@ -912,6 +912,7 @@ class SingleProcessCommunicator(object):
         self.async_threshold = float(threshold)
         self.async_max_interval = int(max_interval)
         self.async_buffer_max = buffer_max
+        self.trigger_mode = 'param'   # 'param'＝PersonalizedET 式3（預設、現行）；'periodic' 由 periodic_configure 開
         self.last_broadcast_step = {d: 0 for d in self.domain_to_idx}
         self.inbox = {d: {} for d in self.domain_to_idx}
         self.async_style_enabled = bool(async_style)
@@ -923,6 +924,19 @@ class SingleProcessCommunicator(object):
         # 深度 k 管線：push 進 pipeline[0]，每個 k 開始把 pipeline[-1](k 輪前 push)搬進 inbox 後右推一格
         self.style_pipeline = _deque([{d: {} for d in self.domain_to_idx} for _ in range(_kd)], maxlen=_kd)
         self.style_latest = {}  # sender -> 最新已 push 的自風格向量（供 style_buffer_dist 量 staleness 造成的風格值偏離）
+
+    def periodic_configure(self, period, phase_seed=0):
+        """[plan 1007] 本地時鐘固定週期廣播：每個節點只數自己的步數，每 period 步送一次（實數週期）。
+        相位 u_i ~ U[0,1) 由**獨立的** numpy Generator 抽（不碰全域亂數流 ⇒ 訓練亂數與 param 模式相同），
+        模擬「各自開機、沒有對時」。全程送出次數 ＝ floor(T/period + u_i) − floor(u_i)。"""
+        if period <= 0:
+            raise ValueError(f"--trigger_period must be > 0 for periodic mode (got {period})")
+        self.trigger_mode = 'periodic'
+        self.trigger_rate = 1.0 / float(period)
+        _rng = np.random.default_rng(int(phase_seed))
+        _doms = sorted(self.domain_to_idx, key=lambda d: self.domain_to_idx[d])
+        _u = _rng.random(len(_doms))
+        self.trigger_phase = {d: float(u) for d, u in zip(_doms, _u)}
 
     def proto_configure(self, own_col, n_cls=6, n_sty=3, proto_dim=128):
         """原型共識觸發器 階段一：建立原型表與影子訊號的狀態（plan 1001 §5.1）。
@@ -1103,7 +1117,12 @@ class SingleProcessCommunicator(object):
         delta = self._param_delta(domain, model)
         thresh = self.async_threshold * gamma
         forced = (step - self.last_broadcast_step.get(domain, 0)) >= self.async_max_interval
-        fired = (delta >= thresh) or forced
+        if getattr(self, 'trigger_mode', 'param') == 'periodic':
+            # delta 照算只為記錄（看送出當下的參數距離）；決策只看本地步數
+            r, u = self.trigger_rate, self.trigger_phase[domain]
+            fired = (math.floor((step + 1) * r + u) > math.floor(step * r + u)) or forced
+        else:
+            fired = (delta >= thresh) or forced
         return fired, delta, forced, thresh
 
     def push_to_neighbors(self, domain, model, step, style_vec=None):
