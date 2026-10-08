@@ -307,7 +307,8 @@ def main():
 
     # node-mean summary per score_fn
     print(f"\n=== node-mean ({topo}, ckpt={suffix}, {len(node_keys)} nodes) ===")
-    for name in ["diffusion", "msp", "energy"]:
+    # proto_angle／zperp 也要有平均列：原本缺這兩列時，log 尾端緊鄰的是 node_8 的值、曾被誤讀成平均（1007）
+    for name in ["diffusion", "msp", "energy", "proto_angle", "zperp"]:
         sub = [r for r in rows if r["score_fn"] == name]
         if not sub:
             continue
