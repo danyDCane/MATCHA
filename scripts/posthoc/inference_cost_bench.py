@@ -63,6 +63,131 @@ def timed(fn, n, warmup):
                 p95=float(np.percentile(a, 95)), std=float(a.std()))
 
 
+@torch.no_grad()
+def decompose(bb_b, bb_o, C, dev, a):
+    """拆解「讀出層」的耗時：是算術量、還是叫指令的固定成本？（dany 2026-09-22 提問）
+
+    ★ 口徑（2026-09-23 統一，與本檔 §8.3 三層表逐字一致，**不得再出現第二套**）：
+      - 三個臂都含 `argmax`（A＝只分類｜B＝分類＋energy｜C＝分類＋原型讀出），
+        因此「淨代價」＝該臂 − A 臂，與 0905 §8.3 括號裡的數字同一個算法。
+      - **量測順序寫死：牆鐘 → CPU 送指令 → profiler**。profiler(CUPTI) 掛著會墊高後續計時，
+        2026-09-22 因為把 profiler 跑在前面，量到的牆鐘比正確值高 15~20%（C 71.2 vs 58.7 µs）。
+
+    三個量的定義（三者不可互相取代）：
+      牆鐘      前後各 synchronize ⇒ 「要求答案 → 拿到答案」的實際等待
+      CPU送指令 連續呼叫 N 次、最後才 synchronize ⇒ 只算把指令送出去的成本（不等 GPU）
+      GPU執行   profiler 的 device_time_total ⇒ 顯示卡真正在算的時間
+    ⚠️ 牆鐘 ≠ CPU送指令 ＋ GPU執行：兩者重疊（CPU 送第二道時 GPU 已在算第一道）
+       ⇒ 牆鐘 ≈ max(兩者) ＋ 同步成本。本設定下 CPU 較慢 ⇒ 牆鐘 ≈ CPU送指令 ＋ ~5µs。
+
+    ⚠️ 臂 A1 的等價性：`min_c arccos(cos)` ＝ `arccos(max_c cos)`，arccos 嚴格遞減
+       ⇒ 用 `−max_c cos` 與原式**排名逐位相同**、AUROC 不變（實測 9 節點差 0.00e+00）。
+    """
+    W1, W2 = bb_o.proj_head[0], bb_o.proj_head[2]
+    batches = [int(s_) for s_ in a.decompose_batches.split(",")]
+
+    mac_proj = W1.in_features * W1.out_features + W2.in_features * W2.out_features
+    print("=" * 96)
+    print(f"環境：{torch.cuda.get_device_name(0)} | torch {torch.__version__}")
+    print("\n【算術量／每張圖】骨幹 ResNet-18 224² ≈ 1,814 MMAC（文獻標準值，非本腳本量測）｜"
+          f"proj_head {mac_proj/1e6:.3f} MMAC｜z·C {C.shape[0]*C.shape[1]/1e6:.6f} MMAC")
+    print(f"  ⇒ 我方讀出佔骨幹算術量 {(mac_proj + C.shape[0]*C.shape[1])/1.814e9*100:.3f}%")
+
+    def _wall(fn, reps, warm):
+        for _ in range(warm):
+            fn()
+        ts = []
+        for _ in range(reps):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            fn()
+            torch.cuda.synchronize()
+            ts.append((time.perf_counter() - t0) * 1e6)
+        return float(np.median(ts))
+
+    def _disp(fn, reps, warm):
+        for _ in range(warm):
+            fn()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(reps):
+            fn()
+        d = (time.perf_counter() - t0) / reps * 1e6
+        torch.cuda.synchronize()
+        return d
+
+    for bs in batches:
+        x = torch.randn(bs, 3, 224, 224, device=dev)
+        lo, ve = bb_o.forward_from_layer3(bb_o.forward_to_layer3_style(x, communicator=None))
+        reps = a.reps_b1 if bs == 1 else a.reps_b64
+
+        def arm_A():
+            return lo.argmax(1)
+
+        def arm_B():
+            return lo.argmax(1), -torch.logsumexp(lo, 1)
+
+        def arm_C():                       # 現行 dood/prototype.detection_score
+            z = bb_o.project(ve)
+            c = (z @ C.t()).clamp(-1 + 1e-7, 1 - 1e-7)
+            return lo.argmax(1), torch.arccos(c).min(1).values
+
+        def arm_C1():                      # A1：−max cos，排名逐位相同
+            u = W2(torch.relu(W1(ve)))
+            return lo.argmax(1), -(u @ C.t()).max(1).values / u.norm(dim=1)
+
+        ARMS = [("A 只做分類", arm_A), ("B 分類＋energy", arm_B),
+                ("C 分類＋我方現行讀出", arm_C), ("C1 分類＋`−max cos` 等價改寫", arm_C1)]
+
+        wall = {n: _wall(f, reps, a.warmup) for n, f in ARMS}           # ① 牆鐘最先
+        disp = {n: _disp(f, max(reps, 1000), a.warmup) for n, f in ARMS}  # ② 再送指令
+        from torch.profiler import profile, ProfilerActivity            # ③ profiler 最後
+        gpu, nk = {}, {}
+        for n, f in ARMS:
+            for _ in range(a.warmup):
+                f()
+            torch.cuda.synchronize()
+            with profile(activities=[ProfilerActivity.CUDA]) as pr:
+                for _ in range(100):
+                    f()
+                torch.cuda.synchronize()
+            r = [e for e in pr.key_averages() if e.device_time_total > 0]
+            gpu[n] = sum(e.device_time_total for e in r) / 100
+            nk[n] = sum(e.count for e in r) / 100
+
+        print("\n" + "=" * 96)
+        print(f"batch = {bs}　（口徑：三臂皆含 argmax，同 §8.3；牆鐘先量、profiler 最後）")
+        print("=" * 96)
+        print(f"  {'臂':<30}{'指令道數':>9}{'CPU送指令':>12}{'GPU執行':>11}{'牆鐘':>10}")
+        for n, _ in ARMS:
+            print(f"  {n:<30}{nk[n]:>9.0f}{disp[n]:>11.1f}µs{gpu[n]:>10.1f}µs{wall[n]:>9.1f}µs")
+
+        A_, B_, Cn, C1 = [n for n, _ in ARMS]
+        print(f"\n  淨代價（牆鐘 − A 臂牆鐘，＝§8.3 括號的算法）：")
+        for n in (B_, Cn, C1):
+            print(f"    {n:<30}+{wall[n]-wall[A_]:6.1f}µs")
+        print(f"    ⇒ C ÷ B ＝ {(wall[Cn]-wall[A_])/(wall[B_]-wall[A_]):.2f}×"
+              f"（＝教授看到的『快兩倍』）")
+
+        dd, dg, dw = disp[Cn]-disp[B_], gpu[Cn]-gpu[B_], wall[Cn]-wall[B_]
+        uB, uC = disp[B_]/max(nk[B_], 1), disp[Cn]/max(nk[Cn], 1)
+        print(f"\n  C − B（我方比 energy 多花的）：道數 +{nk[Cn]-nk[B_]:.0f}　"
+              f"CPU送指令 +{dd:.1f}µs　GPU執行 +{dg:.1f}µs　牆鐘 +{dw:.1f}µs")
+        print(f"    ★ 牆鐘差 {dw:.1f} ≈ CPU送指令差 {dd:.1f} ⇒ 差距幾乎全在『送指令』，"
+              f"GPU 多算的 {dg:.1f}µs 被藏在等待裡")
+        print(f"    拆 CPU送指令差 {dd:.1f}µs：單價 B {uB:.2f} vs C {uC:.2f} µs/道")
+        print(f"      多出的 {nk[Cn]-nk[B_]:.0f} 道 × B 單價 ＝ {(nk[Cn]-nk[B_])*uB:.1f}µs")
+        print(f"      C 的 {nk[Cn]:.0f} 道 × 單價差 {uC-uB:.2f} ＝ {(uC-uB)*nk[Cn]:.1f}µs")
+
+        print(f"\n  單一指令的送出成本（解釋單價差的來源）：")
+        aa, bb_ = torch.randn(bs, 512, device=dev), torch.randn(bs, 512, device=dev)
+        for nm, f in [("逐元素加法 a+b", lambda: aa + bb_),
+                      ("逐元素 exp(a)", lambda: torch.exp(aa)),
+                      ("矩陣乘法 Linear(512→512)", lambda: W1(aa)),
+                      ("矩陣乘法 Linear(512→128)", lambda: W2(aa))]:
+            print(f"    {nm:<34}{_disp(f, 2000, 200):>7.2f}µs")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--leave_out", default="cartoon")
@@ -72,6 +197,10 @@ def main():
     ap.add_argument("--reps_b64", type=int, default=100)
     ap.add_argument("--warmup", type=int, default=50)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--decompose", action="store_true",
+                    help="拆解 (c) 讀出層：逐 op 計時 ＋ 核心啟動次數 ＋ 算術量 ＋ 四個等價改寫臂。"
+                         "不帶此旗標時行為與原本完全相同（dany 2026-09-22）。")
+    ap.add_argument("--decompose_batches", default="1,8,64,256")
     a = ap.parse_args()
     dev = a.device
 
@@ -85,6 +214,10 @@ def main():
         os.path.join(ROOT, f"exp_result_{O_DESC}", f"{O_DESC}_node_0_final.pth"), 6, dev)
     bb_b.eval(); bb_o.eval()
     C = class_centers(bb_o.prototypes, bb_o.proto_count).to(dev)
+
+    if a.decompose:
+        decompose(bb_b, bb_o, C, dev, a)
+        return
 
     # 蒐集真實圖片路徑（端到端層要真的讀檔）
     root = os.path.join(a.datasetRoot, "PACS", LO)
