@@ -34,6 +34,7 @@ venv/
 *.DS_Store
 wandb/
 *.sh
+!start_v1_baseline.sh
 **/ExpDescription
 expdescription
 
@@ -69,4 +70,10 @@ results/
 *.jp
 
 research/
+
+########################
+# Local backups and agent worktrees
+########################
+*.bak.*
+.claude/worktrees/
 
