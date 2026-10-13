@@ -550,14 +550,65 @@ def run(num_domains):
                                      buffer_max=getattr(args, 'async_buffer_max', None),
                                      async_style=async_style_enabled,
                                      aggregate_bn=getattr(args, 'aggregate_bn', False))
+        # ===== [plan 1009] 頻寬不平均情境：每台頻寬 b_i（只記帳；--bw_rho 時才進門檻）=====
+        _bw_table = None
+        _doms_sorted = sorted(communicator.domain_to_idx, key=lambda d: communicator.domain_to_idx[d])
+        if getattr(args, 'bw_dist', 'none') == 'file':
+            # [plan 1012] 自訂頻寬表（node,b）：例如慢設備集中在單一畫風；同樣只記帳，--bw_rho 時才進門檻
+            if not getattr(args, 'bw_file', ''):
+                raise RuntimeError("--bw_dist file 需要 --bw_file")
+            with open(args.bw_file) as _bwf:
+                _bw_table = {r['node']: float(r['b']) for r in _csv.DictReader(_bwf)}
+            _bad = [d for d in _doms_sorted if d not in _bw_table or not (0.0 < _bw_table[d] <= 1.0)]
+            if _bad or len(_bw_table) != len(_doms_sorted):
+                raise ValueError(f"--bw_file 節點缺漏／多餘或 b 不在 (0,1]：{_bad}, {sorted(_bw_table)}")
+            _bw_table = {d: _bw_table[d] for d in _doms_sorted}
+            if args.bw_rho:
+                if getattr(args, 'trigger_mode', 'param') != 'param':
+                    raise RuntimeError("--bw_rho 只適用參數觸發（trigger_mode=param）")
+                communicator.bandwidth_configure({d: 1.0 / b for d, b in _bw_table.items()})
+        elif getattr(args, 'bw_dist', 'none') != 'none':
+            from communicator import stratified_bandwidth_table
+            _styles = [node_to_domain.get(d, d) for d in _doms_sorted]
+            _bw_table = dict(zip(_doms_sorted, stratified_bandwidth_table(
+                _styles, seed=args.bw_seed, floor=args.bw_floor)))
+            if args.bw_rho:
+                if getattr(args, 'trigger_mode', 'param') != 'param':
+                    raise RuntimeError("--bw_rho 只適用參數觸發（trigger_mode=param）")
+                communicator.bandwidth_configure({d: 1.0 / b for d, b in _bw_table.items()})
+        elif getattr(args, 'bw_rho', False):
+            raise RuntimeError("--bw_rho 需要 --bw_dist")
+        _per_period = None
+        if getattr(args, 'trigger_period_file', ''):
+            if getattr(args, 'trigger_mode', 'param') != 'periodic':
+                raise RuntimeError("--trigger_period_file 只適用 trigger_mode=periodic")
+            with open(args.trigger_period_file) as _pf:
+                _per_period = {r['node']: float(r['period']) for r in _csv.DictReader(_pf)}
         if getattr(args, 'trigger_mode', 'param') == 'periodic':
-            communicator.periodic_configure(args.trigger_period, getattr(args, 'trigger_phase_seed', 0))
-            print(f"[ASYNC] trigger_mode=periodic (local clock): period={args.trigger_period} steps, "
+            communicator.periodic_configure(args.trigger_period, getattr(args, 'trigger_phase_seed', 0),
+                                            per_domain_period=_per_period)
+            _pdesc = (f"per-node periods from {args.trigger_period_file}: "
+                      + ", ".join(f"{d}:{_per_period[d]:.4f}" for d in _doms_sorted)) if _per_period \
+                else f"period={args.trigger_period} steps"
+            print(f"[ASYNC] trigger_mode=periodic (local clock): {_pdesc}, "
                   f"phase_seed={args.trigger_phase_seed}, phases="
                   + ", ".join(f"{d}:{u:.3f}" for d, u in communicator.trigger_phase.items()), flush=True)
+        if _bw_table is not None:
+            print(f"[ASYNC][BW] dist={args.bw_dist} seed={args.bw_seed} floor={args.bw_floor} rho_in_threshold={args.bw_rho} | "
+                  + ", ".join(f"{d}({node_to_domain.get(d, d)[:5]}):b={b:.4f},rho={communicator.rho.get(d, 1.0):.4f}"
+                              for d, b in _bw_table.items()), flush=True)
         communicator.async_init_snapshot(models_dict)
         _diag_dir = _os.path.join(args.savePath, 'async_diag')
         _os.makedirs(_diag_dir, exist_ok=True)
+        if _bw_table is not None:
+            with open(_os.path.join(_diag_dir, 'bandwidth.csv'), 'w', newline='') as _bf:
+                _bw_w = _csv.writer(_bf)
+                _bw_w.writerow(['node', 'style', 'b', 'rho_in_threshold', 'degree', 'period'])
+                for d in _doms_sorted:
+                    _bw_w.writerow([d, node_to_domain.get(d, d), f"{_bw_table[d]:.6f}",
+                                    f"{communicator.rho.get(d, 1.0):.6f}", len(communicator.domain_adj.get(d, [])),
+                                    (f"{_per_period[d]:.6f}" if _per_period else
+                                     (args.trigger_period if args.trigger_mode == 'periodic' else ''))])
         async_diag_f = open(_os.path.join(_diag_dir, 'broadcast_log.csv'), 'w', newline='')
         async_diag_writer = _csv.writer(async_diag_f)
         async_diag_writer.writerow(['step', 'epoch', 'domain', 'delta', 'thresh', 'gamma', 'fired', 'forced',
@@ -2699,6 +2750,18 @@ if __name__ == "__main__":
                         help='periodic mode: broadcast period in local steps (real-valued).')
     parser.add_argument('--trigger_phase_seed', type=int, default=0,
                         help='periodic mode: seed of the per-node phase draw (separate RNG, no global RNG use).')
+    parser.add_argument('--trigger_period_file', type=str, default='',
+                        help='[plan 1009] periodic mode: CSV with columns node,period (per-node periods; '
+                             'C-bw / C-match arms). When given, --trigger_period is ignored.')
+    parser.add_argument('--bw_dist', type=str, default='none', choices=['none', 'beta', 'file'],
+                        help="[plan 1009] simulated per-device bandwidth b_i (max=1): 'beta'=Beta(0.5,0.5) clipped to "
+                             "[--bw_floor,1], stratified within style (separate RNG). Bookkeeping only unless --bw_rho.")
+    parser.add_argument('--bw_file', type=str, default='',
+                        help="[plan 1012] CSV (node,b) used when --bw_dist file, e.g. slow devices concentrated in one style.")
+    parser.add_argument('--bw_seed', type=int, default=0, help='[plan 1009] seed of the bandwidth draw.')
+    parser.add_argument('--bw_floor', type=float, default=0.1, help='[plan 1009] lower clip of b_i.')
+    parser.add_argument('--bw_rho', action='store_true',
+                        help='[plan 1009] EF-HC rho_i=1/b_i: param-trigger threshold becomes tau*gamma(k)*rho_i.')
     parser.add_argument('--async_buffer_max', type=int, default=None,
                         help='Optional cap on inbox size per node (naturally bounded by #neighbors).')
     parser.add_argument('--trigger_gamma_mode', type=str, default='lr', choices=['lr', 'const'],

@@ -542,6 +542,30 @@ class ChocoCommunicator(Communicator):
         return comm_time
 
 
+def stratified_bandwidth_table(node_styles, seed=0, floor=0.1, a=0.5, b=0.5):
+    """[plan 1009] 每台設備的頻寬 b_i（最大頻寬正規化為 1），畫風內分層。
+    node_styles：依節點索引排列的畫風標籤（node_0..node_{N-1}）。
+    做法：抽 N 個 Beta(a,b)、截斷到 [floor, 1]、由小到大排序後切成「每畫風節點數」檔；
+    每一檔的值各分給每個畫風一台（值的順序與該畫風內挑哪台都由 rng 決定）⇒ 每個畫風拿到的頻寬組合相同層次。
+    只用**獨立**的 numpy Generator，不碰全域亂數流。回傳 list[float]，索引＝節點索引。"""
+    styles = sorted(set(node_styles))
+    n = len(node_styles)
+    per = n // len(styles)
+    if per * len(styles) != n or any(node_styles.count(s) != per for s in styles):
+        raise ValueError(f"stratified_bandwidth_table 需要每個畫風節點數相同：{node_styles}")
+    rng = np.random.default_rng(int(seed))
+    v = np.sort(np.clip(rng.beta(a, b, n), floor, 1.0))
+    nodes_by_style = {s: [i for i, x in enumerate(node_styles) if x == s] for s in styles}
+    out = [None] * n
+    for tier in range(per):                                   # 低→高，每檔 len(styles) 個值
+        vals = v[tier * len(styles):(tier + 1) * len(styles)]
+        order = rng.permutation(len(styles))                  # 這一檔的值給哪個畫風
+        for si, s in enumerate(styles):
+            free = [i for i in nodes_by_style[s] if out[i] is None]
+            out[free[int(rng.integers(len(free)))]] = float(vals[order[si]])
+    return out
+
+
 class SingleProcessCommunicator(object):
     """
     Single process communicator for decentralized training without MPI.
@@ -913,6 +937,8 @@ class SingleProcessCommunicator(object):
         self.async_max_interval = int(max_interval)
         self.async_buffer_max = buffer_max
         self.trigger_mode = 'param'   # 'param'＝PersonalizedET 式3（預設、現行）；'periodic' 由 periodic_configure 開
+        self.rho = {}                 # [plan 1009] 每節點門檻係數 ρ_i（EF-HC ρ_i＝1/b_i）；空＝全部 1.0（現行）
+        self.trigger_rate_by_domain = None   # [plan 1009] 每節點週期；None＝單一 trigger_rate（現行）
         self.last_broadcast_step = {d: 0 for d in self.domain_to_idx}
         self.inbox = {d: {} for d in self.domain_to_idx}
         self.async_style_enabled = bool(async_style)
@@ -925,18 +951,35 @@ class SingleProcessCommunicator(object):
         self.style_pipeline = _deque([{d: {} for d in self.domain_to_idx} for _ in range(_kd)], maxlen=_kd)
         self.style_latest = {}  # sender -> 最新已 push 的自風格向量（供 style_buffer_dist 量 staleness 造成的風格值偏離）
 
-    def periodic_configure(self, period, phase_seed=0):
+    def periodic_configure(self, period, phase_seed=0, per_domain_period=None):
         """[plan 1007] 本地時鐘固定週期廣播：每個節點只數自己的步數，每 period 步送一次（實數週期）。
         相位 u_i ~ U[0,1) 由**獨立的** numpy Generator 抽（不碰全域亂數流 ⇒ 訓練亂數與 param 模式相同），
-        模擬「各自開機、沒有對時」。全程送出次數 ＝ floor(T/period + u_i) − floor(u_i)。"""
-        if period <= 0:
-            raise ValueError(f"--trigger_period must be > 0 for periodic mode (got {period})")
+        模擬「各自開機、沒有對時」。全程送出次數 ＝ floor(T/period + u_i) − floor(u_i)。
+        [plan 1009] per_domain_period＝{domain: 週期}（C-bw／C-match）：每節點各自週期，相位抽法不變；
+        給了它時 period 不使用。"""
         self.trigger_mode = 'periodic'
-        self.trigger_rate = 1.0 / float(period)
+        if per_domain_period is not None:
+            missing = [d for d in self.domain_to_idx if d not in per_domain_period]
+            bad = {d: p for d, p in per_domain_period.items() if not (float(p) > 0)}
+            if missing or bad:
+                raise ValueError(f"per_domain_period 缺節點 {missing} 或週期不為正 {bad}")
+            self.trigger_rate_by_domain = {d: 1.0 / float(per_domain_period[d]) for d in self.domain_to_idx}
+            self.trigger_rate = None
+        else:
+            if period <= 0:
+                raise ValueError(f"--trigger_period must be > 0 for periodic mode (got {period})")
+            self.trigger_rate = 1.0 / float(period)
         _rng = np.random.default_rng(int(phase_seed))
         _doms = sorted(self.domain_to_idx, key=lambda d: self.domain_to_idx[d])
         _u = _rng.random(len(_doms))
         self.trigger_phase = {d: float(u) for d, u in zip(_doms, _u)}
+
+    def bandwidth_configure(self, rho_by_domain):
+        """[plan 1009] EF-HC 的每節點門檻係數 ρ_i（＝1/b_i）：參數觸發的門檻變成 τ·γ(k)·ρ_i。"""
+        missing = [d for d in self.domain_to_idx if d not in rho_by_domain]
+        if missing:
+            raise ValueError(f"rho_by_domain 缺節點 {missing}")
+        self.rho = {d: float(rho_by_domain[d]) for d in self.domain_to_idx}
 
     def proto_configure(self, own_col, n_cls=6, n_sty=3, proto_dim=128):
         """原型共識觸發器 階段一：建立原型表與影子訊號的狀態（plan 1001 §5.1）。
@@ -1116,10 +1159,15 @@ class SingleProcessCommunicator(object):
         回 (fired, delta, forced, thresh)。"""
         delta = self._param_delta(domain, model)
         thresh = self.async_threshold * gamma
+        _rho = getattr(self, 'rho', {}).get(domain)
+        if _rho is not None:                       # [plan 1009] 未開頻寬時不乘 ⇒ 與現行逐位相同
+            thresh = thresh * _rho
         forced = (step - self.last_broadcast_step.get(domain, 0)) >= self.async_max_interval
         if getattr(self, 'trigger_mode', 'param') == 'periodic':
             # delta 照算只為記錄（看送出當下的參數距離）；決策只看本地步數
-            r, u = self.trigger_rate, self.trigger_phase[domain]
+            _rbd = getattr(self, 'trigger_rate_by_domain', None)
+            r = _rbd[domain] if _rbd is not None else self.trigger_rate
+            u = self.trigger_phase[domain]
             fired = (math.floor((step + 1) * r + u) > math.floor(step * r + u)) or forced
         else:
             fired = (delta >= thresh) or forced
