@@ -54,7 +54,8 @@ def cbw_periods(bw, target):
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
-    ap.add_argument('--art_b', type=float, default=0.1)
+    ap.add_argument('--art_b', type=float, default=0.1, help='慢畫風三台的網速（名稱沿用 art，--slow_style 決定是哪個畫風）')
+    ap.add_argument('--slow_style', default='art', choices=['art', 'photo', 'sketch'], help='[1013] 哪個畫風三台變慢')
     ap.add_argument('--target', type=int, default=29613)
     ap.add_argument('--out_dir', default=ROOT + 'results/proto_trigger/1012_artslow')
     ap.add_argument('--write', action='store_true', help='寫出頻寬表與週期表')
@@ -72,9 +73,10 @@ if __name__ == '__main__':
     for lo, hi in [(0, 1000), (3000, 4000)]:
         s = share(h0, lo, hi); print(f'自檢3 1009 C-bw 合成份量 {lo}-{hi}: ' + ' / '.join(f'{d} {v:.3f}' for d, v in s.items())
                                    + '（報告 R4：0–1000 0.308/0.312/0.380；3000–4000 0.302/0.311/0.387）')
-    bw = bw0.copy(); bw[:3] = o.art_b
+    slow_idx = [i for i in range(N) if DOM[i] == o.slow_style]
+    bw = bw0.copy(); bw[slow_idx] = o.art_b
     p = cbw_periods(bw, o.target); F = fire_matrix(p); fz = F.sum(0)
-    print(f'\nart_b={o.art_b}：頻寬 {np.round(bw, 4).tolist()}')
+    print(f'\n{o.slow_style} 三台 b={o.art_b}：頻寬 {np.round(bw, 4).tolist()}')
     print(f'  週期 {np.round(p, 4).tolist()}')
     print(f'  送出 {fz.tolist()} 總份數 {int((fz * deg).sum())} 總傳輸時間 {(fz / bw).sum():.0f}（1009 C-bw {(F0.sum(0) / bw0).sum():.0f}）')
     h = infl_oneway(F)
@@ -82,7 +84,7 @@ if __name__ == '__main__':
         s = share(h, lo, hi); print(f'  份量 {lo:4d}-{hi:4d}: ' + ' / '.join(f'{d} {v:.3f}' for d, v in s.items()))
     if o.write:
         os.makedirs(o.out_dir, exist_ok=True)
-        tag = f'art{o.art_b:g}'
+        tag = f'{o.slow_style}{o.art_b:g}'
         with open(f'{o.out_dir}/bandwidth_{tag}.csv', 'w') as f:
             f.write('node,b\n'); [f.write(f'node_{i},{b:.6f}\n') for i, b in enumerate(bw)]
         with open(f'{o.out_dir}/period_Cbw_{tag}.csv', 'w') as f:

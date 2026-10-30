@@ -115,10 +115,15 @@ def bw_mode():
     ap.add_argument('--target', type=int, default=29613, help='總傳輸份數目標（＝1007 C 實際值）')
     ap.add_argument('--out_dir', default=ROOT + 'results/proto_trigger/1009_bw')
     ap.add_argument('--match_from', default='', help='D-bw run 目錄 ⇒ 產生 C-match 週期表')
+    ap.add_argument('--bw_file', default='', help='[plan 1017] 從 csv（node,b,…）讀網速表，取代分層表；C-bw 週期表檔名改加 _file')
     o = ap.parse_args()
     sys.path.insert(0, ROOT)
     from communicator import stratified_bandwidth_table
-    bw = np.array(stratified_bandwidth_table(STYLES, seed=o.bw_seed, floor=o.bw_floor))
+    if o.bw_file:
+        _t = pd.read_csv(o.bw_file); _t['i'] = _t.node.str[5:].astype(int)
+        bw = _t.sort_values('i').b.values.astype(float)
+    else:
+        bw = np.array(stratified_bandwidth_table(STYLES, seed=o.bw_seed, floor=o.bw_floor))
     os.makedirs(o.out_dir, exist_ok=True)
     print(f'頻寬表（seed {o.bw_seed}、floor {o.bw_floor}）：' + ', '.join(f'node_{i}({STYLES[i][:5]})={b:.4f}' for i, b in enumerate(bw)))
     print('  各畫風平均：' + ' / '.join(f'{s[:5]} {bw[[i for i in range(N) if STYLES[i] == s]].mean():.3f}' for s in sorted(set(STYLES))))
@@ -145,7 +150,7 @@ def bw_mode():
     c = o.target / (bw * deg).sum() / T          # sends_i ≈ c·T·b_i
     per = 1.0 / (c * bw)
     fz = periodic_fires(per)
-    out = o.out_dir + f'/period_Cbw_seed{o.bw_seed}.csv'; write_periods(out, per)
+    out = o.out_dir + (f'/period_Cbw_file.csv' if o.bw_file else f'/period_Cbw_seed{o.bw_seed}.csv'); write_periods(out, per)
     print(f'\nC-bw：週期 {np.round(per, 4).tolist()}')
     print(f'  依相位精確推算送出 {fz.tolist()}、總份數 {int((fz * deg).sum())}、總傳輸時間 {(fz / bw).sum():.0f}、'
           f'每台時間 {np.round(fz / bw).astype(int).tolist()}；寫出 {out}')
