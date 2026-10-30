@@ -107,6 +107,42 @@ def compute_loader_avg_confidence(model, data_loader):
     return (total_conf / max(1, total_count))
 
 
+def rate_group_descriptors(models_dict, domain_loaders, doms, n_batches, bs, eta):
+    """[plan 1019] 按群校正份量的「認組員」描述向量（訓練前算一次）。
+    每台用自己目前的模型（＝訓練起點的預訓練模型，九台相同）、eval（BN 用預訓練統計）、不算梯度，
+    從自己的訓練集抽 n_batches 批（訓練前處理、獨立讀取器、num_workers=0），算 layer1–3 風格統計量（與第一階段同一套函式）。
+    回 {domain: (A, B)}：前一半批的平均 A＝送給鄰居的描述向量；後一半的平均 B 只用來量「自己換一批的距離」‖A−B‖。
+    python／numpy／torch／cuda 亂數狀態先存後還原 ⇒ 之後的訓練與不算描述向量時逐位相同（驗收二：style＝oracle 逐字相同）。"""
+    st = (random.getstate(), np.random.get_state(), torch.get_rng_state(),
+          torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None)
+    out = {}
+    try:
+        for d in doms:
+            m = models_dict[d]; was_training = m.training; m.eval()
+            ld = torch.utils.data.DataLoader(domain_loaders[d][0].dataset, batch_size=bs, shuffle=True,
+                                             num_workers=0, drop_last=True)
+            it = iter(ld); V = []
+            with torch.no_grad():
+                for _ in range(n_batches):
+                    try:
+                        batch = next(it)
+                    except StopIteration:
+                        it = iter(ld); batch = next(it)
+                    x = util.unpack_batch(batch)[0].cuda(non_blocking=True)
+                    feats = m.extract_features_to_layer3(x)
+                    V.append(flatten_style_stats(compute_multi_layer_style_stats(feats, eta=eta),
+                                                 layer_order=["layer1", "layer2", "layer3"]).float())
+            if was_training:
+                m.train()
+            h = n_batches // 2
+            out[d] = (torch.stack(V[:h]).mean(0), torch.stack(V[h:]).mean(0))
+    finally:
+        random.setstate(st[0]); np.random.set_state(st[1]); torch.set_rng_state(st[2])
+        if st[3] is not None:
+            torch.cuda.set_rng_state_all(st[3])
+    return out
+
+
 def run(num_domains):
     """
     Single process training function for decentralized learning.
@@ -282,12 +318,26 @@ def run(num_domains):
             # Copy parameters from first model
             models_dict[domain].load_state_dict(first_model.state_dict())
     
+    # [plan 1014] 診斷 (a)：指定節點的學習率倍數（例 node_6:0.13,node_7:0.13,node_8:0.13）；未給＝全部 1.0（行為不變）
+    _node_lr_mult = {}
+    if getattr(args, 'node_lr_mult', ''):
+        for _tok in args.node_lr_mult.split(','):
+            _k, _v = _tok.split(':')
+            _node_lr_mult[_k.strip()] = float(_v)
+        _bad = [k for k in _node_lr_mult if k not in domain_names]
+        if _bad or any(v <= 0 for v in _node_lr_mult.values()):
+            raise ValueError(f"--node_lr_mult 節點不存在或倍數不為正：{_bad} {_node_lr_mult}")
+        if getattr(args, 'async_trigger', False) and getattr(args, 'trigger_mode', 'param') == 'param' \
+                and getattr(args, 'trigger_gamma_mode', 'const') == 'lr':
+            raise RuntimeError("--node_lr_mult 不可與 gamma_mode=lr 併用（門檻會跟著被縮放的學習率走、語意改變）")
+        print('[LR] node_lr_mult：' + ', '.join(f"{d}:lr={args.lr * _node_lr_mult.get(d, 1.0):.6g}" for d in domain_names), flush=True)
+
     # Move all models to GPU and create optimizers
     for domain in domain_names:
         criterion = nn.CrossEntropyLoss().cuda()
         optimizers_dict[domain] = optim.SGD(
             models_dict[domain].parameters(), 
-            lr=args.lr,
+            lr=args.lr * _node_lr_mult.get(domain, 1.0),
             momentum=args.momentum, 
             weight_decay=5e-4,
             nesterov=args.nesterov
@@ -597,9 +647,89 @@ def run(num_domains):
             print(f"[ASYNC][BW] dist={args.bw_dist} seed={args.bw_seed} floor={args.bw_floor} rho_in_threshold={args.bw_rho} | "
                   + ", ".join(f"{d}({node_to_domain.get(d, d)[:5]}):b={b:.4f},rho={communicator.rho.get(d, 1.0):.4f}"
                               for d, b in _bw_table.items()), flush=True)
+        # [plan 1014] 診斷 (c)：所有融合權重 × fuse_weight_mult（模型參數與 BN 統計量；預設 1.0＝行為不變）
+        _fwm = float(getattr(args, 'fuse_weight_mult', 1.0))
+        if not (0.0 < _fwm <= 1.0):
+            raise ValueError(f"--fuse_weight_mult 必須在 (0,1]：{_fwm}")
+        communicator.fuse_weight_mult = _fwm
+        if _fwm != 1.0:
+            print(f"[ASYNC] fuse_weight_mult={_fwm}：MH 融合權重 w_ij＝{_fwm}／(1+max(deg_i,deg_j))", flush=True)
+        # [plan 1016] 融合規則（預設 mh＝行為不變）
+        _frule = getattr(args, 'fuse_rule', 'mh')
+        if _frule != 'mh':
+            if getattr(args, 'trigger_mode', 'param') != 'periodic' and _frule == 'rate_pair':
+                raise RuntimeError("--fuse_rule rate_pair 需要 trigger_mode=periodic（送出率＝1/週期才有定義）")
+            if _fwm != 1.0:
+                raise RuntimeError("--fuse_rule 不可與 --fuse_weight_mult≠1 併用（一次只改一件事）")
+            if _frule in ('pushsum', 'pushcen'):
+                communicator.ps_w = {d: 1.0 for d in domain_names}
+                communicator.ps_merge_count = 0
+            print(f"[ASYNC] fuse_rule={_frule}" + ("：w'_ij＝W_ij·min(r_i,r_j)/r_j，r＝推播裡附的送出率（1/週期）"
+                                                    if _frule == 'rate_pair' else
+                                                    "：BWGossip 份量分割、z 依份量合併、BN 一併去偏、梯度 ×1/w_i（SGP）"
+                                                    if _frule == 'pushsum' else
+                                                    "：PushCen 推和融合（份量分割、依份量占比融合、BN 一併）、梯度不縮放"), flush=True)
+        # [plan 1017] EF-HC 雙向交換（預設關＝行為不變）
+        communicator.bidirectional = bool(getattr(args, 'bidirectional', False))
+        communicator.reply_rows = []
+        if communicator.bidirectional:
+            if _frule != 'mh':
+                raise RuntimeError("--bidirectional 只與 fuse_rule=mh 併用（一次只改一件事）")
+            print("[ASYNC] bidirectional=on：觸發的節點與所有鄰居互換模型（EF-HC Alg.1 第 9–11 行）；"
+                  "回傳不更新回傳方的 ŵ、不算其送出；同一步同一連線只交換一次", flush=True)
+        communicator.fuse_rule = _frule
+        communicator.fusion_jump_log = bool(getattr(args, 'fusion_jump_log', False) or _frule != 'mh')
         communicator.async_init_snapshot(models_dict)
         _diag_dir = _os.path.join(args.savePath, 'async_diag')
         _os.makedirs(_diag_dir, exist_ok=True)
+        # [plan 1019] 按群校正份量：附的數 u＝「自己＋組員」的平均送出率；預設 self＝u 就是自己的送出率（＝底座，行為不變）
+        _rgm = getattr(args, 'rate_group', 'self')
+        communicator.rate_u_by_domain = None
+        if _rgm != 'self':
+            if _frule != 'rate_pair':
+                raise RuntimeError("--rate_group 只與 --fuse_rule rate_pair 併用（附的數只在這條規則裡用）")
+            _r = {d: communicator._own_rate(d) for d in _doms_sorted}
+            if any(v is None or not (v > 0) for v in _r.values()):
+                raise RuntimeError(f"--rate_group 需要 periodic 送出率：{_r}")
+            _rgc = float(getattr(args, 'rate_group_c', 3.0))
+            _desc = None
+            if _rgm == 'style':
+                if not getattr(args, 'pretrained', False):
+                    raise RuntimeError("--rate_group style 需要九台從同一份預訓練模型起跑（--pretrained）")
+                _rgb = int(getattr(args, 'rate_group_batches', 20))
+                if _rgb < 2 or _rgb % 2:
+                    raise ValueError(f"--rate_group_batches 必須是 ≥2 的偶數：{_rgb}")
+                _desc = rate_group_descriptors(models_dict, domain_loaders, _doms_sorted, _rgb, args.bs,
+                                               getattr(args, "style_eta", 1e-5))
+            _grp, _rg_rows = {}, []
+            for d in _doms_sorted:
+                _nbs = sorted(communicator.domain_adj.get(d, []), key=lambda x: communicator.domain_to_idx[x])
+                if _rgm == 'oracle':
+                    _grp[d] = [j for j in _nbs if node_to_domain.get(j, j) == node_to_domain.get(d, d)]
+                    _sd, _dist = None, {j: None for j in _nbs}
+                else:
+                    _A, _B = _desc[d]; _sd = float((_A - _B).norm())
+                    _dist = {j: float((_A - _desc[j][0]).norm()) for j in _nbs}
+                    _grp[d] = [j for j in _nbs if _dist[j] <= _rgc * _sd]
+                for j in _nbs:
+                    _rg_rows.append((d, j, _sd, _dist[j]))
+            communicator.rate_u_by_domain = {d: float(np.mean([_r[d]] + [_r[j] for j in _grp[d]])) for d in _doms_sorted}
+            with open(_os.path.join(_diag_dir, 'rate_group.csv'), 'w', newline='') as _rgf:
+                _rgw = _csv.writer(_rgf)
+                _rgw.writerow(['node', 'style', 'r', 'u', 'group', 'self_dist', 'neighbor', 'neighbor_style',
+                               'dist', 'ratio', 'in_group', 'mode', 'c'])
+                for d, j, _sd, _dj in _rg_rows:
+                    _rgw.writerow([d, node_to_domain.get(d, d), f"{_r[d]:.9f}", f"{communicator.rate_u_by_domain[d]:.9f}",
+                                   ';'.join(_grp[d]), '' if _sd is None else f"{_sd:.6f}", j, node_to_domain.get(j, j),
+                                   '' if _dj is None else f"{_dj:.6f}", '' if _dj is None else f"{_dj / _sd:.4f}",
+                                   int(j in _grp[d]), _rgm, _rgc])
+            _wrong = [d for d in _doms_sorted if set(_grp[d]) != {j for j in communicator.domain_adj.get(d, [])
+                                                                   if node_to_domain.get(j, j) == node_to_domain.get(d, d)}]
+            print(f"[ASYNC] rate_group={_rgm}" + (f"（起點模型描述向量、門檻 c={_rgc}）" if _rgm == 'style' else "（直接給定畫風）")
+                  + "：u＝自己＋組員的平均送出率；收方倍數 min(1, u_i/u_j) | "
+                  + ", ".join(f"{d}:組{[x.split('_')[-1] for x in _grp[d]]},r={_r[d]:.4f},u={communicator.rate_u_by_domain[d]:.4f}"
+                              for d in _doms_sorted)
+                  + f" | 與真實同畫風不同的台：{_wrong if _wrong else '無'}", flush=True)
         if _bw_table is not None:
             with open(_os.path.join(_diag_dir, 'bandwidth.csv'), 'w', newline='') as _bf:
                 _bw_w = _csv.writer(_bf)
@@ -647,6 +777,17 @@ def run(num_domains):
     else:
         async_consensus_f = None
         async_consensus_writer = None
+    fusion_jump_f = fusion_jump_writer = None
+    if async_enabled and getattr(communicator, 'fusion_jump_log', False):
+        fusion_jump_f = open(_os.path.join(_diag_dir, 'fusion_jump.csv'), 'w', newline='')
+        fusion_jump_writer = _csv.writer(fusion_jump_f)
+        fusion_jump_writer.writerow(['step', 'epoch', 'domain', 'n_senders', 'w_in', 'w_max', 'jump_l2', 'jump_rel'])
+        print(f"[ASYNC] fusion_jump_log on -> {_os.path.join(_diag_dir, 'fusion_jump.csv')}", flush=True)
+    reply_log_f = reply_log_writer = None
+    if async_enabled and getattr(communicator, 'bidirectional', False):  # [plan 1017]
+        reply_log_f = open(_os.path.join(_diag_dir, 'reply_log.csv'), 'w', newline='')
+        reply_log_writer = _csv.writer(reply_log_f)
+        reply_log_writer.writerow(['step', 'epoch', 'replier', 'target'])
 
     # ===== [唯讀診斷] 聚合前的逐邊偏離（--edge_div_diag）=====
     edge_div_on = bool(getattr(args, 'edge_div_diag', False))
@@ -1721,6 +1862,12 @@ def run(num_domains):
             # because main loss did not touch diffusion params.
             optimizer.zero_grad()
             loss.backward()
+            if getattr(communicator, 'fuse_rule', 'mh') == 'pushsum':
+                # [plan 1016] SGP：梯度加在未除純量的那一份 ⇒ z 的實際步長＝學習率／w_i（不改 lr，免得弄壞餘弦排程）
+                _ps_sc = 1.0 / float(communicator.ps_w[domain])
+                for _p in model.parameters():
+                    if _p.grad is not None:
+                        _p.grad.mul_(_ps_sc)
             optimizer.step()
 
             # Compute diffusion loss if OOD detection is enabled
@@ -1797,6 +1944,10 @@ def run(num_domains):
                     domain, model, k,
                     style_vec=(style_vecs_dict.get(domain) if async_style_enabled else None)
                 ) if fired else 0
+                if fired and getattr(communicator, 'bidirectional', False):
+                    # [plan 1017] EF-HC 雙向：鄰居把當下模型回傳給觸發的這台（本步收件時一起融合）
+                    communicator.bidir_reply(domain, k, models_dict, bn_states_dict,
+                                             style_vecs_dict if async_style_enabled else None)
                 # ===== Async R (RECEIVE): 融合移到「訓練 + push 之後」（切斷訓練接力；0717 報告 §4）=====
                 # push 推的是「本輪訓練後、未融合」的自身成果；receive 後模型才含鄰居（下一輪訓練才用 → staleness≥1）。
                 async_recv[domain] = communicator.receive_and_aggregate(domain, model, k)
@@ -1850,6 +2001,10 @@ def run(num_domains):
             # 仍推進 communicator.iter 以維持風格交換(Phase1)的 active_flags 排程。
             communicator.iter += 1
             d_comm_time_after = 0.0  # 佔位（下方 progress print 會引用）；async 無同步聚合通訊時間
+            if getattr(communicator, 'fuse_rule', 'mh') in ('pushsum', 'pushcen'):
+                _ps_m = communicator.ps_mass_total()   # [plan 1016] 份量守恆：各台＋在途＝節點數
+                if abs(_ps_m - len(domain_names)) > 1e-6:
+                    raise RuntimeError(f"[PUSHSUM] 份量不守恆 step={k}: total={_ps_m:.9f} (應為 {len(domain_names)})")
         elif getattr(args, 'isolated_nodes', False):
             # Isolated ablation: 跳過 Phase-3 模型聚合，各節點獨立訓練（風格交換也已在上方 skip）。
             # 仍推進 iter 保持 communicator 內部排程一致（風格已停用故不影響行為）。
@@ -1894,6 +2049,24 @@ def run(num_domains):
                 async_consensus_writer.writerow([(k // STEPS_PER_EPOCH) + 1,
                                                  f"{_cons_rms:.6e}", f"{_cons_max:.6e}"])
                 async_consensus_f.flush()
+            if getattr(communicator, 'fuse_rule', 'mh') in ('pushsum', 'pushcen'):  # [plan 1016] 每 epoch 記各台份量（＝步長倍數的倒數）
+                _psw = [float(communicator.ps_w[d]) for d in domain_names]
+                print(f"[PUSHSUM] epoch={(k // STEPS_PER_EPOCH) + 1} w=" + ",".join(f"{v:.4f}" for v in _psw)
+                      + f" min={min(_psw):.4f} max={max(_psw):.4f} total_incl_inflight={communicator.ps_mass_total():.9f}"
+                      + f" merges={getattr(communicator, 'ps_merge_count', 0)}"
+                      + f" grad_scaled={communicator.fuse_rule == 'pushsum'}", flush=True)
+            if reply_log_writer is not None:  # [plan 1017] EF-HC 雙向的回傳紀錄
+                _ep = (k // STEPS_PER_EPOCH) + 1
+                for _row in communicator.reply_rows:
+                    reply_log_writer.writerow([_row[0], _ep, _row[1], _row[2]])
+                communicator.reply_rows = []
+                reply_log_f.flush()
+            if fusion_jump_writer is not None:  # [plan 1016]
+                _ep = (k // STEPS_PER_EPOCH) + 1
+                for _row in getattr(communicator, 'fusion_jump_rows', []):
+                    fusion_jump_writer.writerow([_row[0], _ep] + _row[1:])
+                communicator.fusion_jump_rows = []
+                fusion_jump_f.flush()
 
             # ===== [唯讀診斷] 落盤本 epoch 的逐邊偏離 + 原型/風格的逐對距離 =====
             if edge_div_on:
@@ -2756,6 +2929,28 @@ if __name__ == "__main__":
     parser.add_argument('--bw_dist', type=str, default='none', choices=['none', 'beta', 'file'],
                         help="[plan 1009] simulated per-device bandwidth b_i (max=1): 'beta'=Beta(0.5,0.5) clipped to "
                              "[--bw_floor,1], stratified within style (separate RNG). Bookkeeping only unless --bw_rho.")
+    parser.add_argument('--node_lr_mult', type=str, default='',
+                        help="[plan 1014] per-node LR multiplier, e.g. 'node_6:0.13,node_7:0.13,node_8:0.13' (default: all 1.0).")
+    parser.add_argument('--fuse_rule', type=str, default='mh', choices=['mh', 'rate_pair', 'pushsum', 'pushcen'],
+                        help="[plan 1016] async fusion rule: 'mh' (default, unchanged), 'rate_pair' (scale w_ij by min(r_i,r_j)/r_j using "
+                             "the sender's period carried in the push), 'pushsum' (BWGossip-style mass split + 1/w gradient scaling), "
+                             "[plan 1017] 'pushcen' (same mass split / mass-weighted fusion, gradient NOT scaled; PushCen-ADFL).")
+    parser.add_argument('--bidirectional', action='store_true',
+                        help="[plan 1017] EF-HC two-way exchange: when node i fires, every neighbor replies its current model to i "
+                             "(Alg. 1 lines 9-11); replies do not update the replier's reference; one exchange per link per step.")
+    parser.add_argument('--rate_group', type=str, default='self', choices=['self', 'oracle', 'style'],
+                        help="[plan 1019] only with --fuse_rule rate_pair: the number u carried in each push. 'self' (default, unchanged): "
+                             "u = own send rate (base rule). 'oracle': u = mean send rate of self + same-style neighbors (known styles). "
+                             "'style': same, but same-group neighbors are recognised once before training from style statistics computed "
+                             "with the shared pretrained start model (eval BN): dist(A_i, A_j) <= c * dist(A_i, B_i).")
+    parser.add_argument('--rate_group_c', type=float, default=3.0,
+                        help='[plan 1019] rate_group=style threshold c (neighbor distance / own batch-to-batch distance).')
+    parser.add_argument('--rate_group_batches', type=int, default=20,
+                        help='[plan 1019] rate_group=style: batches per node (first half -> descriptor A, second half -> own-distance B).')
+    parser.add_argument('--fusion_jump_log', action='store_true',
+                        help='[plan 1016] read-only: log per-fusion parameter jump to async_diag/fusion_jump.csv (auto-on if fuse_rule != mh).')
+    parser.add_argument('--fuse_weight_mult', type=float, default=1.0,
+                        help='[plan 1014] async only: multiply every MH fusion weight (params + BN stats) by this factor in (0,1].')
     parser.add_argument('--bw_file', type=str, default='',
                         help="[plan 1012] CSV (node,b) used when --bw_dist file, e.g. slow devices concentrated in one style.")
     parser.add_argument('--bw_seed', type=int, default=0, help='[plan 1009] seed of the bandwidth draw.')

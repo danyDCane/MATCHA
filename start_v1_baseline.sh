@@ -213,6 +213,41 @@ if [ "$ASYNC" = "1" ]; then
         fi
         ASYNC_TAG="${ASYNC_TAG}${BW_TAG}"
     fi
+    # [plan 1014] 診斷：FUSE_WEIGHT_MULT=0.22 ⇒ 融合權重整體倍數（名稱 _fw<值>）
+    if [ -n "${FUSE_WEIGHT_MULT:-}" ]; then
+        ASYNC_ARGS="${ASYNC_ARGS} --fuse_weight_mult ${FUSE_WEIGHT_MULT}"
+        ASYNC_TAG="${ASYNC_TAG}_fw${FUSE_WEIGHT_MULT}"
+    fi
+    # [plan 1016] 融合規則：FUSE_RULE=rate_pair ⇒ 名稱 _frp；pushsum ⇒ _fps（自動開 fusion_jump_log）
+    if [ -n "${FUSE_RULE:-}" ] && [ "${FUSE_RULE}" != "mh" ]; then
+        ASYNC_ARGS="${ASYNC_ARGS} --fuse_rule ${FUSE_RULE}"
+        case "${FUSE_RULE}" in
+            rate_pair)   # [plan 1019] RATE_GROUP=style／oracle ⇒ 按群校正份量（名稱 _frg／_fro，與 _frp 同長）
+                case "${RATE_GROUP:-self}" in
+                    self)   ASYNC_TAG="${ASYNC_TAG}_frp" ;;
+                    style)  ASYNC_ARGS="${ASYNC_ARGS} --rate_group style"; ASYNC_TAG="${ASYNC_TAG}_frg" ;;
+                    oracle) ASYNC_ARGS="${ASYNC_ARGS} --rate_group oracle"; ASYNC_TAG="${ASYNC_TAG}_fro" ;;
+                    *) echo "[start_v1_baseline] unknown RATE_GROUP=${RATE_GROUP}" >&2; exit 1 ;;
+                esac ;;
+            pushsum)   ASYNC_TAG="${ASYNC_TAG}_fps" ;;
+            pushcen)   ASYNC_TAG="${ASYNC_TAG}_fpc" ;;   # [plan 1017] PushCen 推和融合（梯度不縮放）
+            *) echo "[start_v1_baseline] unknown FUSE_RULE=${FUSE_RULE}" >&2; exit 1 ;;
+        esac
+    fi
+    # [plan 1017] EF-HC 雙向交換：BIDIR=1 ⇒ --bidirectional（名稱 _bd）
+    if [ "${BIDIR:-0}" = "1" ]; then
+        ASYNC_ARGS="${ASYNC_ARGS} --bidirectional"
+        ASYNC_TAG="${ASYNC_TAG}_bd"
+    fi
+    # [plan 1016] 唯讀診斷：FUSION_JUMP_LOG=1 ⇒ 記每次融合的參數跳動（不改名稱；驗收用）
+    if [ "${FUSION_JUMP_LOG:-0}" = "1" ]; then
+        ASYNC_ARGS="${ASYNC_ARGS} --fusion_jump_log"
+    fi
+    # [plan 1014] 診斷：NODE_LR_MULT='node_6:0.13,node_7:0.13,node_8:0.13' NODE_LR_TAG=sk0.13 ⇒ 名稱 _lr<TAG>
+    if [ -n "${NODE_LR_MULT:-}" ]; then
+        ASYNC_ARGS="${ASYNC_ARGS} --node_lr_mult ${NODE_LR_MULT}"
+        ASYNC_TAG="${ASYNC_TAG}_lr${NODE_LR_TAG:?NODE_LR_MULT needs NODE_LR_TAG}"
+    fi
     # Stage 2: 風格也 event-trigger（綁模型觸發、持久 buffer）。Enable with: ASYNC_STYLE=1
     #   Stage1(model-only) : ASYNC=1 TRIGGER_THRESHOLD=1e-5 bash start_v1_baseline.sh cartoon 6
     #   Stage2(model+style): ASYNC=1 ASYNC_STYLE=1 TRIGGER_THRESHOLD=1e-5 bash start_v1_baseline.sh cartoon 6

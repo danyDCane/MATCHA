@@ -974,6 +974,39 @@ class SingleProcessCommunicator(object):
         _u = _rng.random(len(_doms))
         self.trigger_phase = {d: float(u) for d, u in zip(_doms, _u)}
 
+    def _ps_merge(self, old, new):
+        """[plan 1016] 推和法：同一送方兩份未讀訊息依份量合併（份量相加）。照現行事件順序不會發生，計數供檢查。"""
+        wo, wn = float(old['ps_w']), float(new['ps_w']); wt = wo + wn
+        mix = lambda a, b: None if a is None else {k: (wo * a[k] + wn * b[k]) / wt for k in a}
+        out = dict(new)
+        out['backbone'] = mix(old['backbone'], new['backbone'])
+        out['diffusion'] = mix(old.get('diffusion'), new.get('diffusion'))
+        out['bn'] = mix(old.get('bn'), new.get('bn'))
+        out['ps_w'] = wt
+        out['push_step'] = max(old['push_step'], new['push_step'])
+        self.ps_merge_count = getattr(self, 'ps_merge_count', 0) + 1
+        return out
+
+    def ps_mass_total(self):
+        """[plan 1016] 推和法份量守恆檢查：各台份量＋收件匣裡在途訊息的份量，應恆等於節點數。"""
+        tot = sum(float(v) for v in self.ps_w.values())
+        for box in self.inbox.values():
+            tot += sum(float(m.get('ps_w', 0.0)) for m in box.values())
+        return tot
+
+    def _own_rate(self, domain):
+        """[plan 1016] 本節點的送出率（每步幾次）＝1/週期；只在 periodic 模式有定義，其餘回 None。"""
+        if getattr(self, 'trigger_mode', 'param') != 'periodic':
+            return None
+        _rbd = getattr(self, 'trigger_rate_by_domain', None)
+        return float(_rbd[domain]) if _rbd is not None else float(self.trigger_rate)
+
+    def _own_u(self, domain):
+        """[plan 1019] 推播附的數 u（按群校正份量）：設了 rate_u_by_domain（--rate_group oracle／style）就回「自己＋組員的平均送出率」，
+        否則回自己的送出率（＝底座，行為不變）。收方倍數 min(u_i,u_j)/u_j＝min(1, u_i/u_j)。"""
+        _u = getattr(self, 'rate_u_by_domain', None)
+        return float(_u[domain]) if _u else self._own_rate(domain)
+
     def bandwidth_configure(self, rho_by_domain):
         """[plan 1009] EF-HC 的每節點門檻係數 ρ_i（＝1/b_i）：參數觸發的門檻變成 τ·γ(k)·ρ_i。"""
         missing = [d for d in self.domain_to_idx if d not in rho_by_domain]
@@ -1173,10 +1206,10 @@ class SingleProcessCommunicator(object):
             fired = (delta >= thresh) or forced
         return fired, delta, forced, thresh
 
-    def push_to_neighbors(self, domain, model, step, style_vec=None):
-        """觸發後把當下 w_i(backbone+diffusion denoiser) 立即寫進每個鄰居 inbox(dedup 覆蓋);更新 ŵ_i。
-        Stage 2(async_style)：同一事件夾帶呼叫端傳入的當下自風格 style_vec(=style_vecs_dict[domain]) →
-        寫進鄰居持久 style_inbox(keep-latest、不 consume)。自風格不另存 communicator 狀態、免造輪子。"""
+    def _build_msg(self, domain, model, step, bn_override=None, is_reply=False):
+        """推播／回傳共用的訊息內容（[plan 1017] 從 push_to_neighbors 抽出，推播行為逐位不變）。
+        is_reply＝True（EF-HC 雙向的回傳）：不更新 proto_ref／proto_last_bytes（只屬於自己的推播事件）；
+        bn_override：回傳時用呼叫端給的 BN 真實狀態（模型 buffer 可能被第一階段的前向暫時改過）。回 (msg, backbone)。"""
         backbone = {name: p.data.clone() for name, p in model.named_parameters()}
         diffusion = None
         if hasattr(model, 'diffusion_model') and model.diffusion_model is not None:
@@ -1185,9 +1218,10 @@ class SingleProcessCommunicator(object):
         # 在 eval 模式下不參與正規化，送了只會多一個變因。
         bn_buf = None
         if getattr(self, 'aggregate_bn', False):
-            bn_buf = {n: b.data.clone() for n, b in model.named_buffers()
-                      if n.endswith(("running_mean", "running_var"))}
+            bn_buf = bn_override if bn_override is not None else {
+                n: b.data.clone() for n, b in model.named_buffers() if n.endswith(("running_mean", "running_var"))}
         msg = {'backbone': backbone, 'diffusion': diffusion, 'bn': bn_buf, 'push_step': step}
+        msg['send_rate'] = self._own_u(domain)  # [plan 1016] 送方把自己的送出率（1/週期）放進推播，收方不用估；[plan 1019] 按群時改附組平均 u
         # 原型表（plan §5.2）：搭現有廣播事件的便車、**不新增通訊事件**。整張表送出才支援轉傳
         # ——實測 node_8 沒有 art 鄰居，只送自有欄它永遠拿不到 art。28.3 KB／46.1 MB ＝ 0.061%。
         if getattr(self, 'proto_enabled', False) and hasattr(model, 'prototypes'):
@@ -1205,23 +1239,86 @@ class SingleProcessCommunicator(object):
             msg['proto'] = {'store': self.proto_store[domain].clone(),
                             'stamp': self.proto_stamp[domain].clone(),
                             'cnt': self.proto_cnt[domain].clone()}
-            self.proto_last_bytes[domain] = (msg['proto']['store'].numel() * msg['proto']['store'].element_size()
-                                             + msg['proto']['stamp'].numel() * msg['proto']['stamp'].element_size()
-                                             + msg['proto']['cnt'].numel() * msg['proto']['cnt'].element_size())
-            self.proto_ref[domain] = self._own_centers(model).clone()   # 規則 1 的參照物
+            if not is_reply:
+                self.proto_last_bytes[domain] = (msg['proto']['store'].numel() * msg['proto']['store'].element_size()
+                                                 + msg['proto']['stamp'].numel() * msg['proto']['stamp'].element_size()
+                                                 + msg['proto']['cnt'].numel() * msg['proto']['cnt'].element_size())
+                self.proto_ref[domain] = self._own_centers(model).clone()   # 規則 1 的參照物
+        if is_reply:
+            msg['reply'] = True
+        return msg, backbone
+
+    def push_to_neighbors(self, domain, model, step, style_vec=None):
+        """觸發後把當下 w_i(backbone+diffusion denoiser) 立即寫進每個鄰居 inbox(dedup 覆蓋);更新 ŵ_i。
+        Stage 2(async_style)：同一事件夾帶呼叫端傳入的當下自風格 style_vec(=style_vecs_dict[domain]) →
+        寫進鄰居持久 style_inbox(keep-latest、不 consume)。自風格不另存 communicator 狀態、免造輪子。
+        [plan 1017] bidirectional：本步已回傳給某鄰居 ⇒ 不再推送給它（同一步同一連線只交換一次），回實際推送數。"""
+        msg, backbone = self._build_msg(domain, model, step)
         neighbors = self.domain_adj.get(domain, [])
+        _ps = getattr(self, 'fuse_rule', 'mh') in ('pushsum', 'pushcen')
+        if _ps:
+            # [plan 1016] 推和法（BWGossip 單向廣播）：份量平分成（鄰居數＋1）份，自己留一份、每個鄰居一份
+            _share = self.ps_w[domain] / (len(neighbors) + 1)
+            self.ps_w[domain] = _share
+            msg['ps_w'] = _share
         style_msg = None
         if self.async_style_enabled and style_vec is not None:
             style_msg = {'style_vec': style_vec.detach().clone(), 'push_step': step}
             self.style_latest[domain] = style_vec.detach().clone()  # 記自風格最新值（供 style_buffer_dist）
+        _bd = getattr(self, 'bidirectional', False)
+        if _bd:
+            self._bidir_sync(step)
+        _n_sent = 0
         for nb in neighbors:
-            self.inbox[nb][domain] = msg  # dedup by sender（保留最新）；#鄰居有界故 inbox 天然 bounded
+            if _bd and (step, domain, nb) in self._bidir_replied:
+                continue  # [plan 1017] 本步已把模型回傳給 nb ⇒ 這條連線本步已交換過
+            _n_sent += 1
+            if _ps and domain in self.inbox[nb]:
+                # [plan 1016] 推和法：同一送方還有一份沒讀 ⇒ 份量相加、模型依份量合併（不覆蓋，否則份量遺失）
+                self.inbox[nb][domain] = self._ps_merge(self.inbox[nb][domain], msg)
+            else:
+                self.inbox[nb][domain] = msg  # dedup by sender（保留最新）；#鄰居有界故 inbox 天然 bounded
             if style_msg is not None:
                 # STYLE_NO_DELAY=1 直接寫 inbox(偷看對照)；否則寫管線頭、經 style_delay 輪 swap 才進 inbox
                 (self.style_inbox[nb] if self.style_no_delay else self.style_pipeline[0][nb])[domain] = style_msg
         self.last_broadcast_params[domain] = {name: v.clone() for name, v in backbone.items()}
         self.last_broadcast_step[domain] = step
-        return len(neighbors)  # 推送數（供通訊量診斷）
+        return _n_sent if _bd else len(neighbors)  # 推送數（供通訊量診斷）
+
+    def _bidir_sync(self, step):
+        """[plan 1017] 「本步已回傳」紀錄只保留當步。"""
+        if getattr(self, '_bidir_step', None) != step:
+            self._bidir_step = step
+            self._bidir_replied = set()
+
+    def bidir_reply(self, target, step, models_dict, bn_states_dict=None, style_vecs=None):
+        """[plan 1017] EF-HC 雙向（原文 Algorithm 1 第 9–11 行：觸發的 i 送給所有鄰居，並收下所有鄰居的模型）。
+        target 觸發並推送後呼叫：每個鄰居 y 把當下模型（含風格、原型表，與推播同格式）回傳到 target 的收件匣。
+        - y 本步已推送給 target（收件匣裡 push_step＝step）⇒ 不回傳（v_ij＝max，同一步同一連線只交換一次）。
+        - 回傳**不**更新 y 的 ŵ／last_broadcast_step、不切推和份量、不算 y 的送出（原文第 12 行只在自己廣播時更新 ŵ）。
+        - BN 用 bn_states_dict[y]：還沒輪到訓練的 y，模型 buffer 已被第一階段的前向暫時改過；存檔值才是真實狀態。
+        回本次回傳數；每筆記入 reply_rows（step、回傳方、收方）。"""
+        self._bidir_sync(step)
+        n = 0
+        for y in self.domain_adj.get(target, []):
+            prev = self.inbox[target].get(y)
+            if prev is not None and prev.get('push_step') == step:
+                continue
+            bn_override = None
+            if getattr(self, 'aggregate_bn', False) and bn_states_dict is not None:
+                bn_override = {f'{m}.{b}': st[b].clone() for m, st in bn_states_dict[y].items()
+                               for b in ('running_mean', 'running_var') if st.get(b) is not None}
+            msg, _ = self._build_msg(y, models_dict[y], step, bn_override=bn_override, is_reply=True)
+            self.inbox[target][y] = msg
+            sv = style_vecs.get(y) if style_vecs is not None else None
+            if self.async_style_enabled and sv is not None:
+                self.style_latest[y] = sv.detach().clone()
+                (self.style_inbox[target] if self.style_no_delay else self.style_pipeline[0][target])[y] = \
+                    {'style_vec': sv.detach().clone(), 'push_step': step}
+            self._bidir_replied.add((step, y, target))
+            self.reply_rows.append([step, y, target])
+            n += 1
+        return n
 
     def swap_style_buffers(self):
         """每個 k 開始呼叫：把 style_delay 輪前 push 的風格(管線尾)搬進 active style_inbox。
@@ -1281,10 +1378,24 @@ class SingleProcessCommunicator(object):
                 buf_orig = {n: b.data.clone() for n, b in buf_dict.items()}
                 buf_acc = {n: torch.zeros_like(buf_orig[n]) for n in buf_dict}
             w_sum = 0.0
+            _rule = getattr(self, 'fuse_rule', 'mh')
+            _w_max = 0.0
+            if _rule in ('pushsum', 'pushcen'):
+                _ps_tot = float(self.ps_w[domain]) + sum(float(box[s]['ps_w']) for s in senders)
             for s in senders:
                 deg_j = len(self.domain_adj.get(s, []))
-                w_ij = 1.0 / (1.0 + max(deg_i, deg_j))  # MH edge weight（static degree）
                 msg = box[s]
+                w_ij = getattr(self, 'fuse_weight_mult', 1.0) / (1.0 + max(deg_i, deg_j))  # MH edge weight（static degree）；[1014] ×fuse_weight_mult（預設 1）
+                if _rule == 'rate_pair':
+                    # [plan 1016] 底座：只把比自己送得勤的鄰居縮到自己的送出率（w'＝W·min(r_i,r_j)/r_j ≤ W，自己權重恆 >0）
+                    _ri, _rj = self._own_u(domain), msg.get('send_rate')  # [plan 1019] 按群時兩邊都是 u
+                    if _ri is None or _rj is None or not (_rj > 0):
+                        raise RuntimeError(f"fuse_rule=rate_pair 需要 periodic 送出率：r_i={_ri} r_j={_rj}（{s}->{domain}）")
+                    w_ij = w_ij * min(_ri, _rj) / _rj
+                elif _rule in ('pushsum', 'pushcen'):
+                    # [plan 1016] 推和法：z ←（w_i·z_i＋Σ w_s·z_s）/（w_i＋Σ w_s）⇒ 比重＝份量占比，自己權重＝w_i/總份量
+                    w_ij = float(msg['ps_w']) / _ps_tot
+                _w_max = max(_w_max, w_ij)
                 for name in param_dict:
                     if name in msg['backbone']:
                         acc[name] += w_ij * msg['backbone'][name]
@@ -1323,14 +1434,30 @@ class SingleProcessCommunicator(object):
                         _ps.to(self.proto_store[domain].device, self.proto_store[domain].dtype).clone(),
                         _pp.to(self.proto_stamp[domain].device).clone())
             selfw = 1.0 - w_sum  # MH self weight（deg_i 上限保證 >0）
+            _jl = getattr(self, 'fusion_jump_log', False)
+            if _jl:
+                _jsq = torch.zeros((), device=next(iter(orig.values())).device, dtype=torch.float64)
+                _osq = torch.zeros_like(_jsq)
             for name, p in param_dict.items():
-                p.data.copy_(selfw * orig[name] + acc[name])
+                _new = selfw * orig[name] + acc[name]
+                if _jl:  # [plan 1016] 每次融合的參數跳動（唯讀：只算範數，不改寫回值）
+                    _jsq += ((_new - orig[name]).double() ** 2).sum()
+                    _osq += (orig[name].double() ** 2).sum()
+                p.data.copy_(_new)
+            if _jl:
+                _j = float(_jsq.sqrt().item()); _o = float(_osq.sqrt().item())
+                if not hasattr(self, 'fusion_jump_rows'):
+                    self.fusion_jump_rows = []
+                self.fusion_jump_rows.append([step, domain, len(senders), f"{w_sum:.6f}", f"{_w_max:.6f}",
+                                              f"{_j:.6e}", f"{_j / (_o + 1e-12):.6e}"])
             if has_diff:
                 for name, p in diff_dict.items():
                     p.data.copy_(selfw * diff_orig[name] + diff_acc[name])
             if agg_bn:
                 for name, b in buf_dict.items():
                     b.data.copy_(selfw * buf_orig[name] + buf_acc[name])
+            if _rule in ('pushsum', 'pushcen'):
+                self.ps_w[domain] = _ps_tot  # [plan 1016] 收件後份量＝自己＋收到的
             box.clear()  # 消費（consume-on-read）
         return ages
 
