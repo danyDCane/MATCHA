@@ -355,6 +355,9 @@ export MKL_NUM_THREADS=8
 export OPENBLAS_NUM_THREADS=8
 export NUMEXPR_NUM_THREADS=8
 
+# [1030] 訓練前硬體／環境檢查：版本與登記環境不同就停；SM 數≠170 自動掛 sm_spoof2 並實測生效（逐位重現 5090 登記值，見 research/1028 報告）。
+source /home/server5090/Desktop/M11307320/MATCHA/scripts/repro/hw_guard.sh "$RUN_NAME" || exit 4
+
 /home/server5090/Desktop/M11307320/MATCHA/venv_matcha/bin/python train.py \
 --wandb_project "$WANDB_PROJECT" \
 --dataset pacs \
