@@ -13,7 +13,11 @@
   對【StyleDDG 無檢測】：我方在低 π **落後**（沒有未知可擋、檢測只有誤殺成本），π 超過 π* 才划算
 
 用法：./venv_matcha/bin/python scripts/posthoc/osa_pi_sensitivity.py
+[1104] 同步版：--npz_dir results/osa/sync_A2 --ours_bn raw（同步臂 final 已在訓練收尾合併 BN，raw＝單次合併；avg＝雙重合併）
+       --self_nodet：另報「同一個我方模型不裝檢測器」當對手（＝檢測器本身值多少）。不加任何參數時輸出與舊版逐字相同。
 """
+import argparse
+
 import numpy as np
 
 PACS = ["art_painting", "cartoon", "photo", "sketch"]
@@ -24,9 +28,9 @@ N, Q = 9, 0.95
 GRID = [0.0, 0.10, 0.20, 0.30, 0.50]
 
 
-def operating_point(fold, tag, bn, ro, detect=True):
+def operating_point(fold, tag, bn, ro, detect=True, npz_dir="results/osa"):
     """回傳 (a_id, r_ood)：兩者皆與 π 無關，π 只是加權。"""
-    z = np.load(f"results/osa/{fold}.npz", allow_pickle=True)
+    z = np.load(f"{npz_dir}/{fold}.npz", allow_pickle=True)
     A, R = [], []
     for i in range(N):
         p = f"{tag}__{bn}__{i}"
@@ -43,10 +47,18 @@ def operating_point(fold, tag, bn, ro, detect=True):
 
 
 def main():
-    OURS = {f: operating_point(f, "ours", "avg", "zperp") for f in PACS}
-    OPP = [("StyleDDG+energy／原樣（對外靶）", {f: operating_point(f, "baseline", "raw", "energy") for f in PACS}),
-           ("StyleDDG 無檢測／原樣（地板）", {f: operating_point(f, "baseline", "raw", "energy", False) for f in PACS})]
-    print("★ OSA(π) 對 π 線性 ⇒ 交叉點 π* 可解析求出（我方＝面讀出／平均B）")
+    ap_ = argparse.ArgumentParser()
+    ap_.add_argument("--npz_dir", default="results/osa")
+    ap_.add_argument("--ours_bn", default="avg", choices=["avg", "raw"])
+    ap_.add_argument("--self_nodet", action="store_true")
+    a = ap_.parse_args()
+    D = a.npz_dir
+    OURS = {f: operating_point(f, "ours", a.ours_bn, "zperp", npz_dir=D) for f in PACS}
+    OPP = [("StyleDDG+energy／原樣（對外靶）", {f: operating_point(f, "baseline", "raw", "energy", npz_dir=D) for f in PACS}),
+           ("StyleDDG 無檢測／原樣（地板）", {f: operating_point(f, "baseline", "raw", "energy", False, npz_dir=D) for f in PACS})]
+    if a.self_nodet:
+        OPP.append(("我方同一模型不裝檢測器", {f: operating_point(f, "ours", a.ours_bn, "zperp", False, npz_dir=D) for f in PACS}))
+    print(f"★ OSA(π) 對 π 線性 ⇒ 交叉點 π* 可解析求出（我方＝面讀出／{'平均B' if a.ours_bn == 'avg' else '存檔前已合併 BN（單次合併）'}）")
     print("  π* ＝ (a_我−a_對) / [(a_我−a_對) − (r_我−r_對)]\n")
     for nm, B in OPP:
         print(f"  ── 對手：{nm} ──")

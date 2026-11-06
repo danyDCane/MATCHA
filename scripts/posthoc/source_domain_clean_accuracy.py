@@ -45,7 +45,24 @@ ARMS = {'C0': 'v1_stage2_leave_cartoon_p1a_async_periodic6.2133' + S + '_d5',
         'FoldF11': 'v1_stage2_leave_cartoon_p1a_async_puni_bwfart0.1' + S,            # art 慢 等預算均勻送
         'FoldF12': 'v1_stage2_leave_cartoon_p1a_async_pbw_bwb0_fpc' + S,              # 正常 PushCen
         'FoldF13': 'v1_stage2_leave_cartoon_p1a_async_lr_tau1.368e-05_bwb0r_bd' + S,  # 正常 EF-HC 雙向
-        'FoldF14': 'v1_stage2_leave_cartoon_p1a_async_puni_bwb0' + S}                 # 正常 等預算均勻送
+        'FoldF14': 'v1_stage2_leave_cartoon_p1a_async_puni_bwb0' + S,                 # 正常 等預算均勻送
+        # [plan 1031] 照 EF-HC 原文亂數網速：E1–E16（每表 按群／同週期送／PushCen／EF-HC 雙向）
+        'E1': 'v1_stage2_leave_cartoon_p1a_async_pbwu0_bwfu0_frg' + S,  # 均勻0 按群
+        'E2': 'v1_stage2_leave_cartoon_p1a_async_puni_bwfu0' + S,  # 均勻0 同週期送
+        'E3': 'v1_stage2_leave_cartoon_p1a_async_pbwu0_bwfu0_fpc' + S,  # 均勻0 PushCen
+        'E4': 'v1_stage2_leave_cartoon_p1a_async_lr_tau1.19e-05_bwfu0r_bd' + S,  # 均勻0 EF-HC 雙向
+        'E5': 'v1_stage2_leave_cartoon_p1a_async_pbwu1_bwfu1_frg' + S,  # 均勻1 按群
+        'E6': 'v1_stage2_leave_cartoon_p1a_async_puni_bwfu1' + S,  # 均勻1 同週期送
+        'E7': 'v1_stage2_leave_cartoon_p1a_async_pbwu1_bwfu1_fpc' + S,  # 均勻1 PushCen
+        'E8': 'v1_stage2_leave_cartoon_p1a_async_lr_tau1.22e-05_bwfu1r_bd' + S,  # 均勻1 EF-HC 雙向
+        'E9': 'v1_stage2_leave_cartoon_p1a_async_pbwb0_bwfb0_frg' + S,  # 兩頭多0 按群
+        'E10': 'v1_stage2_leave_cartoon_p1a_async_puni_bwfb0' + S,  # 兩頭多0 同週期送
+        'E11': 'v1_stage2_leave_cartoon_p1a_async_pbwb0_bwfb0_fpc' + S,  # 兩頭多0 PushCen
+        'E12': 'v1_stage2_leave_cartoon_p1a_async_lr_tau1.24e-05_bwfb0r_bd' + S,  # 兩頭多0 EF-HC 雙向
+        'E13': 'v1_stage2_leave_cartoon_p1a_async_pbwb1_bwfb1_frg' + S,  # 兩頭多1 按群
+        'E14': 'v1_stage2_leave_cartoon_p1a_async_puni_bwfb1' + S,  # 兩頭多1 同週期送
+        'E15': 'v1_stage2_leave_cartoon_p1a_async_pbwb1_bwfb1_fpc' + S,  # 兩頭多1 PushCen
+        'E16': 'v1_stage2_leave_cartoon_p1a_async_lr_tau8.96e-06_bwfb1r_bd' + S}  # 兩頭多1 EF-HC 雙向
 DOMS = ['art_painting', 'photo', 'sketch', 'cartoon']   # cartoon＝錨點：avgB 須逐位重現正式評估 CSV 的 closed_acc
 UNK = 6
 

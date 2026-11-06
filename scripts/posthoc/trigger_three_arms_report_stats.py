@@ -1672,6 +1672,124 @@ def early_section(fig_path='results/proto_trigger/1027_contrib2_early_phase.png'
     fig.tight_layout(); fig.savefig(ROOT + fig_path, dpi=130); print(f'\n圖：{fig_path}')
 
 
+EF31_TABLES = {   # [plan 1031] 照 EF-HC 原文亂數網速：表 → (網速表檔名, {組: (E 鍵, 估算規則, 雙向, 要多存 46 MB)})
+    t: (f'bandwidth_{f}.csv', {'ours (group)': (f'E{k}', 'group', False, False), 'uniform-matched': (f'E{k + 1}', 'mh', False, False),
+                               'PushCen': (f'E{k + 2}', 'pushcen', False, False), 'EF-HC two-way': (f'E{k + 3}', 'mh', True, True)})
+    for t, f, k in [('u0', 'uni_s0', 1), ('u1', 'uni_s1', 5), ('b0', 'beta_s0', 9), ('b1', 'beta_s1', 13)]}
+EF31_NAME = {'u0': '均勻 種子0', 'u1': '均勻 種子1', 'b0': '兩頭多 種子0', 'b1': '兩頭多 種子1'}
+EF31_SKEWED = ('u0', 'b0', 'b1')   # plan §7.2：照網速送預測最吃虧份量 <0.25 的偏心表（事前）
+
+
+def efhc1031_section():
+    """[plan 1031 §7.2] 照 EF-HC 原文亂數網速 × 按群校正／同週期送／PushCen／EF-HC 雙向。邏輯沿用 fold_section：
+    同傳輸時間點 T*＝按群校正全程的每台平均累積傳輸時間（送一次＝1÷送出方網速；雙向含回傳，記帳同 EF-HC 原文），各組在 T* 內插、
+    總時間不到 T* 用最終值。成本較高＝單台最長傳輸時間 ≥1.3 倍或要多存 46 MB（plan §7.2）。公平＝各畫風原圖準確率（ep200、平均B、九台平均）
+    相對全員同速（1007 C）的最大掉分，寬 1.54。主表另列 ep200 與全員同速（理想；其傳輸時間＝在該表網速下照理想送法所需）。"""
+    import os, sys, re
+    import networkx as nx
+    sys.path.insert(0, ROOT + 'scripts/posthoc')
+    from composition_inbox_sim import simulate
+    src_py = open(ROOT + 'scripts/posthoc/source_domain_clean_accuracy.py', encoding='utf-8').read()
+    ENAME = dict(re.findall(r"'(E\d+)': '([^']+)' \+ S", src_py))
+    ev = pd.concat([pd.read_csv(ROOT + _FD + f'{c}_curve_cartoon_avgbnB.csv') for c in ('1009_bw', '1031_efhc')], ignore_index=True)
+    ev = ev[ev.score_fn == 'zperp'].copy(); ev['ep'] = ev.ckpt.str.replace('epoch_', '').astype(int)
+    ev = ev.drop_duplicates(['run', 'ep', 'node'], keep='last')
+    G = nx.random_geometric_graph(9, 0.8, seed=1234); NBR = {i: sorted(G[i]) for i in range(9)}; DEG = {i: len(NBR[i]) for i in range(9)}
+    wg, wf, wfair = 0.0109, 0.0144, 1.54
+    rs = pd.read_csv(ROOT + _FD + '1012_artslow_source_clean_acc.csv'); rs = rs[(rs.arm == 'C0') & (rs.bn == 'avgB')]
+    REF = rs.groupby('eval_domain').closed_acc.mean() * 100
+    iq = ev[ev.run == BW_ARMS['C0'][1].replace('exp_result_', '', 1)].groupby('ep')[['closed_acc', 'det_auroc']].mean()
+    IA, IZ = 100 * iq.closed_acc.loc[200], iq.det_auroc.loc[200]
+    c0 = pd.read_csv(ROOT + BW_ARMS['C0'][1] + '/async_diag/broadcast_log.csv'); c0['i'] = c0.domain.str[5:].astype(int)
+    c0s = c0.groupby('i').fired.sum().sort_index().values
+    at = lambda q, t, col: float(np.interp(t, q.cum_t, q[col])) if t <= q.cum_t.iloc[-1] else float(q[col].iloc[-1])
+    DOM3 = ['art_painting', 'photo', 'sketch']
+    print(f'理想（全員同速＝1007 C）：泛化 {IA:.2f}｜面 {IZ:.4f}｜原圖 art {REF["art_painting"]:.2f} photo {REF["photo"]:.2f} sketch {REF["sketch"]:.2f}')
+    OUT = {}
+    for t, (bf, arms) in EF31_TABLES.items():
+        bt = pd.read_csv(ROOT + _FD + '1031_efhc_bw/' + bf); bt['i'] = bt.node.str[5:].astype(int); b_ = bt.sort_values('i').b.values.astype(float)
+        Q, COST, SH, SRC = {}, {}, {}, {}
+        for lab, (ek, rule, bd, store) in arms.items():
+            name = ENAME[ek] + _BWS; run = 'exp_result_' + name
+            q = ev[ev.run == name].groupby('ep')[['closed_acc', 'det_auroc']].mean()
+            if len(q) != 40: continue
+            b = pd.read_csv(ROOT + run + '/async_diag/broadcast_log.csv'); b['i'] = b.domain.str[5:].astype(int)
+            Fm = b.pivot(index='step', columns='i', values='fired').sort_index().values.astype(bool)
+            if bd:
+                V = np.zeros_like(Fm, dtype=float)
+                for i in range(9): V[:, i] = sum(np.maximum(Fm[:, i], Fm[:, j]) for j in NBR[i]) / DEG[i]
+            else:
+                V = Fm.astype(float)
+            cost = V / b_[None, :]
+            ep_t = pd.Series(cost.sum(1) / 9).groupby(np.arange(len(cost)) // 20).sum(); ep_t.index += 1
+            q['cum_t'] = ep_t.cumsum().reindex(q.index).values; Q[lab] = q
+            COST[lab] = dict(total=ep_t.sum(), per_node=cost.sum(0), store=store, sends=Fm.sum(0), run=run, ek=ek)
+            if rule == 'group':
+                g = pd.read_csv(ROOT + run + '/async_diag/rate_group.csv').groupby('node').first()
+                SH[lab] = simulate(Fm[:4000], 'rate_pair', False, u=np.array([g.loc[f'node_{i}', 'u'] for i in range(9)]))
+            else:
+                SH[lab] = simulate(Fm[:4000], rule, bd)
+            sf = ROOT + _FD + f'1031_efhc_{ek}_source_clean_acc.csv'
+            if os.path.exists(sf):
+                d = pd.read_csv(sf); d = d[(d.arm == ek) & (d.bn == 'avgB')]
+                if len(d): SRC[lab] = d.groupby('eval_domain').closed_acc.mean() * 100
+        print('\n' + '#' * 110); print(f'# {EF31_NAME[t]}（{t}）｜網速 {np.round(b_, 4).tolist()}｜完成 {list(Q)}'); print('#' * 110)
+        if 'ours (group)' not in Q:
+            print('  按群校正尚未完成，略過'); continue
+        ref = 'ours (group)'; Tb = COST[ref]['total']; M0 = COST[ref]['per_node'].max(); T0 = (c0s / b_).max()
+        print(f'| 方法 | 單台最長傳輸時間（×按群） | 每台平均傳輸 | 泛化 ep200 | 面 ep200 | 泛化／面 @T*={Tb:.0f} | 原圖 art／photo／sketch（相對理想） | 最大掉分 | 實際份量 art／photo／sketch |')
+        print('|---|---|---|---|---|---|---|---|---|')
+        print(f'| 全員同速（理想） | {T0:,.0f}＊（{T0 / M0:.2f}×） | {(c0s / b_).mean():,.0f} | {IA:.2f} | {IZ:.4f} | — | {REF["art_painting"]:.2f}／{REF["photo"]:.2f}／{REF["sketch"]:.2f} | — | — |')
+        md = {}
+        for lab in Q:
+            c = COST[lab]; q = Q[lab]; pn = c['per_node']; sh = SH[lab]['share']
+            if lab in SRC:
+                sr = SRC[lab]; dr = {k: REF[k] - sr[k] for k in DOM3}; md[lab] = max(dr.values())
+                s_txt = '／'.join(f'{sr[k]:.2f}（{sr[k] - REF[k]:+.2f}）' for k in DOM3); m_txt = f'{md[lab]:+.2f}'
+            else:
+                s_txt = m_txt = '尚無'
+            print(f'| {OV_NAME[lab]}{"（多存 46 MB）" if c["store"] else ""} | {pn.max():,.0f}（{pn.max() / M0:.2f}×） | {pn.mean():,.0f} | {100 * q.closed_acc.loc[200]:.2f} | {q.det_auroc.loc[200]:.4f}'
+                  f' | {100 * at(q, Tb, "closed_acc"):.2f}／{at(q, Tb, "det_auroc"):.4f} | {s_txt} | {m_txt} | ' + '／'.join(f'{x:.3f}' for x in sh) + ' |')
+        print(f'  逐台送出：' + '｜'.join(f'{OV_NAME[l]} {COST[l]["sends"].tolist()}' for l in Q))
+        V_ = {}
+        qa = Q[ref]
+        for lab, q in Q.items():
+            if lab == ref: continue
+            da = at(qa, Tb, 'closed_acc') - at(q, Tb, 'closed_acc'); dz = at(qa, Tb, 'det_auroc') - at(q, Tb, 'det_auroc')
+            c = COST[lab]; mx = c['per_node'].max() >= 1.3 * M0
+            higher = mx or c['store']
+            better = (da > wg) or (dz > wf); worse = (da < -wg) or (dz < -wf)
+            if better and not worse: v = '按群勝'
+            elif not better and not worse: v = '持平、按群成本較低' if higher else '持平'
+            elif worse and not better: v = '按群輸' if not higher else '對手成績較好、但成本較高（取捨）'
+            else: v = '取捨（一高一低）'
+            fair = '—'
+            if lab in md and ref in md:
+                fd = md[lab] - md[ref]; fair = '按群較公平' if fd > wfair else ('對手較公平' if fd < -wfair else '相同')
+                fair += f'（最大掉分 對手 {md[lab]:+.2f} vs 我們 {md[ref]:+.2f}）'
+            why = [n for n, f in [('單台最長 ≥1.3×', mx), ('多存 46 MB', c['store'])] if f]
+            V_[lab] = (v, fair)
+            print(f'  [{OV_NAME[lab]}] @T* 泛化差 {da:+.4f} 面差 {dz:+.4f}｜對手成本較高：{"、".join(why) if why else "否"} ⇒ {v}｜公平：{fair}')
+            if c['run'] and os.path.exists(ROOT + c['run'] + '/async_diag/reply_log.csv'):
+                rp = pd.read_csv(ROOT + c['run'] + '/async_diag/reply_log.csv'); rp['y'] = rp.replier.str[5:].astype(int)
+                nrep = rp.groupby('y').size().reindex(range(9)).fillna(0).astype(int).values; own_ = c['sends']; k_ = int(b_.argmin())
+                print(f'      EF-HC 雙向每台上傳：自己送出 {own_.tolist()}＋回傳 {nrep.tolist()}；最慢 node_{k_}（b={b_[k_]:.4f}）回傳／自己送出 {nrep[k_] / max(own_[k_], 1):.1f}×')
+        OUT[t] = V_
+    print('\n' + '=' * 110); print('整份計畫四級判決（plan §7.2）'); print('=' * 110)
+    full = all(t in OUT and len(OUT[t]) == 3 for t in EF31_TABLES)
+    ok = [t for t in EF31_SKEWED if t in OUT and len(OUT[t]) == 3
+          and OUT[t]['EF-HC two-way'][0] in ('持平、按群成本較低', '按群勝') and OUT[t]['uniform-matched'][0] in ('持平、按群成本較低', '按群勝')
+          and (OUT[t]['PushCen'][0] == '按群勝' or OUT[t]['PushCen'][1].startswith('按群較公平'))]
+    lose = any(v[0] == '按群輸' for t in OUT for v in OUT[t].values())
+    if full:
+        lv = '退化' if lose else ('強' if len(ok) == 3 else '中' if len(ok) == 2 else '邊際')
+        print(f'  偏心表滿足的 {ok}｜任何「按群輸」：{lose} ⇒ {lv}')
+    else:
+        print(f'  尚未齊（已完成：{ {t: list(OUT[t]) for t in OUT} }）｜目前偏心表滿足 {ok}｜目前有「按群輸」：{lose}')
+
+
+if '--efhc1031' in __import__('sys').argv:   # [plan 1031] 照 EF-HC 原文亂數網速 × 主對手
+    efhc1031_section()
 if '--early' in __import__('sys').argv:   # [1027] 前期收斂代價：四情境軌跡、與理想的差、追平時點
     early_section(); raise SystemExit(0)
 if '--final_table' in __import__('sys').argv:   # [1021] 結果報告主表（單台最長傳輸時間）
